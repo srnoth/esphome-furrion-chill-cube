@@ -379,7 +379,8 @@ climate::ClimateTraits FurrionChillCube::traits() {
   traits.add_supported_mode(climate::CLIMATE_MODE_HEAT_COOL);
   traits.set_visual_min_temperature(4.4f);    // 40°F
   traits.set_visual_max_temperature(30.0f);   // 86°F
-  traits.set_visual_temperature_step(1.0f);
+  traits.set_visual_current_temperature_step(0.1f);
+  traits.set_visual_target_temperature_step(1.0f);
   traits.add_supported_fan_mode(climate::CLIMATE_FAN_AUTO);
   traits.add_supported_fan_mode(climate::CLIMATE_FAN_LOW);
   traits.add_supported_fan_mode(climate::CLIMATE_FAN_MEDIUM);

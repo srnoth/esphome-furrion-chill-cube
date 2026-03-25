@@ -560,7 +560,7 @@ void FurrionChillCube::advance_kickstart_() {
       break;
 
     case KickPhase::IDLE_KICK_CS:
-      if (elapsed >= 60000) {
+      if (elapsed >= 10000) {
         set_cs_value_(kick_target_cs_);
         kick_phase_ = KickPhase::IDLE;
         ESP_LOGI(TAG, "Idle kickstart: DROP to cs=%d", kick_target_cs_);

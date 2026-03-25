@@ -39,7 +39,7 @@ static const int COOL_ANCHOR_F = 77;
 //                        0      1       2       3        4        5
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
 static const uint32_t IDLE_BEFORE_OFF_MS = 900000;  // 15 min
-static const uint32_t FAN_CLAMP_DURATION_MS = 310000;  // 5 min + 10s buffer
+static const uint32_t FAN_CLAMP_DURATION_MS = 330000;  // 5 min + 30s buffer
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
 

@@ -289,6 +289,17 @@ void FurrionChillCube::send_swing_off() {
 // ============================================================
 
 void FurrionChillCube::setup() {
+  // Restore mode, targets, fan, swing from flash
+  auto restore = this->restore_state_();
+  if (restore.has_value()) {
+    restore->apply(this);
+    ESP_LOGI(TAG, "Restored state: mode=%d temp=%.1f lo=%.1f hi=%.1f fan=%d swing=%d",
+             (int)this->mode, this->target_temperature,
+             this->target_temperature_low, this->target_temperature_high,
+             (int)this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO),
+             (int)this->swing_mode);
+  }
+
   // Register temperature sensor callbacks
   if (inside_temp_sensor_) {
     inside_temp_sensor_->add_on_state_callback([this](float value) {

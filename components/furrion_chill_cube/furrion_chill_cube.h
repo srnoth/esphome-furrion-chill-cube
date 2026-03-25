@@ -61,8 +61,8 @@ class FurrionChillCube : public climate::Climate, public Component {
     FRESH_PRE_CS,     // CS set, waiting 500ms before mode
     FRESH_MODE_ON,    // Mode sent, waiting 60s
     FRESH_DROP,       // Drop to target CS (instant)
-    IDLE_KICK_CS,     // Idle kickstart CS set, waiting 60s
-    IDLE_KICK_DROP,   // Drop to target CS (instant)
+    IDLE_KICK_CS,       // Idle kickstart CS=25 sent at t=0, waiting 5s
+    IDLE_KICK_CS2,      // CS=25 reinforcement at t=5s, waiting until t=10s
   };
   void advance_kickstart_();
   void start_fresh_kickstart_(int mode, int target_cs);
@@ -115,6 +115,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t kick_phase_start_{0};
   int kick_mode_{0};           // 1=heat, 2=cool
   int kick_target_cs_{22};
+  uint8_t cs_reinforce_count_{0};
+  uint32_t cs_reinforce_at_{0};
 
   // Flags
   bool boot_ready_{false};

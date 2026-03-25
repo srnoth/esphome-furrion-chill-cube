@@ -349,7 +349,16 @@ void FurrionChillCube::loop() {
     last_gear_run_ = now;
   }
 
-  // 3. CS heartbeat every 30s
+  // 3. Post-kickstart CS reinforcement (re-transmit gear controller's CS at 5s intervals)
+  if (cs_reinforce_count_ > 0 && (now - cs_reinforce_at_) >= 5000) {
+    transmit_cs_update_(true);
+    last_cs_heartbeat_ = now;
+    cs_reinforce_count_--;
+    cs_reinforce_at_ = now;
+    ESP_LOGI(TAG, "CS reinforce cs=%d (%d left)", current_cs_, cs_reinforce_count_);
+  }
+
+  // 4. CS heartbeat every 30s
   if (boot_ready_ && !failsafe_active_ &&
       active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
       (now - last_cs_heartbeat_) >= CS_HEARTBEAT_MS) {
@@ -357,7 +366,7 @@ void FurrionChillCube::loop() {
     last_cs_heartbeat_ = now;
   }
 
-  // 4. Fan clamp management (release clamp when expired)
+  // 5. Fan clamp management (release clamp when expired)
   if (fan_clamp_start_ > 0 && (now - fan_clamp_start_) >= FAN_CLAMP_DURATION_MS) {
     fan_clamp_start_ = 0;
     // Re-send mode with AUTO fan if unit is on
@@ -560,10 +569,22 @@ void FurrionChillCube::advance_kickstart_() {
       break;
 
     case KickPhase::IDLE_KICK_CS:
-      if (elapsed >= 2000) {
-        set_cs_value_(kick_target_cs_);
+      if (elapsed >= 5000) {
+        // t=5s: reinforce CS=25
+        transmit_cs_update_(true);
+        kick_phase_ = KickPhase::IDLE_KICK_CS2;
+        kick_phase_start_ = millis();
+        ESP_LOGI(TAG, "Idle kickstart: reinforce cs=25");
+      }
+      break;
+
+    case KickPhase::IDLE_KICK_CS2:
+      if (elapsed >= 5000) {
+        // t=10s: release to gear controller, start CS reinforcement
+        cs_reinforce_count_ = 2;
+        cs_reinforce_at_ = millis();
         kick_phase_ = KickPhase::IDLE;
-        ESP_LOGI(TAG, "Idle kickstart: DROP to cs=%d", kick_target_cs_);
+        ESP_LOGI(TAG, "Idle kickstart: released, gear controller will set CS");
       }
       break;
 

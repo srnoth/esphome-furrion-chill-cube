@@ -25,9 +25,9 @@ SwingOffButton = fcc_ns.class_("SwingOffButton", button.Button)
 # Config keys
 CONF_TRANSMITTER_ID = "transmitter_id"
 CONF_INSIDE_TEMPERATURE = "inside_temperature"
-CONF_INSIDE_TEMPERATURE_UNIT = "inside_temperature_unit"
+CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT = "inside_temperature_is_fahrenheit"
 CONF_OUTSIDE_TEMPERATURE = "outside_temperature"
-CONF_OUTSIDE_TEMPERATURE_UNIT = "outside_temperature_unit"
+CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT = "outside_temperature_is_fahrenheit"
 CONF_HEAT_COOL_GAP = "heat_cool_gap"
 CONF_OUTSIDE_LOCKOUT_TEMP = "outside_lockout_temp"
 CONF_HEAT_GEAR = "heat_gear"
@@ -40,13 +40,6 @@ CONF_TURBO_OFF = "turbo_off"
 CONF_SWING_ON = "swing_on"
 CONF_SWING_OFF = "swing_off"
 
-TEMPERATURE_UNITS = {
-    "C": False,
-    "°C": False,
-    "F": True,
-    "°F": True,
-}
-
 CONFIG_SCHEMA = (
     climate.climate_schema(FurrionChillCube)
     .extend(
@@ -55,13 +48,9 @@ CONFIG_SCHEMA = (
                 remote_transmitter.RemoteTransmitterComponent
             ),
             cv.Required(CONF_INSIDE_TEMPERATURE): cv.use_id(sensor.Sensor),
-            cv.Optional(CONF_INSIDE_TEMPERATURE_UNIT, default="°C"): cv.enum(
-                TEMPERATURE_UNITS
-            ),
+            cv.Optional(CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
             cv.Optional(CONF_OUTSIDE_TEMPERATURE): cv.use_id(sensor.Sensor),
-            cv.Optional(CONF_OUTSIDE_TEMPERATURE_UNIT, default="°C"): cv.enum(
-                TEMPERATURE_UNITS
-            ),
+            cv.Optional(CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
             cv.Optional(CONF_HEAT_COOL_GAP, default=2.0): cv.float_range(
                 min=0.0, max=20.0
             ),
@@ -122,14 +111,14 @@ async def to_code(config):
     # Inside temperature sensor (required)
     sens = await cg.get_variable(config[CONF_INSIDE_TEMPERATURE])
     cg.add(var.set_inside_temperature_sensor(sens))
-    cg.add(var.set_inside_temperature_fahrenheit(config[CONF_INSIDE_TEMPERATURE_UNIT]))
+    cg.add(var.set_inside_temperature_fahrenheit(config[CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT]))
 
     # Outside temperature sensor (optional)
     if CONF_OUTSIDE_TEMPERATURE in config:
         sens = await cg.get_variable(config[CONF_OUTSIDE_TEMPERATURE])
         cg.add(var.set_outside_temperature_sensor(sens))
         cg.add(
-            var.set_outside_temperature_fahrenheit(config[CONF_OUTSIDE_TEMPERATURE_UNIT])
+            var.set_outside_temperature_fahrenheit(config[CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT])
         )
 
     # Configuration values (in Fahrenheit, converted to Celsius internally)

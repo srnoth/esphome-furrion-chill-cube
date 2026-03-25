@@ -558,13 +558,14 @@ void FurrionChillCube::advance_kickstart_() {
 
     case KickPhase::FRESH_MODE_ON:
       if (elapsed >= 60000) {
-        // Step 3: Drop to sustain CS
-        set_cs_value_(kick_target_cs_);
+        // Step 3: Release to gear controller + reinforce drop
+        cs_reinforce_count_ = 2;
+        cs_reinforce_at_ = millis();
         kick_phase_ = KickPhase::IDLE;
         uint32_t clamp_elapsed = millis() - fan_clamp_start_;
         int remaining = (clamp_elapsed < FAN_CLAMP_DURATION_MS) ?
                         (int)(FAN_CLAMP_DURATION_MS - clamp_elapsed) : 0;
-        ESP_LOGI(TAG, "Kickstart: DROP to cs=%d, clamp %dms left", kick_target_cs_, remaining);
+        ESP_LOGI(TAG, "Kickstart: released, clamp %dms left", remaining);
       }
       break;
 

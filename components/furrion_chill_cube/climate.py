@@ -51,7 +51,7 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
             cv.Optional(CONF_OUTSIDE_TEMPERATURE): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
-            cv.Optional(CONF_HEAT_COOL_GAP, default=2.0): cv.float_range(
+            cv.Optional(CONF_HEAT_COOL_GAP, default=0.0): cv.float_range(
                 min=0.0, max=20.0
             ),
             cv.Optional(CONF_OUTSIDE_LOCKOUT_TEMP, default=35.0): cv.float_,

@@ -87,7 +87,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *cs_value_sensor_{nullptr};
 
   // Configuration
-  float heat_cool_gap_c_{1.11f};          // 2°F default
+  float heat_cool_gap_c_{0.0f};            // 0°F default (same setpoint allowed)
   float outside_lockout_temp_c_{1.67f};   // 35°F default
   bool inside_temp_fahrenheit_{false};
   bool outside_temp_fahrenheit_{false};

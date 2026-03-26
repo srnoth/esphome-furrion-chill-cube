@@ -66,7 +66,7 @@ static const float C_DN_10 = -0.15f;
 static const float C_IDLE  = -0.15f;
 
 // Mode-switching hysteresis
-static const float MODE_SWITCH_EXTRA = 0.5f;  // ~0.9F
+static const float MODE_SWITCH_EXTRA = 1.11f;  // ~2.0F
 
 // ============================================================
 // Configuration Setters

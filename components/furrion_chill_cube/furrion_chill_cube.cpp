@@ -190,18 +190,6 @@ void FurrionChillCube::transmit_mode_command_() {
     this->encode_(data, &message[6], 6, 0);
   }
 
-  // Swing mode (in same transmission, with gap)
-  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    data->space(IR_PACKET_SPACE);
-    if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
-      static const uint8_t SWING_ON[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
-      this->encode_(data, SWING_ON, 6, 1);
-    } else {
-      static const uint8_t SWING_OFF[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
-      this->encode_(data, SWING_OFF, 6, 1);
-    }
-  }
-
   transmit.perform();
 
   ESP_LOGD(TAG, "IR mode=%d fan=%d swing=%d",
@@ -444,36 +432,53 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     }
   }
 
+  // Target temperature changes — abort kickstart for immediate gear re-evaluation
+  bool temp_changed = false;
   if (call.get_target_temperature().has_value()) {
     this->target_temperature = *call.get_target_temperature();
+    temp_changed = true;
   }
   if (call.get_target_temperature_low().has_value()) {
     this->target_temperature_low = *call.get_target_temperature_low();
     if (this->target_temperature_high - this->target_temperature_low < heat_cool_gap_c_) {
       this->target_temperature_high = this->target_temperature_low + heat_cool_gap_c_;
     }
+    temp_changed = true;
   }
   if (call.get_target_temperature_high().has_value()) {
     this->target_temperature_high = *call.get_target_temperature_high();
     if (this->target_temperature_high - this->target_temperature_low < heat_cool_gap_c_) {
       this->target_temperature_low = this->target_temperature_high - heat_cool_gap_c_;
     }
+    temp_changed = true;
   }
+  if (temp_changed && kick_phase_ != KickPhase::IDLE) {
+    ESP_LOGI(TAG, "Kickstart aborted — user target temp change");
+    kick_phase_ = KickPhase::IDLE;
+    mode_resend_at_ = 0;
+    cs_reinforce_count_ = 0;
+  }
+
+  // Fan mode change — works during kickstart, explicit non-AUTO terminates clamp
   if (call.get_fan_mode().has_value()) {
-    this->fan_mode = *call.get_fan_mode();
-    // Re-send mode command so fan change takes effect immediately
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
+    auto new_fan = *call.get_fan_mode();
+    this->fan_mode = new_fan;
+    // Explicit non-AUTO fan selection overrides the 5-min LOW clamp
+    if (new_fan != climate::CLIMATE_FAN_AUTO && fan_clamp_start_ > 0) {
+      fan_clamp_start_ = 0;
+      ESP_LOGI(TAG, "Fan clamp terminated — user set fan=%d", (int)new_fan);
+    }
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       transmit_mode_command_();
-      ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)*call.get_fan_mode());
+      ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)new_fan);
     }
   }
+
+  // Swing mode change — standalone swing frame, works during kickstart
   if (call.get_swing_mode().has_value()) {
     this->swing_mode = *call.get_swing_mode();
-    // Re-send mode command so swing change takes effect immediately
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
-      transmit_mode_command_();
-      ESP_LOGI(TAG, "User swing change → %d, mode command sent", (int)*call.get_swing_mode());
-    }
+    send_swing_state_();
+    ESP_LOGI(TAG, "User swing change → %d", (int)*call.get_swing_mode());
   }
 
   this->user_changed_ = true;
@@ -498,7 +503,7 @@ float FurrionChillCube::get_cool_target_() {
 
 climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
   bool clamp_active = fan_clamp_start_ > 0 && (millis() - fan_clamp_start_) < FAN_CLAMP_DURATION_MS;
-  if (clamp_active || kick_phase_ != KickPhase::IDLE) {
+  if (clamp_active) {
     return climate::CLIMATE_FAN_LOW;
   }
   return this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
@@ -528,6 +533,15 @@ void FurrionChillCube::update_action_() {
   if (this->action != action) {
     this->action = action;
     this->publish_state();
+  }
+}
+
+void FurrionChillCube::send_swing_state_() {
+  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) return;
+  if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
+    send_swing_on();
+  } else {
+    send_swing_off();
   }
 }
 
@@ -581,6 +595,7 @@ void FurrionChillCube::advance_kickstart_() {
         active_ir_mode_ = (kick_mode_ == 1) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL;
         fan_clamp_start_ = millis();
         transmit_mode_command_();
+        send_swing_state_();
         kick_phase_ = KickPhase::FRESH_MODE_ON;
         kick_phase_start_ = millis();
         ESP_LOGI(TAG, "Kickstart: MODE ON + fan=LOW, clamp=310s");
@@ -682,6 +697,7 @@ void FurrionChillCube::run_gear_controller_() {
     failsafe_active_ = true;
     active_ir_mode_ = climate::CLIMATE_MODE_COOL;
     transmit_mode_command_();
+    send_swing_state_();
     boot_ready_ = true;
     update_action_();
     return;
@@ -881,6 +897,7 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !heat_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
       transmit_mode_command_();
+      send_swing_state_();
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
@@ -1026,6 +1043,7 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !cool_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_COOL;
       transmit_mode_command_();
+      send_swing_state_();
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;

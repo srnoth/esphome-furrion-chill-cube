@@ -74,6 +74,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Helpers
   void set_cs_value_(int cs);
   void update_action_();
+  void send_swing_state_();
 
   // Hardware
   remote_transmitter::RemoteTransmitterComponent *transmitter_{nullptr};

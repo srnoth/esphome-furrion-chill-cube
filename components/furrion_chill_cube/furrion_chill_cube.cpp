@@ -182,20 +182,31 @@ void FurrionChillCube::transmit_mode_command_() {
     for (int i = 6; i <= 10; i++) message[11] += message[i];
   }
 
-  // Encode packet 1 (repeated once = sent twice)
+  // === Transmission 1: Mode command (B2 + D5) ===
   this->encode_(data, &message[0], 6, 1);
-
-  // Encode packet 2 (sent once) if not OFF
   if (message[6] != 0) {
     this->encode_(data, &message[6], 6, 0);
   }
+  transmit.perform();
 
+  // === Transmission 2: Swing (B9) — 10.5ms gaps before and after ===
+  // Matches Toshiba component: reuse same transmit object with reset
+  data->reset();
+  data->space(IR_PACKET_SPACE);
+  if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
+    static const uint8_t SWING_ON[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
+    this->encode_(data, SWING_ON, 6, 1);
+  } else {
+    static const uint8_t SWING_OFF[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
+    this->encode_(data, SWING_OFF, 6, 1);
+  }
+  data->space(IR_PACKET_SPACE);
   transmit.perform();
 
   ESP_LOGD(TAG, "IR mode=%d fan=%d swing=%d",
            (int)active_ir_mode_, (int)fan, (int)this->swing_mode);
 
-  // Follow-up CS update (enabled flag only, no data)
+  // === Transmission 3: CS follow-up (BA) — separate transmit object ===
   if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !failsafe_active_) {
     this->transmit_cs_update_(false);
   }
@@ -595,7 +606,6 @@ void FurrionChillCube::advance_kickstart_() {
         active_ir_mode_ = (kick_mode_ == 1) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL;
         fan_clamp_start_ = millis();
         transmit_mode_command_();
-        send_swing_state_();
         kick_phase_ = KickPhase::FRESH_MODE_ON;
         kick_phase_start_ = millis();
         ESP_LOGI(TAG, "Kickstart: MODE ON + fan=LOW, clamp=310s");
@@ -697,7 +707,6 @@ void FurrionChillCube::run_gear_controller_() {
     failsafe_active_ = true;
     active_ir_mode_ = climate::CLIMATE_MODE_COOL;
     transmit_mode_command_();
-    send_swing_state_();
     boot_ready_ = true;
     update_action_();
     return;
@@ -897,7 +906,6 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !heat_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
       transmit_mode_command_();
-      send_swing_state_();
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
@@ -1043,7 +1051,6 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !cool_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_COOL;
       transmit_mode_command_();
-      send_swing_state_();
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;

@@ -51,9 +51,11 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
             cv.Optional(CONF_OUTSIDE_TEMPERATURE): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
+            # Gap between heat/cool setpoints, in °F (converted to °C internally)
             cv.Optional(CONF_HEAT_COOL_GAP, default=0.0): cv.float_range(
                 min=0.0, max=20.0
             ),
+            # Below this outside temp (°F), heating is locked out. Default 35°F ≈ 1.7°C
             cv.Optional(CONF_OUTSIDE_LOCKOUT_TEMP, default=35.0): cv.float_,
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(

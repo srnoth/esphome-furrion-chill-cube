@@ -58,9 +58,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Kickstart state machine
   enum class KickPhase : uint8_t {
     IDLE,
-    FRESH_PRE_CS,     // CS set, waiting 500ms before mode
-    FRESH_MODE_ON,    // Mode sent, waiting 60s
-    FRESH_DROP,       // Drop to target CS (instant)
+    FRESH_PRE_CS,       // CS set, waiting 500ms before mode
+    FRESH_MODE_ON,      // Mode sent, waiting 60s
     IDLE_KICK_CS,       // Idle kickstart CS=25 sent at t=0, waiting 5s
     IDLE_KICK_CS2,      // CS=25 reinforcement at t=5s, waiting until t=10s
   };

@@ -466,6 +466,7 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   if (temp_changed && kick_phase_ != KickPhase::IDLE) {
     ESP_LOGI(TAG, "Kickstart aborted — user target temp change");
     kick_phase_ = KickPhase::IDLE;
+    fan_clamp_start_ = 0;
     mode_resend_at_ = 0;
     cs_reinforce_count_ = 0;
   }
@@ -893,7 +894,7 @@ void FurrionChillCube::run_gear_controller_() {
         case 1:  cs = HEAT_ANCHOR + 1; break;
         default: cs = HEAT_ANCHOR + 2; break;
       }
-      bool needs_fresh_start = (gear == -1 && new_gear == 1 && new_gear != gear);
+      bool needs_fresh_start = (gear == -1 && new_gear == 1);
       if (needs_fresh_start) {
         start_fresh_kickstart_(1, cs);
         heat_kickstart_pending = true;
@@ -906,6 +907,7 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !heat_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
       transmit_mode_command_();
+      transmit_cs_update_(true);  // Ensure CS_DATA sent on cold start (kickstart path handles its own)
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
@@ -1051,6 +1053,7 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !cool_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_COOL;
       transmit_mode_command_();
+      transmit_cs_update_(true);  // Ensure CS_DATA sent on cold start (kickstart path handles its own)
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
@@ -1077,16 +1080,6 @@ void FurrionChillCube::run_gear_controller_() {
   // NEITHER ACTIVE
   // ==========================
   } else {
-    // Wind down any active gears to 0 (intermediate state for logging)
-    if (heat_gear_ > 0) {
-      ESP_LOGI(TAG, "HEAT %d -> -1 (neither active)", heat_gear_);
-      heat_gear_ = 0;
-    }
-    if (cool_gear_ > 0) {
-      ESP_LOGI(TAG, "COOL %d -> -1 (neither active)", cool_gear_);
-      cool_gear_ = 0;
-    }
-
     // Ensure HVAC is OFF
     if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
@@ -1103,12 +1096,14 @@ void FurrionChillCube::run_gear_controller_() {
       set_cs_value_(22);
     }
 
-    // HVAC is OFF — force gears to -1
+    // Force gears to -1
     if (heat_gear_ != -1) {
+      ESP_LOGI(TAG, "HEAT %d -> -1 (neither active)", heat_gear_);
       heat_gear_ = -1;
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     }
     if (cool_gear_ != -1) {
+      ESP_LOGI(TAG, "COOL %d -> -1 (neither active)", cool_gear_);
       cool_gear_ = -1;
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
     }

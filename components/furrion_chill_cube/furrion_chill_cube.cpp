@@ -195,10 +195,10 @@ void FurrionChillCube::transmit_mode_command_() {
     data->space(IR_PACKET_SPACE);
     if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
       static const uint8_t SWING_ON[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
-      this->encode_(data, SWING_ON, 6, 0);
+      this->encode_(data, SWING_ON, 6, 1);
     } else {
       static const uint8_t SWING_OFF[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
-      this->encode_(data, SWING_OFF, 6, 0);
+      this->encode_(data, SWING_OFF, 6, 1);
     }
   }
 
@@ -440,6 +440,7 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
       kick_phase_ = KickPhase::IDLE;
       mode_resend_at_ = 0;
       fan_clamp_start_ = 0;
+      cs_reinforce_count_ = 0;
     }
   }
 
@@ -673,6 +674,7 @@ void FurrionChillCube::run_gear_controller_() {
     last_active_mode_ = 0;
     fan_clamp_start_ = 0;
     mode_resend_at_ = 0;
+    cs_reinforce_count_ = 0;
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
@@ -782,6 +784,8 @@ void FurrionChillCube::run_gear_controller_() {
       cool_gear_ = -1;
       heat_gear_ = -1;
       fan_clamp_start_ = 0;
+      mode_resend_at_ = 0;
+      cs_reinforce_count_ = 0;
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
@@ -882,6 +886,8 @@ void FurrionChillCube::run_gear_controller_() {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
       transmit_mode_command_();
       fan_clamp_start_ = 0;
+      mode_resend_at_ = 0;
+      cs_reinforce_count_ = 0;
     }
 
     // Fan clamp: drop if heat gear 2+
@@ -906,6 +912,8 @@ void FurrionChillCube::run_gear_controller_() {
       heat_gear_ = -1;
       cool_gear_ = -1;
       fan_clamp_start_ = 0;
+      mode_resend_at_ = 0;
+      cs_reinforce_count_ = 0;
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
@@ -1023,6 +1031,8 @@ void FurrionChillCube::run_gear_controller_() {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
       transmit_mode_command_();
       fan_clamp_start_ = 0;
+      mode_resend_at_ = 0;
+      cs_reinforce_count_ = 0;
     }
 
     // Fan clamp: drop if cool gear 4+
@@ -1057,6 +1067,8 @@ void FurrionChillCube::run_gear_controller_() {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
       transmit_mode_command_();
       fan_clamp_start_ = 0;
+      mode_resend_at_ = 0;
+      cs_reinforce_count_ = 0;
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
       ESP_LOGI(TAG, "NEITHER ACTIVE — HVAC OFF");
     }

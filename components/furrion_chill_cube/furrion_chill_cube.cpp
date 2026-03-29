@@ -255,7 +255,7 @@ void FurrionChillCube::transmit_cs_update_(bool send_data) {
 void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg) {
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
-  this->encode_(data, msg, 6, 0);
+  this->encode_(data, msg, 6, 1);
   transmit.perform();
 }
 

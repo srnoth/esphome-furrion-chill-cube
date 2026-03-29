@@ -433,6 +433,14 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     }
 
     this->mode = new_mode;
+
+    // Abort active kickstart on mode change — user override takes priority
+    if (kick_phase_ != KickPhase::IDLE) {
+      ESP_LOGI(TAG, "Kickstart aborted — user mode change to %d", (int)new_mode);
+      kick_phase_ = KickPhase::IDLE;
+      mode_resend_at_ = 0;
+      fan_clamp_start_ = 0;
+    }
   }
 
   if (call.get_target_temperature().has_value()) {

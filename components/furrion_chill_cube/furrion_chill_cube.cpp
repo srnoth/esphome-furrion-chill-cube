@@ -83,6 +83,18 @@ void FurrionChillCube::set_outside_lockout_temp(float temp_f) {
 }
 
 // ============================================================
+// Active IR Mode Persistence
+// ============================================================
+
+void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
+  if (active_ir_mode_ == mode) return;
+  active_ir_mode_ = mode;
+  uint8_t m = (mode == climate::CLIMATE_MODE_HEAT) ? 1 :
+              (mode == climate::CLIMATE_MODE_COOL) ? 2 : 0;
+  mode_pref_.save(&m);
+}
+
+// ============================================================
 // IR Protocol Encoding
 // ============================================================
 
@@ -299,6 +311,21 @@ void FurrionChillCube::setup() {
              (int)this->swing_mode);
   }
 
+  // Restore active IR mode from flash (survives reboot)
+  mode_pref_ = global_preferences->make_preference<uint8_t>(this->get_object_id_hash() ^ 0x4D4F4445);
+  uint8_t saved_mode = 0;
+  if (mode_pref_.load(&saved_mode)) {
+    if (saved_mode == 1) {
+      heat_gear_ = 0;
+      last_active_mode_ = 1;
+      ESP_LOGI(TAG, "Restored prior mode: HEAT (gear → idle, skip kickstart)");
+    } else if (saved_mode == 2) {
+      cool_gear_ = 0;
+      last_active_mode_ = 2;
+      ESP_LOGI(TAG, "Restored prior mode: COOL (gear → idle, skip kickstart)");
+    }
+  }
+
   // Register temperature sensor callbacks
   if (inside_temp_sensor_) {
     inside_temp_sensor_->add_on_state_callback([this](float value) {
@@ -323,9 +350,9 @@ void FurrionChillCube::setup() {
     });
   }
 
-  // Initialize diagnostic sensors
-  if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
-  if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+  // Initialize diagnostic sensors (reflect restored gear state)
+  if (heat_gear_sensor_) heat_gear_sensor_->publish_state(heat_gear_);
+  if (cool_gear_sensor_) cool_gear_sensor_->publish_state(cool_gear_);
   if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
 }
 
@@ -604,7 +631,7 @@ void FurrionChillCube::advance_kickstart_() {
     case KickPhase::FRESH_PRE_CS:
       if (elapsed >= 500) {
         // Step 2: Turn on mode — first IR frame has correct CS
-        active_ir_mode_ = (kick_mode_ == 1) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL;
+        set_active_ir_mode_((kick_mode_ == 1) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
         fan_clamp_start_ = millis();
         transmit_mode_command_();
         kick_phase_ = KickPhase::FRESH_MODE_ON;
@@ -706,7 +733,7 @@ void FurrionChillCube::run_gear_controller_() {
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
     // CS feed stops (failsafe gate), unit reverts to own sensor
     failsafe_active_ = true;
-    active_ir_mode_ = climate::CLIMATE_MODE_COOL;
+    set_active_ir_mode_(climate::CLIMATE_MODE_COOL);
     transmit_mode_command_();
     boot_ready_ = true;
     update_action_();
@@ -815,7 +842,7 @@ void FurrionChillCube::run_gear_controller_() {
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-      active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
       mode_switch_off_at_ = now;
       ESP_LOGI(TAG, "MODE SWITCH cool→heat — OFF for 60s");
@@ -905,12 +932,12 @@ void FurrionChillCube::run_gear_controller_() {
 
     // HVAC on/off
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !heat_kickstart_pending) {
-      active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
+      set_active_ir_mode_(climate::CLIMATE_MODE_HEAT);
       transmit_mode_command_();
       transmit_cs_update_(true);  // Ensure CS_DATA sent on cold start (kickstart path handles its own)
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
       fan_clamp_start_ = 0;
       mode_resend_at_ = 0;
@@ -944,7 +971,7 @@ void FurrionChillCube::run_gear_controller_() {
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-      active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
       mode_switch_off_at_ = now;
       ESP_LOGI(TAG, "MODE SWITCH heat→cool — OFF for 60s");
@@ -1051,12 +1078,12 @@ void FurrionChillCube::run_gear_controller_() {
 
     // HVAC on/off
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !cool_kickstart_pending) {
-      active_ir_mode_ = climate::CLIMATE_MODE_COOL;
+      set_active_ir_mode_(climate::CLIMATE_MODE_COOL);
       transmit_mode_command_();
       transmit_cs_update_(true);  // Ensure CS_DATA sent on cold start (kickstart path handles its own)
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
       fan_clamp_start_ = 0;
       mode_resend_at_ = 0;
@@ -1082,7 +1109,7 @@ void FurrionChillCube::run_gear_controller_() {
   } else {
     // Ensure HVAC is OFF
     if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
       fan_clamp_start_ = 0;
       mode_resend_at_ = 0;
@@ -1139,6 +1166,9 @@ void FurrionChillCube::dump_config() {
   if (outside_temp_sensor_) {
     ESP_LOGCONFIG(TAG, "  Outside Temp Unit: %s", outside_temp_fahrenheit_ ? "°F" : "°C");
   }
+  const char *mode_str = (heat_gear_ == 0) ? "HEAT (idle)" :
+                         (cool_gear_ == 0) ? "COOL (idle)" : "OFF";
+  ESP_LOGCONFIG(TAG, "  Restored Mode: %s", mode_str);
 }
 
 }  // namespace furrion_chill_cube

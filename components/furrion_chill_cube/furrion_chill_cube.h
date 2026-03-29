@@ -6,6 +6,7 @@
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/button/button.h"
+#include "esphome/core/preferences.h"
 
 namespace esphome {
 namespace furrion_chill_cube {
@@ -74,6 +75,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_cs_value_(int cs);
   void update_action_();
   void send_swing_state_();
+  void set_active_ir_mode_(climate::ClimateMode mode);
 
   // Hardware
   remote_transmitter::RemoteTransmitterComponent *transmitter_{nullptr};
@@ -129,6 +131,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Cached temperatures (Celsius)
   float inside_temp_c_{NAN};
   float outside_temp_c_{NAN};
+
+  // Persisted mode (survives reboot)
+  ESPPreferenceObject mode_pref_;
 };
 
 // Button sub-entities

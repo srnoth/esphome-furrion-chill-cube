@@ -468,6 +468,11 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   }
   if (call.get_swing_mode().has_value()) {
     this->swing_mode = *call.get_swing_mode();
+    // Re-send mode command so swing change takes effect immediately
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
+      transmit_mode_command_();
+      ESP_LOGI(TAG, "User swing change → %d, mode command sent", (int)*call.get_swing_mode());
+    }
   }
 
   this->user_changed_ = true;

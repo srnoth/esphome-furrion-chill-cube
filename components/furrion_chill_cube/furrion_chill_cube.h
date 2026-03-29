@@ -46,7 +46,7 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // IR protocol
   void encode_(remote_base::RemoteTransmitData *data, const uint8_t *msg, uint8_t len, uint8_t repeat);
-  void transmit_mode_command_(bool include_swing = false);
+  void transmit_mode_command_();
   void transmit_cs_update_(bool send_data);
   void transmit_raw_6byte_(const uint8_t *msg);
 

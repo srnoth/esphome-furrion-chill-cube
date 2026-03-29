@@ -109,7 +109,7 @@ void FurrionChillCube::encode_(remote_base::RemoteTransmitData *data,
 // IR Transmission Methods
 // ============================================================
 
-void FurrionChillCube::transmit_mode_command_(bool include_swing) {
+void FurrionChillCube::transmit_mode_command_() {
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
 
@@ -188,18 +188,6 @@ void FurrionChillCube::transmit_mode_command_(bool include_swing) {
   // Encode packet 2 (sent once) if not OFF
   if (message[6] != 0) {
     this->encode_(data, &message[6], 6, 0);
-  }
-
-  // Swing frame (only on mode-ON transitions to avoid double beep on fan changes)
-  if (include_swing && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    data->space(IR_PACKET_SPACE);
-    if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
-      static const uint8_t SWING_ON[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
-      this->encode_(data, SWING_ON, 6, 1);
-    } else {
-      static const uint8_t SWING_OFF[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
-      this->encode_(data, SWING_OFF, 6, 1);
-    }
   }
 
   transmit.perform();
@@ -606,7 +594,8 @@ void FurrionChillCube::advance_kickstart_() {
         // Step 2: Turn on mode — first IR frame has correct CS
         active_ir_mode_ = (kick_mode_ == 1) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL;
         fan_clamp_start_ = millis();
-        transmit_mode_command_(true);
+        transmit_mode_command_();
+        send_swing_state_();
         kick_phase_ = KickPhase::FRESH_MODE_ON;
         kick_phase_start_ = millis();
         ESP_LOGI(TAG, "Kickstart: MODE ON + fan=LOW, clamp=310s");
@@ -707,7 +696,8 @@ void FurrionChillCube::run_gear_controller_() {
     // CS feed stops (failsafe gate), unit reverts to own sensor
     failsafe_active_ = true;
     active_ir_mode_ = climate::CLIMATE_MODE_COOL;
-    transmit_mode_command_(true);
+    transmit_mode_command_();
+    send_swing_state_();
     boot_ready_ = true;
     update_action_();
     return;
@@ -906,7 +896,8 @@ void FurrionChillCube::run_gear_controller_() {
     // HVAC on/off
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !heat_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
-      transmit_mode_command_(true);
+      transmit_mode_command_();
+      send_swing_state_();
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;
@@ -1051,7 +1042,8 @@ void FurrionChillCube::run_gear_controller_() {
     // HVAC on/off
     if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !cool_kickstart_pending) {
       active_ir_mode_ = climate::CLIMATE_MODE_COOL;
-      transmit_mode_command_(true);
+      transmit_mode_command_();
+      send_swing_state_();
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       active_ir_mode_ = climate::CLIMATE_MODE_OFF;

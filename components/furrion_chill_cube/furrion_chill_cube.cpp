@@ -372,7 +372,17 @@ void FurrionChillCube::loop() {
     // Re-send mode with AUTO fan if unit is on
     if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
       transmit_mode_command_();
-      ESP_LOGI(TAG, "Fan clamp expired — fan → AUTO");
+      mode_resend_at_ = now;
+      ESP_LOGI(TAG, "Fan clamp expired — fan → AUTO (re-send in 5s)");
+    }
+  }
+
+  // 6. Mode command re-send (one-shot, 5s after fan recovery)
+  if (mode_resend_at_ > 0 && (now - mode_resend_at_) >= 5000) {
+    mode_resend_at_ = 0;
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
+      transmit_mode_command_();
+      ESP_LOGI(TAG, "Mode re-send (fan recovery)");
     }
   }
 }
@@ -442,6 +452,11 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   }
   if (call.get_fan_mode().has_value()) {
     this->fan_mode = *call.get_fan_mode();
+    // Re-send mode command so fan change takes effect immediately
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
+      transmit_mode_command_();
+      ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)*call.get_fan_mode());
+    }
   }
   if (call.get_swing_mode().has_value()) {
     this->swing_mode = *call.get_swing_mode();
@@ -521,6 +536,7 @@ void FurrionChillCube::start_fresh_kickstart_(int mode, int target_cs) {
 
   kick_phase_ = KickPhase::FRESH_PRE_CS;
   kick_phase_start_ = millis();
+  mode_resend_at_ = 0;
   ESP_LOGI(TAG, "Kickstart: PRE-SET cs=%d, target_cs=%d", restart_cs, target_cs);
 }
 
@@ -537,6 +553,7 @@ void FurrionChillCube::start_idle_kickstart_(int target_cs) {
 
   kick_phase_ = KickPhase::IDLE_KICK_CS;
   kick_phase_start_ = millis();
+  mode_resend_at_ = 0;
   ESP_LOGI(TAG, "Idle kickstart: cs=25 target_cs=%d", target_cs);
 }
 
@@ -642,6 +659,7 @@ void FurrionChillCube::run_gear_controller_() {
     idle_since_ = 0;
     last_active_mode_ = 0;
     fan_clamp_start_ = 0;
+    mode_resend_at_ = 0;
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
@@ -859,7 +877,8 @@ void FurrionChillCube::run_gear_controller_() {
       if (clamp_active && new_gear >= 2) {
         fan_clamp_start_ = 0;
         transmit_mode_command_();
-        ESP_LOGI(TAG, "HEAT clamp dropped — gear %d", new_gear);
+        mode_resend_at_ = now;
+        ESP_LOGI(TAG, "HEAT clamp dropped — gear %d (re-send in 5s)", new_gear);
       }
     }
 
@@ -999,7 +1018,8 @@ void FurrionChillCube::run_gear_controller_() {
       if (clamp_active && new_gear >= 4) {
         fan_clamp_start_ = 0;
         transmit_mode_command_();
-        ESP_LOGI(TAG, "COOL clamp dropped — gear %d", new_gear);
+        mode_resend_at_ = now;
+        ESP_LOGI(TAG, "COOL clamp dropped — gear %d (re-send in 5s)", new_gear);
       }
     }
 

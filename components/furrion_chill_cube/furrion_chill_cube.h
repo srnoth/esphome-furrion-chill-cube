@@ -109,6 +109,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t ha_disconnect_time_{0};
   uint32_t temp_nan_since_{0};
   uint32_t fan_clamp_start_{0};
+  uint32_t mode_resend_at_{0};
 
   // Kickstart
   KickPhase kick_phase_{KickPhase::IDLE};

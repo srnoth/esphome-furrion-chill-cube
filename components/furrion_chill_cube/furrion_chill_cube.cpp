@@ -415,9 +415,9 @@ void FurrionChillCube::loop() {
 
 climate::ClimateTraits FurrionChillCube::traits() {
   auto traits = climate::ClimateTraits();
-  traits.set_supports_current_temperature(true);
-  traits.set_supports_two_point_target_temperature(true);
-  traits.set_supports_action(true);
+  traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE |
+                           climate::CLIMATE_REQUIRES_TWO_POINT_TARGET_TEMPERATURE |
+                           climate::CLIMATE_SUPPORTS_ACTION);
   traits.add_supported_mode(climate::CLIMATE_MODE_OFF);
   traits.add_supported_mode(climate::CLIMATE_MODE_HEAT);
   traits.add_supported_mode(climate::CLIMATE_MODE_COOL);

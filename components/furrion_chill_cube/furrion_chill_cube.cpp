@@ -514,13 +514,22 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   }
 
   // Swing mode change — standalone swing frame, works during kickstart
+  // Does NOT set user_changed_: vent direction is cosmetic and must never
+  // trigger gear recalculation, timer resets, or immediate-off logic.
   if (call.get_swing_mode().has_value()) {
     this->swing_mode = *call.get_swing_mode();
     send_swing_state_();
     ESP_LOGI(TAG, "User swing change → %d", (int)*call.get_swing_mode());
   }
 
-  this->user_changed_ = true;
+  // Only flag gear recalculation for changes that affect cooling/heating
+  // (mode, setpoint, fan). Swing is purely cosmetic.
+  bool gear_relevant = call.get_mode().has_value() ||
+                       temp_changed ||
+                       call.get_fan_mode().has_value();
+  if (gear_relevant) {
+    this->user_changed_ = true;
+  }
   this->publish_state();
 }
 

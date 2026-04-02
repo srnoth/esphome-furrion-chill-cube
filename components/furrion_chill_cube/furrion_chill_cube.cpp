@@ -440,8 +440,13 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     auto new_mode = *call.get_mode();
     auto old_mode = this->mode;
 
-    // With CLIMATE_REQUIRES_TWO_POINT_TARGET_TEMPERATURE, HA always maintains
-    // target_temperature_low and target_temperature_high. Just ensure non-NaN.
+    // Sync target_temperature for HA single-slider display in HEAT/COOL modes
+    if (new_mode == climate::CLIMATE_MODE_HEAT) {
+      this->target_temperature = this->target_temperature_low;
+    } else if (new_mode == climate::CLIMATE_MODE_COOL) {
+      this->target_temperature = this->target_temperature_high;
+    }
+    // Ensure two-point values valid for first boot
     if (isnan(this->target_temperature_low)) this->target_temperature_low = 20.0f;
     if (isnan(this->target_temperature_high)) this->target_temperature_high = 25.0f;
 
@@ -477,6 +482,17 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     }
     temp_changed = true;
   }
+  // Sync target_temperature when low/high change in single modes.
+  // Without this, get_heat/cool_target_() returns a stale value in HEAT/COOL modes.
+  if (call.get_target_temperature_low().has_value() &&
+      this->mode == climate::CLIMATE_MODE_HEAT) {
+    this->target_temperature = this->target_temperature_low;
+  }
+  if (call.get_target_temperature_high().has_value() &&
+      this->mode == climate::CLIMATE_MODE_COOL) {
+    this->target_temperature = this->target_temperature_high;
+  }
+
   if (temp_changed && kick_phase_ != KickPhase::IDLE) {
     ESP_LOGI(TAG, "Kickstart aborted — user target temp change");
     kick_phase_ = KickPhase::IDLE;
@@ -525,11 +541,15 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 // ============================================================
 
 float FurrionChillCube::get_heat_target_() {
-  return this->target_temperature_low;
+  if (this->mode == climate::CLIMATE_MODE_HEAT_COOL)
+    return this->target_temperature_low;
+  return this->target_temperature;
 }
 
 float FurrionChillCube::get_cool_target_() {
-  return this->target_temperature_high;
+  if (this->mode == climate::CLIMATE_MODE_HEAT_COOL)
+    return this->target_temperature_high;
+  return this->target_temperature;
 }
 
 climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {

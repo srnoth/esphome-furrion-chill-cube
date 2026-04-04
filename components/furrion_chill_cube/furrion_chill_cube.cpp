@@ -549,6 +549,7 @@ float FurrionChillCube::get_heat_target_() {
 float FurrionChillCube::get_cool_target_() {
   if (this->mode == climate::CLIMATE_MODE_HEAT_COOL)
     return this->target_temperature_high;
+  ESP_LOGD(TAG, "cool_target: target_temp=%.4f target_high=%.4f", this->target_temperature, this->target_temperature_high);
   return this->target_temperature;
 }
 
@@ -871,15 +872,18 @@ void FurrionChillCube::run_gear_controller_() {
     int gear = heat_gear_;
     int new_gear = gear;
 
-    if (gear == -1) {
+    if (gear == -1 || user_input) {
+      // Fresh start or user change: jump directly to appropriate gear
       if (diff < H_UP_23)         new_gear = 3;
       else if (diff < H_UP_12)    new_gear = 2;
       else if (diff < H_UP_01)    new_gear = 1;
+      else if (diff > H_IDLE)     new_gear = (gear == -1) ? -1 : 0;
+      else                        new_gear = 0;
     } else {
       switch (gear) {
         case 0: {
           if (can_upshift_to(1) && diff < H_UP_01) new_gear = 1;
-          bool imm_off = !boot_ready_ || user_input;
+          bool imm_off = !boot_ready_;
           bool far_from_setpoint = (diff > 1.1f);
           if ((imm_off || (idle_long_enough && far_from_setpoint)) && diff > H_IDLE) new_gear = -1;
           break;
@@ -1000,17 +1004,20 @@ void FurrionChillCube::run_gear_controller_() {
     int gear = cool_gear_;
     int new_gear = gear;
 
-    if (gear == -1) {
+    if (gear == -1 || user_input) {
+      // Fresh start or user change: jump directly to appropriate gear
       if (diff > C_UP_45)         new_gear = 5;
       else if (diff > C_UP_34)    new_gear = 4;
       else if (diff > C_UP_23)    new_gear = 3;
       else if (diff > C_UP_12)    new_gear = 2;
       else if (diff > C_UP_01)    new_gear = 1;
+      else if (diff < C_IDLE)     new_gear = (gear == -1) ? -1 : 0;
+      else                        new_gear = 0;
     } else {
       switch (gear) {
         case 0: {
           if (can_upshift_to(1) && diff > C_UP_01) new_gear = 1;
-          bool imm_off = !boot_ready_ || user_input;
+          bool imm_off = !boot_ready_;
           bool far_from_setpoint = (diff < -1.1f);
           if ((imm_off || (idle_long_enough && far_from_setpoint)) && diff < C_IDLE) new_gear = -1;
           break;

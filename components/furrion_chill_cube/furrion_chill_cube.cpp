@@ -541,16 +541,15 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 // ============================================================
 
 float FurrionChillCube::get_heat_target_() {
-  if (this->mode == climate::CLIMATE_MODE_HEAT_COOL)
-    return this->target_temperature_low;
-  return this->target_temperature;
+  // Always use target_temperature_low — it's the authoritative value maintained by YAML sync.
+  // target_temperature is unreliable (state restore union, missed sync paths).
+  return this->target_temperature_low;
 }
 
 float FurrionChillCube::get_cool_target_() {
-  if (this->mode == climate::CLIMATE_MODE_HEAT_COOL)
-    return this->target_temperature_high;
-  ESP_LOGD(TAG, "cool_target: target_temp=%.4f target_high=%.4f", this->target_temperature, this->target_temperature_high);
-  return this->target_temperature;
+  // Always use target_temperature_high — it's the authoritative value maintained by YAML sync.
+  // target_temperature is unreliable (state restore union, missed sync paths).
+  return this->target_temperature_high;
 }
 
 climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {

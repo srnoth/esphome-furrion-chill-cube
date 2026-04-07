@@ -43,23 +43,58 @@ CONF_TURBO_OFF = "turbo_off"
 CONF_SWING_ON = "swing_on"
 CONF_SWING_OFF = "swing_off"
 CONF_DEBUG = "debug"
+CONF_DEBUG_ACTIVE_IR_MODE = "debug_active_ir_mode"
+CONF_DEBUG_LAST_ACTIVE_MODE = "debug_last_active_mode"
+CONF_DEBUG_KICK_PHASE = "debug_kick_phase"
+CONF_DEBUG_GEAR_DIFF = "debug_gear_diff"
+CONF_DEBUG_TIME_IN_GEAR = "debug_time_in_gear"
+CONF_DEBUG_IDLE_DURATION = "debug_idle_duration"
+CONF_DEBUG_MODE_SWITCH_COOLDOWN = "debug_mode_switch_cooldown"
+CONF_DEBUG_FAN_CLAMP_REMAINING = "debug_fan_clamp_remaining"
+CONF_DEBUG_HEATER_LOCKED_OUT = "debug_heater_locked_out"
+CONF_DEBUG_FAILSAFE_ACTIVE = "debug_failsafe_active"
+CONF_DEBUG_BOOT_READY = "debug_boot_ready"
 
-# Debug sensor definitions: (suffix, setter_name, unit, accuracy_decimals, icon)
-DEBUG_SENSORS = [
-    ("active_ir_mode", "set_debug_active_ir_mode_sensor", "", 0, "mdi:hvac"),
-    ("last_active_mode", "set_debug_last_active_mode_sensor", "", 0, "mdi:swap-horizontal"),
-    ("kick_phase", "set_debug_kick_phase_sensor", "", 0, "mdi:rocket-launch"),
-    ("gear_diff", "set_debug_gear_diff_sensor", UNIT_CELSIUS, 2, "mdi:thermometer-lines"),
-    ("time_in_gear", "set_debug_time_in_gear_sensor", UNIT_SECOND, 0, "mdi:timer"),
-    ("idle_duration", "set_debug_idle_duration_sensor", UNIT_SECOND, 0, "mdi:timer-sand"),
-    ("mode_switch_cooldown", "set_debug_mode_switch_cooldown_sensor", UNIT_SECOND, 0, "mdi:timer-lock"),
-    ("fan_clamp_remaining", "set_debug_fan_clamp_remaining_sensor", UNIT_SECOND, 0, "mdi:fan-clock"),
-    ("heater_locked_out", "set_debug_heater_locked_out_sensor", "", 0, "mdi:lock"),
-    ("failsafe_active", "set_debug_failsafe_active_sensor", "", 0, "mdi:shield-alert"),
-    ("boot_ready", "set_debug_boot_ready_sensor", "", 0, "mdi:check-circle"),
+# (config_key, setter_name)
+DEBUG_SENSOR_MAP = [
+    (CONF_DEBUG_ACTIVE_IR_MODE, "set_debug_active_ir_mode_sensor"),
+    (CONF_DEBUG_LAST_ACTIVE_MODE, "set_debug_last_active_mode_sensor"),
+    (CONF_DEBUG_KICK_PHASE, "set_debug_kick_phase_sensor"),
+    (CONF_DEBUG_GEAR_DIFF, "set_debug_gear_diff_sensor"),
+    (CONF_DEBUG_TIME_IN_GEAR, "set_debug_time_in_gear_sensor"),
+    (CONF_DEBUG_IDLE_DURATION, "set_debug_idle_duration_sensor"),
+    (CONF_DEBUG_MODE_SWITCH_COOLDOWN, "set_debug_mode_switch_cooldown_sensor"),
+    (CONF_DEBUG_FAN_CLAMP_REMAINING, "set_debug_fan_clamp_remaining_sensor"),
+    (CONF_DEBUG_HEATER_LOCKED_OUT, "set_debug_heater_locked_out_sensor"),
+    (CONF_DEBUG_FAILSAFE_ACTIVE, "set_debug_failsafe_active_sensor"),
+    (CONF_DEBUG_BOOT_READY, "set_debug_boot_ready_sensor"),
 ]
 
-CONFIG_SCHEMA = (
+
+def _auto_debug_sensors(config):
+    """When debug: true, auto-populate any missing debug sensor configs."""
+    if config.get(CONF_DEBUG):
+        for key, _ in DEBUG_SENSOR_MAP:
+            if key not in config:
+                config[key] = {}
+    return config
+
+_DEBUG_SENSOR = sensor.sensor_schema(
+    accuracy_decimals=0,
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
+_DEBUG_SENSOR_C = sensor.sensor_schema(
+    accuracy_decimals=2,
+    unit_of_measurement=UNIT_CELSIUS,
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
+_DEBUG_SENSOR_S = sensor.sensor_schema(
+    accuracy_decimals=0,
+    unit_of_measurement=UNIT_SECOND,
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
+
+CONFIG_SCHEMA = cv.All(
     climate.climate_schema(FurrionChillCube)
     .extend(
         {
@@ -96,6 +131,18 @@ CONFIG_SCHEMA = (
             ),
             # Debug mode: auto-creates diagnostic sensors for internal state
             cv.Optional(CONF_DEBUG, default=False): cv.boolean,
+            # Debug sensors (auto-populated when debug: true, or add individually)
+            cv.Optional(CONF_DEBUG_ACTIVE_IR_MODE): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_LAST_ACTIVE_MODE): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_KICK_PHASE): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_GEAR_DIFF): _DEBUG_SENSOR_C,
+            cv.Optional(CONF_DEBUG_TIME_IN_GEAR): _DEBUG_SENSOR_S,
+            cv.Optional(CONF_DEBUG_IDLE_DURATION): _DEBUG_SENSOR_S,
+            cv.Optional(CONF_DEBUG_MODE_SWITCH_COOLDOWN): _DEBUG_SENSOR_S,
+            cv.Optional(CONF_DEBUG_FAN_CLAMP_REMAINING): _DEBUG_SENSOR_S,
+            cv.Optional(CONF_DEBUG_HEATER_LOCKED_OUT): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_FAILSAFE_ACTIVE): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_BOOT_READY): _DEBUG_SENSOR,
             # Buttons (optional)
             cv.Optional(CONF_DISPLAY_TOGGLE): button.button_schema(
                 DisplayToggleButton,
@@ -119,7 +166,8 @@ CONFIG_SCHEMA = (
             ),
         }
     )
-    .extend(cv.COMPONENT_SCHEMA)
+    .extend(cv.COMPONENT_SCHEMA),
+    _auto_debug_sensors,
 )
 
 
@@ -171,29 +219,8 @@ async def to_code(config):
             btn = await button.new_button(config[key])
             await cg.register_parented(btn, config[CONF_ID])
 
-    # Debug sensors
-    if config[CONF_DEBUG]:
-        from esphome.core import ID
-
-        parent_id = str(config[CONF_ID].id)
-        for suffix, setter, unit, accuracy, icon in DEBUG_SENSORS:
-            sid = ID(
-                f"{parent_id}_debug_{suffix}",
-                is_declaration=True,
-                type=sensor.Sensor,
-            )
-            s = cg.new_Pvariable(sid)
-            human_name = suffix.replace("_", " ").title()
-            cg.add(s.set_name(f"Debug {human_name}"))
-            cg.add(s.set_object_id(f"{parent_id}_debug_{suffix}"))
-            if unit:
-                cg.add(s.set_unit_of_measurement(unit))
-            cg.add(s.set_accuracy_decimals(accuracy))
-            cg.add(s.set_icon(icon))
-            cg.add(
-                s.set_entity_category(
-                    cg.global_ns.ENTITY_CATEGORY_DIAGNOSTIC
-                )
-            )
-            cg.add(cg.App.register_sensor(s))
+    # Debug sensors (auto-populated by _auto_debug_sensors when debug: true)
+    for key, setter in DEBUG_SENSOR_MAP:
+        if key in config:
+            s = await sensor.new_sensor(config[key])
             cg.add(getattr(var, setter)(s))

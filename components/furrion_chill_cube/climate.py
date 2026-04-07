@@ -70,6 +70,20 @@ DEBUG_SENSOR_MAP = [
     (CONF_DEBUG_BOOT_READY, "set_debug_boot_ready_sensor"),
 ]
 
+_DEBUG_SENSOR = sensor.sensor_schema(
+    accuracy_decimals=0,
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
+_DEBUG_SENSOR_C = sensor.sensor_schema(
+    accuracy_decimals=2,
+    unit_of_measurement=UNIT_CELSIUS,
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
+_DEBUG_SENSOR_S = sensor.sensor_schema(
+    accuracy_decimals=0,
+    unit_of_measurement=UNIT_SECOND,
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
 
 _DEBUG_SCHEMAS = {
     CONF_DEBUG_ACTIVE_IR_MODE: _DEBUG_SENSOR,
@@ -95,20 +109,6 @@ def _auto_debug_sensors(config):
                 config[key] = _DEBUG_SCHEMAS[key]({})
     return config
 
-_DEBUG_SENSOR = sensor.sensor_schema(
-    accuracy_decimals=0,
-    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
-)
-_DEBUG_SENSOR_C = sensor.sensor_schema(
-    accuracy_decimals=2,
-    unit_of_measurement=UNIT_CELSIUS,
-    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
-)
-_DEBUG_SENSOR_S = sensor.sensor_schema(
-    accuracy_decimals=0,
-    unit_of_measurement=UNIT_SECOND,
-    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
-)
 
 CONFIG_SCHEMA = cv.All(
     climate.climate_schema(FurrionChillCube)

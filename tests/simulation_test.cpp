@@ -64,8 +64,7 @@ int select_cool_gear(int current_gear, float room_c, float target_c,
         else if (diff > C_UP_23)    new_gear = 3;
         else if (diff > C_UP_12)    new_gear = 2;
         else if (diff > C_UP_01)    new_gear = 1;
-        else if (diff < C_IDLE)     new_gear = (gear == -1) ? -1 : 0;
-        else                        new_gear = 0;
+        else                        new_gear = (gear == -1) ? -1 : 0;
     } else {
         switch (gear) {
             case 0: {
@@ -114,8 +113,7 @@ int select_heat_gear(int current_gear, float room_c, float target_c,
         if (diff < H_UP_23)         new_gear = 3;
         else if (diff < H_UP_12)    new_gear = 2;
         else if (diff < H_UP_01)    new_gear = 1;
-        else if (diff > H_IDLE)     new_gear = (gear == -1) ? -1 : 0;
-        else                        new_gear = 0;
+        else                        new_gear = (gear == -1) ? -1 : 0;
     } else {
         switch (gear) {
             case 0: {

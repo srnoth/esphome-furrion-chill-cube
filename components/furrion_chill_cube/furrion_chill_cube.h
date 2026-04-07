@@ -33,6 +33,19 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_compressor_output_sensor(sensor::Sensor *s) { compressor_output_sensor_ = s; }
   void set_comfort_sense_sensor(sensor::Sensor *s) { cs_value_sensor_ = s; }
 
+  // Debug sensor setters
+  void set_debug_active_ir_mode_sensor(sensor::Sensor *s) { debug_active_ir_mode_sensor_ = s; }
+  void set_debug_last_active_mode_sensor(sensor::Sensor *s) { debug_last_active_mode_sensor_ = s; }
+  void set_debug_kick_phase_sensor(sensor::Sensor *s) { debug_kick_phase_sensor_ = s; }
+  void set_debug_gear_diff_sensor(sensor::Sensor *s) { debug_gear_diff_sensor_ = s; }
+  void set_debug_time_in_gear_sensor(sensor::Sensor *s) { debug_time_in_gear_sensor_ = s; }
+  void set_debug_idle_duration_sensor(sensor::Sensor *s) { debug_idle_duration_sensor_ = s; }
+  void set_debug_mode_switch_cooldown_sensor(sensor::Sensor *s) { debug_mode_switch_cooldown_sensor_ = s; }
+  void set_debug_fan_clamp_remaining_sensor(sensor::Sensor *s) { debug_fan_clamp_remaining_sensor_ = s; }
+  void set_debug_heater_locked_out_sensor(sensor::Sensor *s) { debug_heater_locked_out_sensor_ = s; }
+  void set_debug_failsafe_active_sensor(sensor::Sensor *s) { debug_failsafe_active_sensor_ = s; }
+  void set_debug_boot_ready_sensor(sensor::Sensor *s) { debug_boot_ready_sensor_ = s; }
+
   // IR commands (public for button access)
   void send_display_toggle();
   void send_turbo_on();
@@ -76,6 +89,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void update_action_();
   void send_swing_state_();
   void set_active_ir_mode_(climate::ClimateMode mode);
+  void publish_debug_state_(float diff);
 
   // Hardware
   remote_transmitter::RemoteTransmitterComponent *transmitter_{nullptr};
@@ -87,6 +101,19 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *cool_gear_sensor_{nullptr};
   sensor::Sensor *compressor_output_sensor_{nullptr};
   sensor::Sensor *cs_value_sensor_{nullptr};
+
+  // Debug sensors (registered when debug: true)
+  sensor::Sensor *debug_active_ir_mode_sensor_{nullptr};
+  sensor::Sensor *debug_last_active_mode_sensor_{nullptr};
+  sensor::Sensor *debug_kick_phase_sensor_{nullptr};
+  sensor::Sensor *debug_gear_diff_sensor_{nullptr};
+  sensor::Sensor *debug_time_in_gear_sensor_{nullptr};
+  sensor::Sensor *debug_idle_duration_sensor_{nullptr};
+  sensor::Sensor *debug_mode_switch_cooldown_sensor_{nullptr};
+  sensor::Sensor *debug_fan_clamp_remaining_sensor_{nullptr};
+  sensor::Sensor *debug_heater_locked_out_sensor_{nullptr};
+  sensor::Sensor *debug_failsafe_active_sensor_{nullptr};
+  sensor::Sensor *debug_boot_ready_sensor_{nullptr};
 
   // Configuration
   float heat_cool_gap_c_{0.0f};            // 0°F default (same setpoint allowed)

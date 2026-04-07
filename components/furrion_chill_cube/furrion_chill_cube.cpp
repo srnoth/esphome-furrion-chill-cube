@@ -698,6 +698,7 @@ void FurrionChillCube::advance_kickstart_() {
 void FurrionChillCube::run_gear_controller_() {
   float room = inside_temp_c_;
   uint32_t now = millis();
+  float gear_diff = NAN;  // Tracks active diff for debug publishing
 
   // === Failsafe scenario 1: Boot, HA never connects (5 min) ===
   bool never_got_update = (last_temp_update_ == 0 && now > 300000);
@@ -756,6 +757,7 @@ void FurrionChillCube::run_gear_controller_() {
   if (isnan(room)) {
     ESP_LOGD(TAG, "Room temp NaN — holding (%lus left)",
              (300000 - (now - temp_nan_since_)) / 1000);
+    publish_debug_state_(NAN);
     return;
   }
 
@@ -770,6 +772,7 @@ void FurrionChillCube::run_gear_controller_() {
     if ((now - mode_switch_off_at_) < 60000) {
       ESP_LOGD(TAG, "Mode switch cooldown — %lus remaining",
                (60000 - (now - mode_switch_off_at_)) / 1000);
+      publish_debug_state_(NAN);
       return;
     }
     mode_switch_off_at_ = 0;
@@ -859,6 +862,7 @@ void FurrionChillCube::run_gear_controller_() {
       mode_switch_off_at_ = now;
       ESP_LOGI(TAG, "MODE SWITCH cool→heat — OFF for 60s");
       update_action_();
+      publish_debug_state_(NAN);
       return;
     }
     if (cool_gear_ != -1) {
@@ -868,16 +872,17 @@ void FurrionChillCube::run_gear_controller_() {
 
     float target = get_heat_target_();
     float diff = room - target;
+    gear_diff = diff;
     int gear = heat_gear_;
     int new_gear = gear;
 
     if (gear == -1 || user_input) {
       // Fresh start or user change: jump directly to appropriate gear
+      // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
       if (diff < H_UP_23)         new_gear = 3;
       else if (diff < H_UP_12)    new_gear = 2;
       else if (diff < H_UP_01)    new_gear = 1;
-      else if (diff > H_IDLE)     new_gear = (gear == -1) ? -1 : 0;
-      else                        new_gear = 0;
+      else                        new_gear = (gear == -1) ? -1 : 0;
     } else {
       switch (gear) {
         case 0: {
@@ -991,6 +996,7 @@ void FurrionChillCube::run_gear_controller_() {
       mode_switch_off_at_ = now;
       ESP_LOGI(TAG, "MODE SWITCH heat→cool — OFF for 60s");
       update_action_();
+      publish_debug_state_(NAN);
       return;
     }
     if (heat_gear_ != -1) {
@@ -1000,18 +1006,19 @@ void FurrionChillCube::run_gear_controller_() {
 
     float target = get_cool_target_();
     float diff = room - target;
+    gear_diff = diff;
     int gear = cool_gear_;
     int new_gear = gear;
 
     if (gear == -1 || user_input) {
       // Fresh start or user change: jump directly to appropriate gear
+      // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
       if (diff > C_UP_45)         new_gear = 5;
       else if (diff > C_UP_34)    new_gear = 4;
       else if (diff > C_UP_23)    new_gear = 3;
       else if (diff > C_UP_12)    new_gear = 2;
       else if (diff > C_UP_01)    new_gear = 1;
-      else if (diff < C_IDLE)     new_gear = (gear == -1) ? -1 : 0;
-      else                        new_gear = 0;
+      else                        new_gear = (gear == -1) ? -1 : 0;
     } else {
       switch (gear) {
         case 0: {
@@ -1163,12 +1170,77 @@ void FurrionChillCube::run_gear_controller_() {
     ESP_LOGI(TAG, "Boot ready — first gear computation complete, IR enabled");
   }
 
+  // Debug sensor publishing
+  publish_debug_state_(gear_diff);
+
   // Periodic state log
   ESP_LOGD(TAG, "state: heat=%d cool=%d room=%.2f cs=%d hold=%lus idle=%lum mode=%d",
            heat_gear_, cool_gear_, room, current_cs_,
            time_in_gear / 1000,
            idle_since_ > 0 ? (now - idle_since_) / 60000 : 0,
            last_active_mode_);
+}
+
+// ============================================================
+// Debug State Publishing
+// ============================================================
+
+void FurrionChillCube::publish_debug_state_(float diff) {
+  // Skip if no debug sensors registered
+  if (!debug_active_ir_mode_sensor_) return;
+
+  uint32_t now = millis();
+
+  // Active IR mode: 0=OFF, 1=HEAT, 2=COOL
+  float ir_mode = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? 1.0f :
+                  (active_ir_mode_ == climate::CLIMATE_MODE_COOL) ? 2.0f : 0.0f;
+  debug_active_ir_mode_sensor_->publish_state(ir_mode);
+
+  if (debug_last_active_mode_sensor_)
+    debug_last_active_mode_sensor_->publish_state((float)last_active_mode_);
+
+  if (debug_kick_phase_sensor_)
+    debug_kick_phase_sensor_->publish_state((float)(uint8_t)kick_phase_);
+
+  if (debug_gear_diff_sensor_)
+    debug_gear_diff_sensor_->publish_state(isnan(diff) ? NAN : diff);
+
+  if (debug_time_in_gear_sensor_) {
+    float tig = (last_gear_change_ == 0) ? -1.0f : (float)((now - last_gear_change_) / 1000);
+    debug_time_in_gear_sensor_->publish_state(tig);
+  }
+
+  if (debug_idle_duration_sensor_) {
+    float idle = (idle_since_ == 0) ? -1.0f : (float)((now - idle_since_) / 1000);
+    debug_idle_duration_sensor_->publish_state(idle);
+  }
+
+  if (debug_mode_switch_cooldown_sensor_) {
+    float cd = 0.0f;
+    if (mode_switch_off_at_ > 0) {
+      uint32_t elapsed = now - mode_switch_off_at_;
+      cd = (elapsed < 60000) ? (float)((60000 - elapsed) / 1000) : 0.0f;
+    }
+    debug_mode_switch_cooldown_sensor_->publish_state(cd);
+  }
+
+  if (debug_fan_clamp_remaining_sensor_) {
+    float clamp = 0.0f;
+    if (fan_clamp_start_ > 0) {
+      uint32_t elapsed = now - fan_clamp_start_;
+      clamp = (elapsed < FAN_CLAMP_DURATION_MS) ? (float)((FAN_CLAMP_DURATION_MS - elapsed) / 1000) : 0.0f;
+    }
+    debug_fan_clamp_remaining_sensor_->publish_state(clamp);
+  }
+
+  if (debug_heater_locked_out_sensor_)
+    debug_heater_locked_out_sensor_->publish_state(heater_locked_out_ ? 1.0f : 0.0f);
+
+  if (debug_failsafe_active_sensor_)
+    debug_failsafe_active_sensor_->publish_state(failsafe_active_ ? 1.0f : 0.0f);
+
+  if (debug_boot_ready_sensor_)
+    debug_boot_ready_sensor_->publish_state(boot_ready_ ? 1.0f : 0.0f);
 }
 
 // ============================================================

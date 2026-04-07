@@ -59,13 +59,13 @@ int select_cool_gear(int current_gear, float room_c, float target_c,
 
     if (gear == -1 || user_input) {
         // Fresh start or user change: jump directly to appropriate gear
+        // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
         if (diff > C_UP_45)         new_gear = 5;
         else if (diff > C_UP_34)    new_gear = 4;
         else if (diff > C_UP_23)    new_gear = 3;
         else if (diff > C_UP_12)    new_gear = 2;
         else if (diff > C_UP_01)    new_gear = 1;
-        else if (diff < C_IDLE)     new_gear = (gear == -1) ? -1 : 0;
-        else                        new_gear = 0;
+        else                        new_gear = (gear == -1) ? -1 : 0;
     } else {
         switch (gear) {
             case 0: {
@@ -114,11 +114,11 @@ int select_heat_gear(int current_gear, float room_c, float target_c,
 
     if (gear == -1 || user_input) {
         // Fresh start or user change: jump directly to appropriate gear
+        // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
         if (diff < H_UP_23)         new_gear = 3;
         else if (diff < H_UP_12)    new_gear = 2;
         else if (diff < H_UP_01)    new_gear = 1;
-        else if (diff > H_IDLE)     new_gear = (gear == -1) ? -1 : 0;
-        else                        new_gear = 0;
+        else                        new_gear = (gear == -1) ? -1 : 0;
     } else {
         switch (gear) {
             case 0: {
@@ -299,7 +299,7 @@ TEST(cool_fresh_start_various_diffs) {
     EXPECT_GEAR(2, gear, "Fresh start, room 63.5°F (diff=0.28°C): gear 2");
 
     gear = select_cool_gear(-1, f_to_c(63.0f), target, false, 0, true, 0, 100000);
-    EXPECT_GEAR(0, gear, "Fresh start, room at setpoint (diff=0): idle");
+    EXPECT_GEAR(-1, gear, "Fresh start, room at setpoint (diff=0): stay off");
 
     gear = select_cool_gear(-1, f_to_c(62.0f), target, false, 0, true, 0, 100000);
     EXPECT_GEAR(-1, gear, "Fresh start, room below setpoint: stay off");

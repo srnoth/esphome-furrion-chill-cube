@@ -105,8 +105,9 @@ def _auto_debug_sensors(config):
     if config.get(CONF_DEBUG):
         for key, _ in DEBUG_SENSOR_MAP:
             if key not in config:
-                # Validate empty dict through the sensor schema to generate ID + defaults
-                config[key] = _DEBUG_SCHEMAS[key]({})
+                # Derive a human-readable name from the config key
+                human_name = key.replace("debug_", "Debug ").replace("_", " ").title()
+                config[key] = _DEBUG_SCHEMAS[key]({"name": human_name})
     return config
 
 

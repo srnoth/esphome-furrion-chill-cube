@@ -71,12 +71,28 @@ DEBUG_SENSOR_MAP = [
 ]
 
 
+_DEBUG_SCHEMAS = {
+    CONF_DEBUG_ACTIVE_IR_MODE: _DEBUG_SENSOR,
+    CONF_DEBUG_LAST_ACTIVE_MODE: _DEBUG_SENSOR,
+    CONF_DEBUG_KICK_PHASE: _DEBUG_SENSOR,
+    CONF_DEBUG_GEAR_DIFF: _DEBUG_SENSOR_C,
+    CONF_DEBUG_TIME_IN_GEAR: _DEBUG_SENSOR_S,
+    CONF_DEBUG_IDLE_DURATION: _DEBUG_SENSOR_S,
+    CONF_DEBUG_MODE_SWITCH_COOLDOWN: _DEBUG_SENSOR_S,
+    CONF_DEBUG_FAN_CLAMP_REMAINING: _DEBUG_SENSOR_S,
+    CONF_DEBUG_HEATER_LOCKED_OUT: _DEBUG_SENSOR,
+    CONF_DEBUG_FAILSAFE_ACTIVE: _DEBUG_SENSOR,
+    CONF_DEBUG_BOOT_READY: _DEBUG_SENSOR,
+}
+
+
 def _auto_debug_sensors(config):
     """When debug: true, auto-populate any missing debug sensor configs."""
     if config.get(CONF_DEBUG):
         for key, _ in DEBUG_SENSOR_MAP:
             if key not in config:
-                config[key] = {}
+                # Validate empty dict through the sensor schema to generate ID + defaults
+                config[key] = _DEBUG_SCHEMAS[key]({})
     return config
 
 _DEBUG_SENSOR = sensor.sensor_schema(

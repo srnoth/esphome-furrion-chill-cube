@@ -23,20 +23,16 @@ static const uint16_t IR_GAP_SPACE = 5480;
 static const uint16_t IR_PACKET_SPACE = 10500;
 static const uint16_t IR_CARRIER_FREQ = 38000;
 
-// Temperature encoding: non-linear lookup (same codes for F and C display)
-// Index = temp_F - 60, range 60-86°F. Bits: [5]=FRAC, [4]=NEG, [3:0]=temp nibble
-static const uint8_t TEMP_F_TABLE[] = {
-    0x10, 0x30, 0x00, 0x20, 0x01, 0x21, 0x03, 0x23, 0x02,
-    0x22, 0x06, 0x26, 0x07, 0x05, 0x25, 0x04, 0x24, 0x0C,
-    0x2C, 0x0D, 0x2D, 0x09, 0x08, 0x28, 0x0A, 0x2A, 0x0B};
+// Temperature encoding: non-linear Gray code lookup
+// RAC-PT1411HWRU Celsius table (index 0=16°C, 14=30°C)
+// Bits: [5]=FRAC, [4]=NEG, [3:0]=temp nibble
+static const uint8_t TEMP_C_TABLE[] = {
+    0x10, 0x00, 0x01, 0x03, 0x02, 0x06, 0x07, 0x05,
+    0x04, 0x0C, 0x0D, 0x09, 0x08, 0x0A, 0x0B};
 
 // Celsius setpoint range (Furrion accepts 16-30°C)
 static const int FURRION_MIN_TEMP_C = 16;
 static const int FURRION_MAX_TEMP_C = 30;
-
-// °C → nearest °F for IR encoding (index = temp_C - 16)
-static const int C_TO_F[] = {
-    61, 63, 64, 66, 68, 70, 72, 73, 75, 77, 79, 81, 82, 84, 86};
 
 // Gear controller constants — no fixed anchors; setpoint is dynamic
 
@@ -138,14 +134,13 @@ void FurrionChillCube::transmit_mode_command_() {
   message[0] = 0xB2;
   message[1] = ~message[0];
 
-  // Temperature code (dynamic setpoint → nearest °F → non-linear lookup)
+  // Temperature code (dynamic Celsius setpoint → Gray code lookup)
   uint8_t temp_code;
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
     temp_code = 0x0E;  // OFF special value
   } else {
     int temp_c = std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, furrion_setpoint_c_));
-    int temp_f = C_TO_F[temp_c - FURRION_MIN_TEMP_C];
-    temp_code = TEMP_F_TABLE[temp_f - 60];
+    temp_code = TEMP_C_TABLE[temp_c - FURRION_MIN_TEMP_C];
   }
 
   // Fan speed
@@ -196,7 +191,7 @@ void FurrionChillCube::transmit_mode_command_() {
     // message[7] already set (fan code2)
     if (temp_code & 0x20) message[8] |= 0x20;  // FRAC flag
     if (temp_code & 0x10) message[9] |= 0x10;  // NEG flag
-    message[9] |= 0x01;  // FAH flag (Fahrenheit encoding)
+    // FAH flag NOT set — Celsius mode
     message[10] = 0x00;
     message[11] = 0;
     for (int i = 6; i <= 10; i++) message[11] += message[i];

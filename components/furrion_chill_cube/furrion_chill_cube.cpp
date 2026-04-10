@@ -11,7 +11,7 @@ namespace furrion_chill_cube {
 static const char *const TAG = "furrion_chill_cube";
 
 // ============================================================
-// IR Protocol Constants — RAC-PT1411HWRU-F (Fahrenheit model)
+// IR Protocol Constants — RAC-PT1411HWRU (Celsius mode)
 // ============================================================
 
 static const uint16_t IR_HEADER_MARK = 4380;
@@ -23,17 +23,11 @@ static const uint16_t IR_GAP_SPACE = 5480;
 static const uint16_t IR_PACKET_SPACE = 10500;
 static const uint16_t IR_CARRIER_FREQ = 38000;
 
-// Fahrenheit temperature table (index = temp_F - 60, range 60-86°F)
-static const uint8_t TEMP_F_TABLE[] = {
-    0x10, 0x30, 0x00, 0x20, 0x01, 0x21, 0x03, 0x23, 0x02,
-    0x22, 0x06, 0x26, 0x07, 0x05, 0x25, 0x04, 0x24, 0x0C,
-    0x2C, 0x0D, 0x2D, 0x09, 0x08, 0x28, 0x0A, 0x2A, 0x0B};
+// Celsius temperature range (Furrion unit accepts 16-30°C)
+static const int FURRION_MIN_TEMP_C = 16;
+static const int FURRION_MAX_TEMP_C = 30;
 
-// Gear controller constants
-static const int HEAT_ANCHOR = 20;   // 20°C = 68°F
-static const int COOL_ANCHOR = 25;   // 25°C = 77°F
-static const int HEAT_ANCHOR_F = 68;
-static const int COOL_ANCHOR_F = 77;
+// Gear controller constants — no fixed anchors; setpoint is dynamic
 
 // Per-gear upshift hold times (ms) — index = target gear
 //                        0      1       2       3        4        5
@@ -42,6 +36,8 @@ static const uint32_t IDLE_BEFORE_OFF_MS = 900000;  // 15 min
 static const uint32_t FAN_CLAMP_DURATION_MS = 330000;  // 5 min + 30s buffer
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
+static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
+static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
 
 // Heating deadbands (diff = room - target, negative = cold)
 static const float H_UP_01 = -0.3f;   // 0->1: room 0.5F below target
@@ -131,13 +127,13 @@ void FurrionChillCube::transmit_mode_command_() {
   message[0] = 0xB2;
   message[1] = ~message[0];
 
-  // Temperature code (always use fixed anchor for this model)
+  // Temperature code (dynamic Celsius setpoint)
   uint8_t temp_code;
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
     temp_code = 0x0E;  // OFF special value
   } else {
-    int temp_f = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? HEAT_ANCHOR_F : COOL_ANCHOR_F;
-    temp_code = TEMP_F_TABLE[temp_f - 60];
+    int temp_c = std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, furrion_setpoint_c_));
+    temp_code = (uint8_t)(temp_c - FURRION_MIN_TEMP_C);
   }
 
   // Fan speed
@@ -186,9 +182,9 @@ void FurrionChillCube::transmit_mode_command_() {
   if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     message[6] = 0xD5;
     // message[7] already set (fan code2)
-    if (temp_code & 0x20) message[8] |= 0x20;  // FRAC flag
-    if (temp_code & 0x10) message[9] |= 0x10;  // NEG flag
-    message[9] |= 0x01;  // FAH flag (always Fahrenheit model)
+    // Celsius mode: no FRAC, NEG, or FAH flags needed
+    message[8] = 0x00;
+    message[9] = 0x00;   // FAH flag (bit 0) clear = Celsius
     message[10] = 0x00;
     message[11] = 0;
     for (int i = 6; i <= 10; i++) message[11] += message[i];
@@ -364,18 +360,38 @@ void FurrionChillCube::loop() {
     advance_kickstart_();
   }
 
-  // 2. Run gear controller if triggered
+  // 2. Advance keep-alive state machine
+  if (keepalive_phase_ != KeepAlivePhase::IDLE) {
+    advance_keepalive_();
+  }
+
+  // 3. Run gear controller if triggered
   bool should_run = false;
   if (temp_dirty_) { should_run = true; temp_dirty_ = false; }
   if (last_gear_run_ == 0 || (now - last_gear_run_) >= GEAR_INTERVAL_MS) should_run = true;
   if (user_changed_) should_run = true;
 
-  if (should_run && kick_phase_ == KickPhase::IDLE) {
+  if (should_run && kick_phase_ == KickPhase::IDLE && keepalive_phase_ == KeepAlivePhase::IDLE) {
     run_gear_controller_();
     last_gear_run_ = now;
   }
 
-  // 3. Post-kickstart CS reinforcement (re-transmit gear controller's CS at 5s intervals)
+  // 4. Keep-alive trigger for low-CS gears (cool 1-2, heat 1)
+  if (kick_phase_ == KickPhase::IDLE && keepalive_phase_ == KeepAlivePhase::IDLE &&
+      boot_ready_ && !failsafe_active_) {
+    bool cool_eligible = (cool_gear_ >= 1 && cool_gear_ <= 2 &&
+                          active_ir_mode_ == climate::CLIMATE_MODE_COOL);
+    bool heat_eligible = (heat_gear_ == 1 &&
+                          active_ir_mode_ == climate::CLIMATE_MODE_HEAT);
+    if (cool_eligible || heat_eligible) {
+      uint32_t since = keepalive_last_ > 0 ? keepalive_last_ : last_gear_change_;
+      if (since > 0 && (now - since) >= KEEPALIVE_INTERVAL_MS) {
+        start_keepalive_(heat_eligible);
+      }
+    }
+  }
+
+  // 5. Post-kickstart CS reinforcement (re-transmit gear controller's CS at 5s intervals)
   if (cs_reinforce_count_ > 0 && (now - cs_reinforce_at_) >= 5000) {
     transmit_cs_update_(true);
     last_cs_heartbeat_ = now;
@@ -384,7 +400,7 @@ void FurrionChillCube::loop() {
     ESP_LOGI(TAG, "CS reinforce cs=%d (%d left)", current_cs_, cs_reinforce_count_);
   }
 
-  // 4. CS heartbeat every 30s
+  // 6. CS heartbeat every 30s
   if (boot_ready_ && !failsafe_active_ &&
       active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
       (now - last_cs_heartbeat_) >= CS_HEARTBEAT_MS) {
@@ -392,7 +408,7 @@ void FurrionChillCube::loop() {
     last_cs_heartbeat_ = now;
   }
 
-  // 5. Fan clamp management (release clamp when expired)
+  // 7. Fan clamp management (release clamp when expired)
   if (fan_clamp_start_ > 0 && (now - fan_clamp_start_) >= FAN_CLAMP_DURATION_MS) {
     fan_clamp_start_ = 0;
     // Re-send mode with AUTO fan if unit is on
@@ -403,7 +419,7 @@ void FurrionChillCube::loop() {
     }
   }
 
-  // 6. Mode command re-send (one-shot, 5s after fan recovery)
+  // 8. Mode command re-send (one-shot, 5s after fan recovery)
   if (mode_resend_at_ > 0 && (now - mode_resend_at_) >= 5000) {
     mode_resend_at_ = 0;
     if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
@@ -541,15 +557,31 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 // ============================================================
 
 float FurrionChillCube::get_heat_target_() {
-  // Always use target_temperature_low — it's the authoritative value maintained by YAML sync.
-  // target_temperature is unreliable (state restore union, missed sync paths).
   return this->target_temperature_low;
 }
 
 float FurrionChillCube::get_cool_target_() {
-  // Always use target_temperature_high — it's the authoritative value maintained by YAML sync.
-  // target_temperature is unreliable (state restore union, missed sync paths).
   return this->target_temperature_high;
+}
+
+int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
+  float target_c = is_heat ? get_heat_target_() : get_cool_target_();
+  if (isnan(target_c)) return 22;  // safe default
+  int rounded = (int)roundf(target_c);
+  return std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, rounded));
+}
+
+void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
+  int new_sp = compute_setpoint_c_(is_heat);
+  if (new_sp != furrion_setpoint_c_) {
+    ESP_LOGI(TAG, "Furrion setpoint %d°C → %d°C (%s)",
+             furrion_setpoint_c_, new_sp, is_heat ? "heat" : "cool");
+    furrion_setpoint_c_ = new_sp;
+    // Retransmit mode command so unit gets the new setpoint
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
+      transmit_mode_command_();
+    }
+  }
 }
 
 climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
@@ -605,7 +637,8 @@ void FurrionChillCube::start_fresh_kickstart_(int mode, int target_cs) {
   kick_target_cs_ = target_cs;
 
   // Step 1: Set kickstart CS BEFORE mode change
-  int restart_cs = (mode == 1) ? 20 : 26;
+  // Heat restart = setpoint (at anchor), Cool restart = setpoint + 1 (above anchor)
+  int restart_cs = (mode == 1) ? furrion_setpoint_c_ : (furrion_setpoint_c_ + 1);
   current_cs_ = restart_cs;
   if (boot_ready_ && !failsafe_active_) {
     transmit_cs_update_(true);
@@ -623,17 +656,17 @@ void FurrionChillCube::start_idle_kickstart_(int target_cs) {
   kick_target_cs_ = target_cs;
   kick_mode_ = 2;  // cool only
 
-  current_cs_ = 25;  // cool idle restart threshold
+  current_cs_ = furrion_setpoint_c_;  // cool idle restart threshold (at anchor)
   if (boot_ready_ && !failsafe_active_) {
     transmit_cs_update_(true);
     last_cs_heartbeat_ = millis();
   }
-  if (cs_value_sensor_) cs_value_sensor_->publish_state(25);
+  if (cs_value_sensor_) cs_value_sensor_->publish_state(furrion_setpoint_c_);
 
   kick_phase_ = KickPhase::IDLE_KICK_CS;
   kick_phase_start_ = millis();
   mode_resend_at_ = 0;
-  ESP_LOGI(TAG, "Idle kickstart: cs=25 target_cs=%d", target_cs);
+  ESP_LOGI(TAG, "Idle kickstart: cs=%d target_cs=%d", furrion_setpoint_c_, target_cs);
 }
 
 void FurrionChillCube::advance_kickstart_() {
@@ -671,7 +704,7 @@ void FurrionChillCube::advance_kickstart_() {
         transmit_cs_update_(true);
         kick_phase_ = KickPhase::IDLE_KICK_CS2;
         kick_phase_start_ = millis();
-        ESP_LOGI(TAG, "Idle kickstart: reinforce cs=25");
+        ESP_LOGI(TAG, "Idle kickstart: reinforce cs=%d", current_cs_);
       }
       break;
 
@@ -688,6 +721,66 @@ void FurrionChillCube::advance_kickstart_() {
     default:
       kick_phase_ = KickPhase::IDLE;
       break;
+  }
+}
+
+// ============================================================
+// Keep-Alive Pulse (sustain compressor at low CS gears)
+// ============================================================
+
+void FurrionChillCube::start_keepalive_(bool is_heat) {
+  keepalive_restore_cs_ = current_cs_;
+  int anchor = furrion_setpoint_c_;
+  keepalive_step2_cs_ = is_heat ? (anchor - 1) : (anchor + 1);
+  set_cs_value_(anchor);  // Step 1: setpoint CS
+  keepalive_phase_ = KeepAlivePhase::STEP1;
+  keepalive_phase_start_ = millis();
+  ESP_LOGI(TAG, "Keep-alive: start %s pulse, anchor=%d step2=%d restore=%d",
+           is_heat ? "HEAT" : "COOL", anchor, keepalive_step2_cs_, keepalive_restore_cs_);
+}
+
+void FurrionChillCube::advance_keepalive_() {
+  uint32_t elapsed = millis() - keepalive_phase_start_;
+
+  switch (keepalive_phase_) {
+    case KeepAlivePhase::STEP1:
+      if (elapsed >= KEEPALIVE_STEP_MS) {
+        set_cs_value_(keepalive_step2_cs_);  // Step 2: over-anchor (heat=19, cool=26)
+        keepalive_phase_ = KeepAlivePhase::STEP2;
+        keepalive_phase_start_ = millis();
+        ESP_LOGI(TAG, "Keep-alive: cs=%d", keepalive_step2_cs_);
+      }
+      break;
+
+    case KeepAlivePhase::STEP2:
+      if (elapsed >= KEEPALIVE_STEP_MS) {
+        set_cs_value_(keepalive_restore_cs_);  // Step 3: restore (1/2)
+        keepalive_phase_ = KeepAlivePhase::STEP_RESTORE1;
+        keepalive_phase_start_ = millis();
+        ESP_LOGI(TAG, "Keep-alive: restore cs=%d (1/2)", keepalive_restore_cs_);
+      }
+      break;
+
+    case KeepAlivePhase::STEP_RESTORE1:
+      if (elapsed >= KEEPALIVE_STEP_MS) {
+        set_cs_value_(keepalive_restore_cs_);  // Step 4: restore (2/2) — done
+        keepalive_phase_ = KeepAlivePhase::IDLE;
+        keepalive_last_ = millis();
+        ESP_LOGI(TAG, "Keep-alive: restore cs=%d (2/2), done", keepalive_restore_cs_);
+      }
+      break;
+
+    default:
+      keepalive_phase_ = KeepAlivePhase::IDLE;
+      break;
+  }
+}
+
+void FurrionChillCube::abort_keepalive_() {
+  if (keepalive_phase_ != KeepAlivePhase::IDLE) {
+    ESP_LOGI(TAG, "Keep-alive: aborted (phase=%d)", (int)keepalive_phase_);
+    keepalive_phase_ = KeepAlivePhase::IDLE;
+    keepalive_last_ = 0;
   }
 }
 
@@ -732,7 +825,7 @@ void FurrionChillCube::run_gear_controller_() {
 
   // === Failsafe trigger ===
   if (never_got_update || ha_disconnected || temp_unavailable) {
-    ESP_LOGW(TAG, "FAILSAFE COOL 76F (boot=%d ha_dc=%d nan=%d)",
+    ESP_LOGW(TAG, "FAILSAFE — CS stopped, unit will revert to internal sensor (boot=%d ha_dc=%d nan=%d)",
              never_got_update, ha_disconnected, temp_unavailable);
     heat_gear_ = -1;
     cool_gear_ = -1;
@@ -741,13 +834,14 @@ void FurrionChillCube::run_gear_controller_() {
     fan_clamp_start_ = 0;
     mode_resend_at_ = 0;
     cs_reinforce_count_ = 0;
+    abort_keepalive_();
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-    // CS feed stops (failsafe gate), unit reverts to own sensor
+    // Stop all IR transmission — failsafe_active_ gates CS heartbeat.
+    // Unit's setpoint is already near the desired target (dynamic setpoint).
+    // After ~7 min with no CS, unit reverts to its own internal sensor.
     failsafe_active_ = true;
-    set_active_ir_mode_(climate::CLIMATE_MODE_COOL);
-    transmit_mode_command_();
     boot_ready_ = true;
     update_action_();
     return;
@@ -854,6 +948,7 @@ void FurrionChillCube::run_gear_controller_() {
       fan_clamp_start_ = 0;
       mode_resend_at_ = 0;
       cs_reinforce_count_ = 0;
+      abort_keepalive_();
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
@@ -870,6 +965,7 @@ void FurrionChillCube::run_gear_controller_() {
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
     }
 
+    update_furrion_setpoint_(true);
     float target = get_heat_target_();
     float diff = room - target;
     gear_diff = diff;
@@ -929,6 +1025,13 @@ void FurrionChillCube::run_gear_controller_() {
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
       ESP_LOGI(TAG, "HEAT %d -> %d (room=%.2f target=%.2f diff=%.2f)",
                gear, new_gear, room, target, diff);
+
+      // Keep-alive: reset timer on entering eligible range, abort on leaving
+      if (new_gear == 1) {
+        keepalive_last_ = now;  // fresh 5-min window
+      } else {
+        abort_keepalive_();
+      }
     }
 
     // CS + kickstart logic
@@ -936,10 +1039,10 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
       int cs;
       switch (new_gear) {
-        case 3:  cs = HEAT_ANCHOR - 1; break;
-        case 2:  cs = HEAT_ANCHOR;     break;
-        case 1:  cs = HEAT_ANCHOR + 1; break;
-        default: cs = HEAT_ANCHOR + 2; break;
+        case 3:  cs = furrion_setpoint_c_ - 1; break;
+        case 2:  cs = furrion_setpoint_c_;     break;
+        case 1:  cs = furrion_setpoint_c_ + 1; break;
+        default: cs = furrion_setpoint_c_ + 2; break;
       }
       bool needs_fresh_start = (gear == -1 && new_gear == 1);
       if (needs_fresh_start) {
@@ -988,6 +1091,7 @@ void FurrionChillCube::run_gear_controller_() {
       fan_clamp_start_ = 0;
       mode_resend_at_ = 0;
       cs_reinforce_count_ = 0;
+      abort_keepalive_();
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
@@ -1004,6 +1108,7 @@ void FurrionChillCube::run_gear_controller_() {
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     }
 
+    update_furrion_setpoint_(false);
     float target = get_cool_target_();
     float diff = room - target;
     gear_diff = diff;
@@ -1075,6 +1180,13 @@ void FurrionChillCube::run_gear_controller_() {
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
       ESP_LOGI(TAG, "COOL %d -> %d (room=%.2f target=%.2f diff=%.2f)",
                gear, new_gear, room, target, diff);
+
+      // Keep-alive: reset timer on entering eligible range, abort on leaving
+      if (new_gear >= 1 && new_gear <= 2) {
+        keepalive_last_ = now;  // fresh 5-min window
+      } else {
+        abort_keepalive_();
+      }
     }
 
     // CS + kickstart logic
@@ -1082,12 +1194,12 @@ void FurrionChillCube::run_gear_controller_() {
     if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
       int cs;
       switch (new_gear) {
-        case 5:  cs = COOL_ANCHOR + 2; break;
-        case 4:  cs = COOL_ANCHOR + 1; break;
-        case 3:  cs = COOL_ANCHOR;     break;
-        case 2:  cs = COOL_ANCHOR - 1; break;
-        case 1:  cs = COOL_ANCHOR - 2; break;
-        default: cs = COOL_ANCHOR - 3; break;
+        case 5:  cs = furrion_setpoint_c_ + 2; break;
+        case 4:  cs = furrion_setpoint_c_ + 1; break;
+        case 3:  cs = furrion_setpoint_c_;     break;
+        case 2:  cs = furrion_setpoint_c_ - 1; break;
+        case 1:  cs = furrion_setpoint_c_ - 2; break;
+        default: cs = furrion_setpoint_c_ - 3; break;
       }
       bool needs_fresh_start = (gear == -1 && new_gear >= 1 && new_gear <= 3);
       bool needs_idle_kick = (gear == 0 && new_gear >= 1 && new_gear <= 2);
@@ -1139,13 +1251,14 @@ void FurrionChillCube::run_gear_controller_() {
       fan_clamp_start_ = 0;
       mode_resend_at_ = 0;
       cs_reinforce_count_ = 0;
+      abort_keepalive_();
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
       ESP_LOGI(TAG, "NEITHER ACTIVE — HVAC OFF");
     }
 
-    // Enforce CS=22
-    if (current_cs_ != 22) {
-      set_cs_value_(22);
+    // Enforce neutral CS (at setpoint — unit is OFF so doesn't matter much)
+    if (current_cs_ != furrion_setpoint_c_) {
+      set_cs_value_(furrion_setpoint_c_);
     }
 
     // Force gears to -1

@@ -81,8 +81,24 @@ class FurrionChillCube : public climate::Climate, public Component {
   void start_fresh_kickstart_(int mode, int target_cs);
   void start_idle_kickstart_(int target_cs);
 
+  // Keep-alive pulse (sustain compressor at low CS gears)
+  enum class KeepAlivePhase : uint8_t {
+    IDLE,
+    STEP1,          // Anchor CS sent, waiting 5s
+    STEP2,          // Over-anchor CS sent, waiting 5s
+    STEP_RESTORE1,  // Target CS sent (1/2), waiting 5s
+    // Final step (restore 2/2) transitions directly to IDLE
+  };
+  void start_keepalive_(bool is_heat);
+  void advance_keepalive_();
+  void abort_keepalive_();
+
   // Fan clamp
   climate::ClimateFanMode get_effective_fan_mode_();
+
+  // Dynamic setpoint
+  int compute_setpoint_c_(bool is_heat);
+  void update_furrion_setpoint_(bool is_heat);
 
   // Helpers
   void set_cs_value_(int cs);
@@ -126,6 +142,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   int cool_gear_{-1};
   int last_active_mode_{0};    // 0=none, 1=heat, 2=cool
   int current_cs_{22};
+  int furrion_setpoint_c_{22}; // Dynamic Furrion setpoint in °C (16-30)
   climate::ClimateMode active_ir_mode_{climate::CLIMATE_MODE_OFF};
 
   // Timing (all uint32_t for millis())
@@ -147,6 +164,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   int kick_target_cs_{22};
   uint8_t cs_reinforce_count_{0};
   uint32_t cs_reinforce_at_{0};
+
+  // Keep-alive
+  KeepAlivePhase keepalive_phase_{KeepAlivePhase::IDLE};
+  uint32_t keepalive_phase_start_{0};
+  uint32_t keepalive_last_{0};       // last completion (or gear entered eligible range)
+  int keepalive_restore_cs_{22};     // CS to restore after pulse
+  int keepalive_step2_cs_{22};       // CS for step 2 (anchor±1 depending on mode)
 
   // Flags
   bool boot_ready_{false};

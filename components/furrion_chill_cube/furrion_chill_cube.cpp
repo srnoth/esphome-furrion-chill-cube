@@ -11,7 +11,7 @@ namespace furrion_chill_cube {
 static const char *const TAG = "furrion_chill_cube";
 
 // ============================================================
-// IR Protocol Constants — RAC-PT1411HWRU (Celsius mode)
+// IR Protocol Constants — RAC-PT1411HWRU
 // ============================================================
 
 static const uint16_t IR_HEADER_MARK = 4380;
@@ -23,9 +23,20 @@ static const uint16_t IR_GAP_SPACE = 5480;
 static const uint16_t IR_PACKET_SPACE = 10500;
 static const uint16_t IR_CARRIER_FREQ = 38000;
 
-// Celsius temperature range (Furrion unit accepts 16-30°C)
+// Temperature encoding: non-linear lookup (same codes for F and C display)
+// Index = temp_F - 60, range 60-86°F. Bits: [5]=FRAC, [4]=NEG, [3:0]=temp nibble
+static const uint8_t TEMP_F_TABLE[] = {
+    0x10, 0x30, 0x00, 0x20, 0x01, 0x21, 0x03, 0x23, 0x02,
+    0x22, 0x06, 0x26, 0x07, 0x05, 0x25, 0x04, 0x24, 0x0C,
+    0x2C, 0x0D, 0x2D, 0x09, 0x08, 0x28, 0x0A, 0x2A, 0x0B};
+
+// Celsius setpoint range (Furrion accepts 16-30°C)
 static const int FURRION_MIN_TEMP_C = 16;
 static const int FURRION_MAX_TEMP_C = 30;
+
+// °C → nearest °F for IR encoding (index = temp_C - 16)
+static const int C_TO_F[] = {
+    61, 63, 64, 66, 68, 70, 72, 73, 75, 77, 79, 81, 82, 84, 86};
 
 // Gear controller constants — no fixed anchors; setpoint is dynamic
 
@@ -127,13 +138,14 @@ void FurrionChillCube::transmit_mode_command_() {
   message[0] = 0xB2;
   message[1] = ~message[0];
 
-  // Temperature code (dynamic Celsius setpoint)
+  // Temperature code (dynamic setpoint → nearest °F → non-linear lookup)
   uint8_t temp_code;
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
     temp_code = 0x0E;  // OFF special value
   } else {
     int temp_c = std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, furrion_setpoint_c_));
-    temp_code = (uint8_t)(temp_c - FURRION_MIN_TEMP_C);
+    int temp_f = C_TO_F[temp_c - FURRION_MIN_TEMP_C];
+    temp_code = TEMP_F_TABLE[temp_f - 60];
   }
 
   // Fan speed
@@ -182,9 +194,9 @@ void FurrionChillCube::transmit_mode_command_() {
   if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     message[6] = 0xD5;
     // message[7] already set (fan code2)
-    // Celsius mode: no FRAC, NEG, or FAH flags needed
-    message[8] = 0x00;
-    message[9] = 0x00;   // FAH flag (bit 0) clear = Celsius
+    if (temp_code & 0x20) message[8] |= 0x20;  // FRAC flag
+    if (temp_code & 0x10) message[9] |= 0x10;  // NEG flag
+    message[9] |= 0x01;  // FAH flag (Fahrenheit encoding)
     message[10] = 0x00;
     message[11] = 0;
     for (int i = 6; i <= 10; i++) message[11] += message[i];

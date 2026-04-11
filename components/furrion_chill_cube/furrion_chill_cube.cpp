@@ -195,7 +195,8 @@ void FurrionChillCube::transmit_mode_command_() {
 
   // === Transmission 1: Mode command (B2 + D5) ===
   this->encode_(data, &message[0], 6, 1);
-  if (message[6] != 0) {
+  bool send_packet2 = (active_ir_mode_ != climate::CLIMATE_MODE_OFF);
+  if (send_packet2) {
     this->encode_(data, &message[6], 6, 0);
   }
   transmit.perform();
@@ -1044,13 +1045,23 @@ void FurrionChillCube::run_gear_controller_() {
     // CS + kickstart logic
     bool heat_kickstart_pending = false;
     if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
+      // Offset to keep all gear CS values distinct at high setpoints
+      // (gear 0 CS = setpoint+2 would exceed 30 when setpoint > 28)
+      int hi = furrion_setpoint_c_ + 2;  // gear 0 = highest CS
+      int offset = (hi > 30) ? (30 - hi) : 0;
       int cs;
       switch (new_gear) {
-        case 3:  cs = furrion_setpoint_c_ - 1; break;
-        case 2:  cs = furrion_setpoint_c_;     break;
-        case 1:  cs = furrion_setpoint_c_ + 1; break;
-        default: cs = furrion_setpoint_c_ + 2; break;
+        case 3:  cs = furrion_setpoint_c_ - 1 + offset; break;
+        case 2:  cs = furrion_setpoint_c_     + offset; break;
+        case 1:  cs = furrion_setpoint_c_ + 1 + offset; break;
+        default: cs = furrion_setpoint_c_ + 2 + offset; break;
       }
+      // Heat kickstart: only -1→1 (asymmetric with cool path by design).
+      // Gear 1 CS = setpoint+1 tells the unit room is ABOVE heat target,
+      // so it won't start heating without the kickstart pre-CS walk.
+      // Gears 2-3 CS ≤ setpoint — unit sees "room at/below target" and
+      // starts the compressor naturally. Cool gears 1-3 are the opposite
+      // (CS ≤ cool target), so they ALL need kickstart.
       bool needs_fresh_start = (gear == -1 && new_gear == 1);
       if (needs_fresh_start) {
         last_mode_event_at_ = now;
@@ -1200,14 +1211,18 @@ void FurrionChillCube::run_gear_controller_() {
     // CS + kickstart logic
     bool cool_kickstart_pending = false;
     if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
+      // Offset to keep all gear CS values distinct at low setpoints
+      // (gear 0 CS = setpoint-3 would go below 15 when setpoint < 18)
+      int lo = furrion_setpoint_c_ - 3;  // gear 0 = lowest CS
+      int offset = (lo < 15) ? (15 - lo) : 0;
       int cs;
       switch (new_gear) {
-        case 5:  cs = furrion_setpoint_c_ + 2; break;
-        case 4:  cs = furrion_setpoint_c_ + 1; break;
-        case 3:  cs = furrion_setpoint_c_;     break;
-        case 2:  cs = furrion_setpoint_c_ - 1; break;
-        case 1:  cs = furrion_setpoint_c_ - 2; break;
-        default: cs = furrion_setpoint_c_ - 3; break;
+        case 5:  cs = furrion_setpoint_c_ + 2 + offset; break;
+        case 4:  cs = furrion_setpoint_c_ + 1 + offset; break;
+        case 3:  cs = furrion_setpoint_c_     + offset; break;
+        case 2:  cs = furrion_setpoint_c_ - 1 + offset; break;
+        case 1:  cs = furrion_setpoint_c_ - 2 + offset; break;
+        default: cs = furrion_setpoint_c_ - 3 + offset; break;
       }
       bool needs_fresh_start = (gear == -1 && new_gear >= 1 && new_gear <= 3);
       bool needs_idle_kick = (gear == 0 && new_gear >= 1 && new_gear <= 2);

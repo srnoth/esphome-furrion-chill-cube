@@ -78,7 +78,7 @@ class FurrionChillCube : public climate::Climate, public Component {
     CLAMPED,    // 5:30: fan=LOW, kickstart CS retransmitted, gear controller monitored
   };
   void start_clamped_kickstart_(bool is_heat, uint32_t now);
-  void start_quick_kickstart_(bool is_heat, int kickstart_cs, int target_cs, uint32_t now);
+  void start_quick_kickstart_(bool is_heat, int kickstart_cs, uint32_t now);
   void advance_kickstart_(uint32_t now);
   void end_kickstart_(uint32_t now);
   bool kickstart_active_() { return clamp_phase_ != ClampPhase::IDLE || quick_kick_active_; }
@@ -169,6 +169,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t quick_kick_start_{0};
   int quick_kick_cs_{0};              // kickstart CS to hold for 10s
   bool quick_kick_is_heat_{false};
+  bool quick_kick_reinforced_{false}; // one-shot guard for 5s reinforce
 
   // Keep-alive
   KeepAlivePhase keepalive_phase_{KeepAlivePhase::IDLE};

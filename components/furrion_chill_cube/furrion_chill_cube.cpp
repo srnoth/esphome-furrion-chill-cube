@@ -646,11 +646,12 @@ void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
   ESP_LOGI(TAG, "Clamped kickstart: PRE_CS %s cs=%d", is_heat ? "HEAT" : "COOL", clamp_kickstart_cs_);
 }
 
-void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, int target_cs, uint32_t now) {
+void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, uint32_t now) {
   quick_kick_active_ = true;
   quick_kick_start_ = now;
   quick_kick_cs_ = std::max(15, std::min(30, kickstart_cs));
   quick_kick_is_heat_ = is_heat;
+  quick_kick_reinforced_ = false;
 
   // Set and transmit kickstart CS immediately
   current_cs_ = quick_kick_cs_;
@@ -666,7 +667,7 @@ void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, in
     transmit_mode_command_();
   }
 
-  ESP_LOGI(TAG, "Quick kickstart: %s cs=%d target_cs=%d", is_heat ? "HEAT" : "COOL", quick_kick_cs_, target_cs);
+  ESP_LOGI(TAG, "Quick kickstart: %s cs=%d", is_heat ? "HEAT" : "COOL", quick_kick_cs_);
 }
 
 void FurrionChillCube::advance_kickstart_(uint32_t now) {
@@ -700,8 +701,9 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
   // === Quick kickstart ===
   if (quick_kick_active_) {
     uint32_t elapsed = now - quick_kick_start_;
-    if (elapsed >= 5000 && elapsed < 6000) {
-      // 5s: reinforce kickstart CS (one-shot, guarded by 1s window)
+    if (elapsed >= 5000 && !quick_kick_reinforced_) {
+      // 5s: reinforce kickstart CS (one-shot)
+      quick_kick_reinforced_ = true;
       transmit_cs_update_(true);
       last_cs_heartbeat_ = now;
       ESP_LOGI(TAG, "Quick kickstart: reinforce cs=%d", quick_kick_cs_);
@@ -1218,7 +1220,7 @@ void FurrionChillCube::run_gear_controller_() {
         // OFF→gear 3: quick kickstart (CS=gear4 for 10s, then gear 3)
         last_mode_event_at_ = now;
         int kick_cs = std::max(15, std::min(30, furrion_setpoint_c_ + 1));
-        start_quick_kickstart_(false, kick_cs, cs, now);
+        start_quick_kickstart_(false, kick_cs, now);
       } else if (gear == -1 && new_gear >= 4) {
         // OFF→gear 4+: direct, no kickstart
         if (!kickstart_active_() && current_cs_ != cs) {
@@ -1227,7 +1229,7 @@ void FurrionChillCube::run_gear_controller_() {
       } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
         // Idle→gear 1-2: quick kickstart (CS=setpoint for 10s)
         int kick_cs = std::max(15, std::min(30, furrion_setpoint_c_));
-        start_quick_kickstart_(false, kick_cs, cs, now);
+        start_quick_kickstart_(false, kick_cs, now);
       } else if (!kickstart_active_() && current_cs_ != cs) {
         set_cs_value_(cs);
       }

@@ -89,8 +89,8 @@ class FurrionChillCube : public climate::Climate, public Component {
     STEP_RESTORE1,  // Target CS sent (1/2), waiting 5s
     // Final step (restore 2/2) transitions directly to IDLE
   };
-  void start_keepalive_(bool is_heat);
-  void advance_keepalive_();
+  void start_keepalive_(bool is_heat, uint32_t now);
+  void advance_keepalive_(uint32_t now);
   void abort_keepalive_();
 
   // Fan clamp

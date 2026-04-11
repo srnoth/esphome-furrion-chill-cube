@@ -369,7 +369,7 @@ void FurrionChillCube::loop() {
 
   // 2. Advance keep-alive state machine
   if (keepalive_phase_ != KeepAlivePhase::IDLE) {
-    advance_keepalive_();
+    advance_keepalive_(now);
   }
 
   // 3. Run gear controller if triggered
@@ -393,7 +393,7 @@ void FurrionChillCube::loop() {
     if (cool_eligible || heat_eligible) {
       uint32_t since = keepalive_last_ > 0 ? keepalive_last_ : last_gear_change_;
       if (since > 0 && (now - since) >= KEEPALIVE_INTERVAL_MS) {
-        start_keepalive_(heat_eligible);
+        start_keepalive_(heat_eligible, now);
       }
     }
   }
@@ -735,26 +735,26 @@ void FurrionChillCube::advance_kickstart_() {
 // Keep-Alive Pulse (sustain compressor at low CS gears)
 // ============================================================
 
-void FurrionChillCube::start_keepalive_(bool is_heat) {
+void FurrionChillCube::start_keepalive_(bool is_heat, uint32_t now) {
   keepalive_restore_cs_ = current_cs_;
   int anchor = furrion_setpoint_c_;
   keepalive_step2_cs_ = is_heat ? (anchor - 1) : (anchor + 1);
   set_cs_value_(anchor);  // Step 1: setpoint CS
   keepalive_phase_ = KeepAlivePhase::STEP1;
-  keepalive_phase_start_ = millis();
+  keepalive_phase_start_ = now;
   ESP_LOGI(TAG, "Keep-alive: start %s pulse, anchor=%d step2=%d restore=%d",
            is_heat ? "HEAT" : "COOL", anchor, keepalive_step2_cs_, keepalive_restore_cs_);
 }
 
-void FurrionChillCube::advance_keepalive_() {
-  uint32_t elapsed = millis() - keepalive_phase_start_;
+void FurrionChillCube::advance_keepalive_(uint32_t now) {
+  uint32_t elapsed = now - keepalive_phase_start_;
 
   switch (keepalive_phase_) {
     case KeepAlivePhase::STEP1:
       if (elapsed >= KEEPALIVE_STEP_MS) {
         set_cs_value_(keepalive_step2_cs_);  // Step 2: over-anchor (heat=19, cool=26)
         keepalive_phase_ = KeepAlivePhase::STEP2;
-        keepalive_phase_start_ = millis();
+        keepalive_phase_start_ = now;
         ESP_LOGI(TAG, "Keep-alive: cs=%d", keepalive_step2_cs_);
       }
       break;
@@ -763,7 +763,7 @@ void FurrionChillCube::advance_keepalive_() {
       if (elapsed >= KEEPALIVE_STEP_MS) {
         set_cs_value_(keepalive_restore_cs_);  // Step 3: restore (1/2)
         keepalive_phase_ = KeepAlivePhase::STEP_RESTORE1;
-        keepalive_phase_start_ = millis();
+        keepalive_phase_start_ = now;
         ESP_LOGI(TAG, "Keep-alive: restore cs=%d (1/2)", keepalive_restore_cs_);
       }
       break;
@@ -772,7 +772,7 @@ void FurrionChillCube::advance_keepalive_() {
       if (elapsed >= KEEPALIVE_STEP_MS) {
         set_cs_value_(keepalive_restore_cs_);  // Step 4: restore (2/2) — done
         keepalive_phase_ = KeepAlivePhase::IDLE;
-        keepalive_last_ = millis();
+        keepalive_last_ = now;
         ESP_LOGI(TAG, "Keep-alive: restore cs=%d (2/2), done", keepalive_restore_cs_);
       }
       break;

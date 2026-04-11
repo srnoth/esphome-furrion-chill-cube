@@ -76,7 +76,7 @@ class FurrionChillCube : public climate::Climate, public Component {
     IDLE_KICK_CS,       // Idle kickstart CS=25 sent at t=0, waiting 5s
     IDLE_KICK_CS2,      // CS=25 reinforcement at t=5s, waiting until t=10s
   };
-  void advance_kickstart_();
+  void advance_kickstart_(uint32_t now);
   void start_fresh_kickstart_(int mode, int target_cs);
   void start_idle_kickstart_(int target_cs);
 

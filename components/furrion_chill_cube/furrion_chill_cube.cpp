@@ -360,7 +360,7 @@ void FurrionChillCube::loop() {
 
   // 1. Advance kickstart state machine
   if (kick_phase_ != KickPhase::IDLE) {
-    advance_kickstart_();
+    advance_kickstart_(now);
   }
 
   // 2. Advance keep-alive state machine
@@ -666,18 +666,18 @@ void FurrionChillCube::start_idle_kickstart_(int target_cs) {
   ESP_LOGI(TAG, "Idle kickstart: cs=%d target_cs=%d", furrion_setpoint_c_, target_cs);
 }
 
-void FurrionChillCube::advance_kickstart_() {
-  uint32_t elapsed = millis() - kick_phase_start_;
+void FurrionChillCube::advance_kickstart_(uint32_t now) {
+  uint32_t elapsed = now - kick_phase_start_;
 
   switch (kick_phase_) {
     case KickPhase::FRESH_PRE_CS:
       if (elapsed >= 500) {
         // Step 2: Turn on mode — first IR frame has correct CS
         set_active_ir_mode_((kick_mode_ == 1) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
-        fan_clamp_start_ = millis();
+        fan_clamp_start_ = now;
         transmit_mode_command_();
         kick_phase_ = KickPhase::FRESH_MODE_ON;
-        kick_phase_start_ = millis();
+        kick_phase_start_ = now;
         ESP_LOGI(TAG, "Kickstart: MODE ON + fan=LOW, clamp=310s");
       }
       break;
@@ -686,9 +686,9 @@ void FurrionChillCube::advance_kickstart_() {
       if (elapsed >= 60000) {
         // Step 3: Release to gear controller + reinforce drop
         cs_reinforce_count_ = 2;
-        cs_reinforce_at_ = millis();
+        cs_reinforce_at_ = now;
         kick_phase_ = KickPhase::IDLE;
-        uint32_t clamp_elapsed = millis() - fan_clamp_start_;
+        uint32_t clamp_elapsed = now - fan_clamp_start_;
         int remaining = (clamp_elapsed < FAN_CLAMP_DURATION_MS) ?
                         (int)(FAN_CLAMP_DURATION_MS - clamp_elapsed) : 0;
         ESP_LOGI(TAG, "Kickstart: released, clamp %dms left", remaining);
@@ -700,7 +700,7 @@ void FurrionChillCube::advance_kickstart_() {
         // t=5s: reinforce CS=25
         transmit_cs_update_(true);
         kick_phase_ = KickPhase::IDLE_KICK_CS2;
-        kick_phase_start_ = millis();
+        kick_phase_start_ = now;
         ESP_LOGI(TAG, "Idle kickstart: reinforce cs=%d", current_cs_);
       }
       break;
@@ -709,7 +709,7 @@ void FurrionChillCube::advance_kickstart_() {
       if (elapsed >= 5000) {
         // t=10s: release to gear controller, start CS reinforcement
         cs_reinforce_count_ = 2;
-        cs_reinforce_at_ = millis();
+        cs_reinforce_at_ = now;
         kick_phase_ = KickPhase::IDLE;
         ESP_LOGI(TAG, "Idle kickstart: released, gear controller will set CS");
       }

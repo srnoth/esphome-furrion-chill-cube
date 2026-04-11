@@ -104,6 +104,7 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Helpers
   void set_cs_value_(int cs);
+  void force_mode_switch_off_(const char *label, uint32_t now);
   void update_action_();
   void send_swing_state_();
   void set_active_ir_mode_(climate::ClimateMode mode);
@@ -147,6 +148,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   climate::ClimateMode active_ir_mode_{climate::CLIMATE_MODE_OFF};
 
   // Timing (all uint32_t for millis())
+  uint32_t boot_time_{0};
   uint32_t last_temp_update_{0};
   uint32_t last_gear_change_{0};
   uint32_t idle_since_{0};

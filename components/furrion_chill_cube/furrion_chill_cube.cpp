@@ -350,7 +350,8 @@ void FurrionChillCube::setup() {
     });
   }
 
-  // Initialize diagnostic sensors (reflect restored gear state)
+  // Initialize boot time and diagnostic sensors
+  boot_time_ = millis();
   if (heat_gear_sensor_) heat_gear_sensor_->publish_state(heat_gear_);
   if (cool_gear_sensor_) cool_gear_sensor_->publish_state(cool_gear_);
   if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
@@ -564,8 +565,12 @@ climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
 }
 
 int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
+  // Offset keeps all gear CS values distinct at boundary setpoints.
+  // Without it, multiple gears clamp to the same CS (15 or 30) and
+  // the Furrion can't differentiate them. The offset shifts the entire
+  // mapping so the most extreme gear lands exactly at the clamp limit.
   if (is_heat) {
-    int hi = furrion_setpoint_c_ + 2;
+    int hi = furrion_setpoint_c_ + 2;  // gear 0 = highest heat CS
     int offset = (hi > 30) ? (30 - hi) : 0;
     switch (gear) {
       case 3:  return furrion_setpoint_c_ - 1 + offset;
@@ -574,7 +579,7 @@ int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
       default: return furrion_setpoint_c_ + 2 + offset;
     }
   } else {
-    int lo = furrion_setpoint_c_ - 3;
+    int lo = furrion_setpoint_c_ - 3;  // gear 0 = lowest cool CS
     int offset = (lo < 15) ? (15 - lo) : 0;
     switch (gear) {
       case 5:  return furrion_setpoint_c_ + 2 + offset;
@@ -595,6 +600,24 @@ void FurrionChillCube::set_cs_value_(int cs) {
     last_cs_heartbeat_ = millis();
   }
   if (cs_value_sensor_) cs_value_sensor_->publish_state(cs);
+}
+
+void FurrionChillCube::force_mode_switch_off_(const char *label, uint32_t now) {
+  heat_gear_ = -1;
+  cool_gear_ = -1;
+  clamp_phase_ = ClampPhase::IDLE;
+  quick_kick_active_ = false;
+  abort_keepalive_();
+  if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+  if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+  if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
+  set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+  transmit_mode_command_();
+  mode_switch_off_at_ = now;
+  last_mode_event_at_ = now;
+  ESP_LOGI(TAG, "MODE SWITCH %s — OFF for 60s", label);
+  update_action_();
+  publish_debug_state_(NAN);
 }
 
 void FurrionChillCube::update_action_() {
@@ -819,7 +842,7 @@ void FurrionChillCube::run_gear_controller_() {
   float gear_diff = NAN;  // Tracks active diff for debug publishing
 
   // === Failsafe scenario 1: Boot, HA never connects (5 min) ===
-  bool never_got_update = (last_temp_update_ == 0 && now > 300000);
+  bool never_got_update = (last_temp_update_ == 0 && (now - boot_time_) > 300000);
 
   // === Failsafe scenario 2: HA API disconnected (15 min) ===
 #ifdef USE_API
@@ -977,21 +1000,7 @@ void FurrionChillCube::run_gear_controller_() {
   if (do_heat) {
     // Mode switch: if HVAC is actively in cool mode, force 60s OFF first
     if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
-      cool_gear_ = -1;
-      heat_gear_ = -1;
-      clamp_phase_ = ClampPhase::IDLE;
-      quick_kick_active_ = false;
-      abort_keepalive_();
-      if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
-      if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
-      if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-      transmit_mode_command_();
-      mode_switch_off_at_ = now;
-      last_mode_event_at_ = now;
-      ESP_LOGI(TAG, "MODE SWITCH cool→heat — OFF for 60s");
-      update_action_();
-      publish_debug_state_(NAN);
+      force_mode_switch_off_("cool→heat", now);
       return;
     }
     if (cool_gear_ != -1) {
@@ -1104,21 +1113,7 @@ void FurrionChillCube::run_gear_controller_() {
   } else if (do_cool) {
     // Mode switch: if HVAC is actively in heat mode, force 60s OFF first
     if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
-      heat_gear_ = -1;
-      cool_gear_ = -1;
-      clamp_phase_ = ClampPhase::IDLE;
-      quick_kick_active_ = false;
-      abort_keepalive_();
-      if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
-      if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
-      if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-      transmit_mode_command_();
-      mode_switch_off_at_ = now;
-      last_mode_event_at_ = now;
-      ESP_LOGI(TAG, "MODE SWITCH heat→cool — OFF for 60s");
-      update_action_();
-      publish_debug_state_(NAN);
+      force_mode_switch_off_("heat→cool", now);
       return;
     }
     if (heat_gear_ != -1) {
@@ -1135,12 +1130,12 @@ void FurrionChillCube::run_gear_controller_() {
 
     if (gear == -1 || user_input) {
       // Fresh start or user change: jump directly to appropriate gear
-      // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
+      // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
+      // and never gear 0 (only reachable by downshift from 1)
       if (diff > C_UP_45)         new_gear = 5;
       else if (diff > C_UP_34)    new_gear = 4;
       else if (diff > C_UP_23)    new_gear = 3;
-      else if (diff > C_UP_12)    new_gear = 2;
-      else if (diff > C_UP_01)    new_gear = 1;
+      else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;
       else                        new_gear = (gear == -1) ? -1 : 0;
     } else {
       switch (gear) {
@@ -1171,9 +1166,6 @@ void FurrionChillCube::run_gear_controller_() {
           break;
       }
     }
-
-    // Block -1→1 for cooling (can't cold-start at gear 1)
-    if (gear == -1 && new_gear == 1) new_gear = 2;
 
     // Track idle_since
     if (new_gear == 0 && gear != 0) {
@@ -1312,59 +1304,48 @@ void FurrionChillCube::publish_debug_state_(float diff) {
 
   uint32_t now = millis();
 
+  // Helper: only publish if value changed (reduces HA state churn)
+  auto pub = [](sensor::Sensor *s, float val) {
+    if (s && (isnan(val) != isnan(s->state) || (!isnan(val) && val != s->state))) {
+      s->publish_state(val);
+    }
+  };
+
   // Active IR mode: 0=OFF, 1=HEAT, 2=COOL
   float ir_mode = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? 1.0f :
                   (active_ir_mode_ == climate::CLIMATE_MODE_COOL) ? 2.0f : 0.0f;
-  debug_active_ir_mode_sensor_->publish_state(ir_mode);
+  pub(debug_active_ir_mode_sensor_, ir_mode);
+  pub(debug_last_active_mode_sensor_, (float)last_active_mode_);
 
-  if (debug_last_active_mode_sensor_)
-    debug_last_active_mode_sensor_->publish_state((float)last_active_mode_);
+  float phase = (float)(uint8_t)clamp_phase_;
+  if (quick_kick_active_) phase = 10.0f;
+  pub(debug_kick_phase_sensor_, phase);
 
-  if (debug_kick_phase_sensor_) {
-    float phase = (float)(uint8_t)clamp_phase_;
-    if (quick_kick_active_) phase = 10.0f;  // distinct value for quick kick
-    debug_kick_phase_sensor_->publish_state(phase);
+  pub(debug_gear_diff_sensor_, diff);
+
+  float tig = (last_gear_change_ == 0) ? -1.0f : (float)((now - last_gear_change_) / 1000);
+  pub(debug_time_in_gear_sensor_, tig);
+
+  float idle = (idle_since_ == 0) ? -1.0f : (float)((now - idle_since_) / 1000);
+  pub(debug_idle_duration_sensor_, idle);
+
+  float cd = 0.0f;
+  if (mode_switch_off_at_ > 0) {
+    uint32_t elapsed = now - mode_switch_off_at_;
+    cd = (elapsed < 60000) ? (float)((60000 - elapsed) / 1000) : 0.0f;
   }
+  pub(debug_mode_switch_cooldown_sensor_, cd);
 
-  if (debug_gear_diff_sensor_)
-    debug_gear_diff_sensor_->publish_state(isnan(diff) ? NAN : diff);
-
-  if (debug_time_in_gear_sensor_) {
-    float tig = (last_gear_change_ == 0) ? -1.0f : (float)((now - last_gear_change_) / 1000);
-    debug_time_in_gear_sensor_->publish_state(tig);
+  float clamp = 0.0f;
+  if (clamp_phase_ == ClampPhase::CLAMPED && clamp_start_ > 0) {
+    uint32_t elapsed = now - clamp_start_;
+    clamp = (elapsed < CLAMP_DURATION_MS) ? (float)((CLAMP_DURATION_MS - elapsed) / 1000) : 0.0f;
   }
+  pub(debug_fan_clamp_remaining_sensor_, clamp);
 
-  if (debug_idle_duration_sensor_) {
-    float idle = (idle_since_ == 0) ? -1.0f : (float)((now - idle_since_) / 1000);
-    debug_idle_duration_sensor_->publish_state(idle);
-  }
-
-  if (debug_mode_switch_cooldown_sensor_) {
-    float cd = 0.0f;
-    if (mode_switch_off_at_ > 0) {
-      uint32_t elapsed = now - mode_switch_off_at_;
-      cd = (elapsed < 60000) ? (float)((60000 - elapsed) / 1000) : 0.0f;
-    }
-    debug_mode_switch_cooldown_sensor_->publish_state(cd);
-  }
-
-  if (debug_fan_clamp_remaining_sensor_) {
-    float clamp = 0.0f;
-    if (clamp_phase_ == ClampPhase::CLAMPED && clamp_start_ > 0) {
-      uint32_t elapsed = now - clamp_start_;
-      clamp = (elapsed < CLAMP_DURATION_MS) ? (float)((CLAMP_DURATION_MS - elapsed) / 1000) : 0.0f;
-    }
-    debug_fan_clamp_remaining_sensor_->publish_state(clamp);
-  }
-
-  if (debug_heater_locked_out_sensor_)
-    debug_heater_locked_out_sensor_->publish_state(heater_locked_out_ ? 1.0f : 0.0f);
-
-  if (debug_failsafe_active_sensor_)
-    debug_failsafe_active_sensor_->publish_state(failsafe_active_ ? 1.0f : 0.0f);
-
-  if (debug_boot_ready_sensor_)
-    debug_boot_ready_sensor_->publish_state(boot_ready_ ? 1.0f : 0.0f);
+  pub(debug_heater_locked_out_sensor_, heater_locked_out_ ? 1.0f : 0.0f);
+  pub(debug_failsafe_active_sensor_, failsafe_active_ ? 1.0f : 0.0f);
+  pub(debug_boot_ready_sensor_, boot_ready_ ? 1.0f : 0.0f);
 }
 
 // ============================================================
@@ -1379,9 +1360,10 @@ void FurrionChillCube::dump_config() {
   if (outside_temp_sensor_) {
     ESP_LOGCONFIG(TAG, "  Outside Temp Unit: %s", outside_temp_fahrenheit_ ? "°F" : "°C");
   }
-  const char *mode_str = (heat_gear_ == 0) ? "HEAT (idle)" :
-                         (cool_gear_ == 0) ? "COOL (idle)" : "OFF";
-  ESP_LOGCONFIG(TAG, "  Restored Mode: %s", mode_str);
+  const char *mode_str = (heat_gear_ == 0) ? "HEAT (restored from prior session)" :
+                         (cool_gear_ == 0) ? "COOL (restored from prior session)" :
+                         "none (fresh boot)";
+  ESP_LOGCONFIG(TAG, "  Prior Mode: %s", mode_str);
 }
 
 }  // namespace furrion_chill_cube

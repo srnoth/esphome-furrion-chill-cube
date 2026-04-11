@@ -24,7 +24,6 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_inside_temperature_fahrenheit(bool f) { inside_temp_fahrenheit_ = f; }
   void set_outside_temperature_sensor(sensor::Sensor *s) { outside_temp_sensor_ = s; }
   void set_outside_temperature_fahrenheit(bool f) { outside_temp_fahrenheit_ = f; }
-  void set_heat_cool_gap(float gap_f);
   void set_outside_lockout_temp(float temp_f);
 
   // Diagnostic sensor setters
@@ -132,7 +131,6 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *debug_boot_ready_sensor_{nullptr};
 
   // Configuration
-  float heat_cool_gap_c_{0.0f};            // 0°F default (same setpoint allowed)
   float outside_lockout_temp_c_{1.67f};   // 35°F default
   bool inside_temp_fahrenheit_{false};
   bool outside_temp_fahrenheit_{false};
@@ -152,6 +150,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t last_cs_heartbeat_{0};
   uint32_t last_gear_run_{0};
   uint32_t mode_switch_off_at_{0};
+  uint32_t last_mode_event_at_{0};  // last mode switch or fresh start (time-based lockout)
   uint32_t ha_disconnect_time_{0};
   uint32_t temp_nan_since_{0};
   uint32_t fan_clamp_start_{0};

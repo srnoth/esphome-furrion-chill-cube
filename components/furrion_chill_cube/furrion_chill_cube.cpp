@@ -45,6 +45,8 @@ static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
 static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
 static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
+static const uint32_t MODE_SWITCH_IDLE_MS = 600000;   // 10 min idle before mode switch allowed
+static const uint32_t MODE_SWITCH_EVENT_MS = 1200000;  // 20 min lockout after mode switch or fresh start
 
 // Heating deadbands (diff = room - target, negative = cold)
 static const float H_UP_01 = -0.3f;   // 0->1: room 0.5F below target
@@ -68,17 +70,11 @@ static const float C_DN_21 =  0.0f;
 static const float C_DN_10 = -0.15f;
 static const float C_IDLE  = -0.15f;
 
-// Mode-switching hysteresis
-static const float MODE_SWITCH_EXTRA = 1.11f;  // ~2.0F
+// Mode-switching protection is time-based (MODE_SWITCH_IDLE_MS / MODE_SWITCH_EVENT_MS)
 
 // ============================================================
 // Configuration Setters
 // ============================================================
-
-void FurrionChillCube::set_heat_cool_gap(float gap_f) {
-  // Convert Fahrenheit delta to Celsius delta
-  heat_cool_gap_c_ = gap_f * (5.0f / 9.0f);
-}
 
 void FurrionChillCube::set_outside_lockout_temp(float temp_f) {
   // Convert Fahrenheit to Celsius
@@ -493,16 +489,10 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   }
   if (call.get_target_temperature_low().has_value()) {
     this->target_temperature_low = *call.get_target_temperature_low();
-    if (this->target_temperature_high - this->target_temperature_low < heat_cool_gap_c_) {
-      this->target_temperature_high = this->target_temperature_low + heat_cool_gap_c_;
-    }
     temp_changed = true;
   }
   if (call.get_target_temperature_high().has_value()) {
     this->target_temperature_high = *call.get_target_temperature_high();
-    if (this->target_temperature_high - this->target_temperature_low < heat_cool_gap_c_) {
-      this->target_temperature_low = this->target_temperature_high - heat_cool_gap_c_;
-    }
     temp_changed = true;
   }
   // Sync target_temperature when low/high change in single modes.
@@ -838,6 +828,7 @@ void FurrionChillCube::run_gear_controller_() {
     cool_gear_ = -1;
     idle_since_ = 0;
     last_active_mode_ = 0;
+    last_mode_event_at_ = 0;
     fan_clamp_start_ = 0;
     mode_resend_at_ = 0;
     cs_reinforce_count_ = 0;
@@ -866,6 +857,11 @@ void FurrionChillCube::run_gear_controller_() {
   if (failsafe_active_) {
     failsafe_active_ = false;
     ESP_LOGI(TAG, "Failsafe cleared — normal operation resumed");
+  }
+
+  // Fix: seed idle_since_ if gear is 0 but timer was never set (post-boot recovery)
+  if ((heat_gear_ == 0 || cool_gear_ == 0) && idle_since_ == 0) {
+    idle_since_ = now;
   }
 
   // === Mode switch guard: 60s OFF between heat↔cool ===
@@ -919,20 +915,24 @@ void FurrionChillCube::run_gear_controller_() {
     float c_target = get_cool_target_();
     int last_mode = last_active_mode_;
 
-    float heat_engage = h_target;
-    float cool_engage = c_target;
-    if (last_mode == 1) {
-      cool_engage = c_target + MODE_SWITCH_EXTRA;
-    } else if (last_mode == 2) {
-      heat_engage = h_target - MODE_SWITCH_EXTRA;
+    // Time-based mode switch lockout (replaces temperature-based MODE_SWITCH_EXTRA)
+    bool mode_switch_allowed = user_input;  // user override cancels all lockouts
+    if (!mode_switch_allowed && last_mode != 0) {
+      bool idle_enough = idle_since_ > 0 && (now - idle_since_) >= MODE_SWITCH_IDLE_MS;
+      bool no_recent_event = last_mode_event_at_ == 0 || (now - last_mode_event_at_) >= MODE_SWITCH_EVENT_MS;
+      mode_switch_allowed = idle_enough && no_recent_event;
     }
 
-    if (room <= heat_engage) {
+    if (!mode_switch_allowed && last_mode == 1) {
+      do_cool = false;    // locked: stay in heat path
+    } else if (!mode_switch_allowed && last_mode == 2) {
+      do_heat = false;    // locked: stay in cool path
+    } else if (room <= h_target) {
       do_cool = false;
-    } else if (room >= cool_engage) {
+    } else if (room >= c_target) {
       do_heat = false;
     } else {
-      // Hysteresis deadband — keep whichever was last active
+      // Deadband — keep whichever was last active
       if (heat_gear_ >= 0) { do_cool = false; }
       else if (cool_gear_ >= 0) { do_heat = false; }
       else {
@@ -962,6 +962,7 @@ void FurrionChillCube::run_gear_controller_() {
       set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
       mode_switch_off_at_ = now;
+      last_mode_event_at_ = now;
       ESP_LOGI(TAG, "MODE SWITCH cool→heat — OFF for 60s");
       update_action_();
       publish_debug_state_(NAN);
@@ -991,8 +992,7 @@ void FurrionChillCube::run_gear_controller_() {
         case 0: {
           if (can_upshift_to(1) && diff < H_UP_01) new_gear = 1;
           bool imm_off = !boot_ready_;
-          bool far_from_setpoint = (diff > 1.1f);
-          if ((imm_off || (idle_long_enough && far_from_setpoint)) && diff > H_IDLE) new_gear = -1;
+          if ((imm_off || idle_long_enough) && diff > H_IDLE) new_gear = -1;
           break;
         }
         case 1:
@@ -1053,6 +1053,7 @@ void FurrionChillCube::run_gear_controller_() {
       }
       bool needs_fresh_start = (gear == -1 && new_gear == 1);
       if (needs_fresh_start) {
+        last_mode_event_at_ = now;
         start_fresh_kickstart_(1, cs);
         heat_kickstart_pending = true;
       } else if (current_cs_ != cs) {
@@ -1105,6 +1106,7 @@ void FurrionChillCube::run_gear_controller_() {
       set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
       mode_switch_off_at_ = now;
+      last_mode_event_at_ = now;
       ESP_LOGI(TAG, "MODE SWITCH heat→cool — OFF for 60s");
       update_action_();
       publish_debug_state_(NAN);
@@ -1136,8 +1138,7 @@ void FurrionChillCube::run_gear_controller_() {
         case 0: {
           if (can_upshift_to(1) && diff > C_UP_01) new_gear = 1;
           bool imm_off = !boot_ready_;
-          bool far_from_setpoint = (diff < -1.1f);
-          if ((imm_off || (idle_long_enough && far_from_setpoint)) && diff < C_IDLE) new_gear = -1;
+          if ((imm_off || idle_long_enough) && diff < C_IDLE) new_gear = -1;
           break;
         }
         case 1:
@@ -1211,6 +1212,7 @@ void FurrionChillCube::run_gear_controller_() {
       bool needs_fresh_start = (gear == -1 && new_gear >= 1 && new_gear <= 3);
       bool needs_idle_kick = (gear == 0 && new_gear >= 1 && new_gear <= 2);
       if (needs_fresh_start) {
+        last_mode_event_at_ = now;
         start_fresh_kickstart_(2, cs);
         cool_kickstart_pending = true;
       } else if (needs_idle_kick) {
@@ -1369,7 +1371,6 @@ void FurrionChillCube::publish_debug_state_(float diff) {
 
 void FurrionChillCube::dump_config() {
   ESP_LOGCONFIG(TAG, "Furrion Chill Cube:");
-  ESP_LOGCONFIG(TAG, "  Heat/Cool Gap: %.1f°F (%.2f°C)", heat_cool_gap_c_ * 9.0f / 5.0f, heat_cool_gap_c_);
   ESP_LOGCONFIG(TAG, "  Outside Lockout: %.1f°F (%.1f°C)",
                 outside_lockout_temp_c_ * 9.0f / 5.0f + 32.0f, outside_lockout_temp_c_);
   ESP_LOGCONFIG(TAG, "  Inside Temp Unit: %s", inside_temp_fahrenheit_ ? "°F" : "°C");

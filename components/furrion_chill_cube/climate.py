@@ -31,7 +31,6 @@ CONF_INSIDE_TEMPERATURE = "inside_temperature"
 CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT = "inside_temperature_is_fahrenheit"
 CONF_OUTSIDE_TEMPERATURE = "outside_temperature"
 CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT = "outside_temperature_is_fahrenheit"
-CONF_HEAT_COOL_GAP = "heat_cool_gap"
 CONF_OUTSIDE_LOCKOUT_TEMP = "outside_lockout_temp"
 CONF_HEAT_GEAR = "heat_gear"
 CONF_COOL_GEAR = "cool_gear"
@@ -122,10 +121,6 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
             cv.Optional(CONF_OUTSIDE_TEMPERATURE): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
-            # Gap between heat/cool setpoints, in °F (converted to °C internally)
-            cv.Optional(CONF_HEAT_COOL_GAP, default=0.0): cv.float_range(
-                min=0.0, max=20.0
-            ),
             # Below this outside temp (°F), heating is locked out. Default 35°F ≈ 1.7°C
             cv.Optional(CONF_OUTSIDE_LOCKOUT_TEMP, default=35.0): cv.float_,
             # Diagnostic sensors (optional)
@@ -210,7 +205,6 @@ async def to_code(config):
         )
 
     # Configuration values (in Fahrenheit, converted to Celsius internally)
-    cg.add(var.set_heat_cool_gap(config[CONF_HEAT_COOL_GAP]))
     cg.add(var.set_outside_lockout_temp(config[CONF_OUTSIDE_LOCKOUT_TEMP]))
 
     # Diagnostic sensors

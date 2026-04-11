@@ -36,7 +36,9 @@ static const int FURRION_MAX_TEMP_C = 30;
 
 // Gear controller constants — no fixed anchors; setpoint is dynamic
 
-// Per-gear upshift hold times (ms) — index = target gear
+// Per-gear upshift hold times (ms) — indexed by target gear number.
+// HOLD_MS[0] is unused (gear 0 never upshifts via can_upshift_to) but
+// kept for direct array indexing by gear number without offset.
 //                        0      1       2       3        4        5
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
 static const uint32_t IDLE_BEFORE_OFF_MS = 900000;  // 15 min
@@ -201,19 +203,21 @@ void FurrionChillCube::transmit_mode_command_() {
   }
   transmit.perform();
 
-  // === Transmission 2: Swing (B9) — 10.5ms gaps before and after ===
-  // Matches Toshiba component: reuse same transmit object with reset
-  data->reset();
-  data->space(IR_PACKET_SPACE);
-  if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
-    static const uint8_t SWING_ON[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
-    this->encode_(data, SWING_ON, 6, 1);
-  } else {
-    static const uint8_t SWING_OFF[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
-    this->encode_(data, SWING_OFF, 6, 1);
+  // === Transmission 2: Swing (B9) — separate transmit call for clean state ===
+  {
+    auto swing_tx = this->transmitter_->transmit();
+    auto *swing_data = swing_tx.get_data();
+    swing_data->space(IR_PACKET_SPACE);
+    if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
+      static const uint8_t SWING_ON[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
+      this->encode_(swing_data, SWING_ON, 6, 1);
+    } else {
+      static const uint8_t SWING_OFF[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
+      this->encode_(swing_data, SWING_OFF, 6, 1);
+    }
+    swing_data->space(IR_PACKET_SPACE);
+    swing_tx.perform();
   }
-  data->space(IR_PACKET_SPACE);
-  transmit.perform();
 
   ESP_LOGD(TAG, "IR mode=%d fan=%d swing=%d",
            (int)active_ir_mode_, (int)fan, (int)this->swing_mode);
@@ -317,11 +321,11 @@ void FurrionChillCube::setup() {
   if (mode_pref_.load(&saved_mode)) {
     if (saved_mode == 1) {
       heat_gear_ = 0;
-      last_active_mode_ = 1;
+      last_active_mode_ = MODE_HEAT;
       ESP_LOGI(TAG, "Restored prior mode: HEAT (gear → idle, skip kickstart)");
     } else if (saved_mode == 2) {
       cool_gear_ = 0;
-      last_active_mode_ = 2;
+      last_active_mode_ = MODE_COOL;
       ESP_LOGI(TAG, "Restored prior mode: COOL (gear → idle, skip kickstart)");
     }
   }
@@ -878,7 +882,7 @@ void FurrionChillCube::run_gear_controller_() {
     heat_gear_ = -1;
     cool_gear_ = -1;
     idle_since_ = 0;
-    last_active_mode_ = 0;
+    last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
     clamp_phase_ = ClampPhase::IDLE;
     quick_kick_active_ = false;
@@ -963,19 +967,19 @@ void FurrionChillCube::run_gear_controller_() {
   if (heater_on && cooler_on) {
     float h_target = get_heat_target_();
     float c_target = get_cool_target_();
-    int last_mode = last_active_mode_;
+    ActiveMode last_mode = last_active_mode_;
 
     // Time-based mode switch lockout (replaces temperature-based MODE_SWITCH_EXTRA)
     bool mode_switch_allowed = user_input;  // user override cancels all lockouts
-    if (!mode_switch_allowed && last_mode != 0) {
+    if (!mode_switch_allowed && last_mode != MODE_NONE) {
       bool idle_enough = idle_since_ > 0 && (now - idle_since_) >= MODE_SWITCH_IDLE_MS;
       bool no_recent_event = last_mode_event_at_ == 0 || (now - last_mode_event_at_) >= MODE_SWITCH_EVENT_MS;
       mode_switch_allowed = idle_enough && no_recent_event;
     }
 
-    if (!mode_switch_allowed && last_mode == 1) {
+    if (!mode_switch_allowed && last_mode == MODE_HEAT) {
       do_cool = false;    // locked: stay in heat path
-    } else if (!mode_switch_allowed && last_mode == 2) {
+    } else if (!mode_switch_allowed && last_mode == MODE_COOL) {
       do_heat = false;    // locked: stay in cool path
     } else if (room <= h_target) {
       do_cool = false;
@@ -1056,7 +1060,7 @@ void FurrionChillCube::run_gear_controller_() {
       heat_gear_ = new_gear;
       last_gear_change_ = now;
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(new_gear);
-      if (new_gear >= 1) last_active_mode_ = 1;
+      if (new_gear >= 1) last_active_mode_ = MODE_HEAT;
       float pct;
       switch (new_gear) {
         case 3:  pct = 100.0f; break;
@@ -1179,7 +1183,7 @@ void FurrionChillCube::run_gear_controller_() {
       cool_gear_ = new_gear;
       last_gear_change_ = now;
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(new_gear);
-      if (new_gear >= 1) last_active_mode_ = 2;
+      if (new_gear >= 1) last_active_mode_ = MODE_COOL;
       float pct;
       switch (new_gear) {
         case 5:  pct = 100.0f; break;
@@ -1291,7 +1295,7 @@ void FurrionChillCube::run_gear_controller_() {
            heat_gear_, cool_gear_, room, current_cs_,
            time_in_gear / 1000,
            idle_since_ > 0 ? (now - idle_since_) / 60000 : 0,
-           last_active_mode_);
+           (int)last_active_mode_);
 }
 
 // ============================================================

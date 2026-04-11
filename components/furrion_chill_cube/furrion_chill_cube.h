@@ -140,9 +140,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool outside_temp_fahrenheit_{false};
 
   // Gear state
+  enum ActiveMode : uint8_t { MODE_NONE = 0, MODE_HEAT = 1, MODE_COOL = 2 };
   int heat_gear_{-1};
   int cool_gear_{-1};
-  int last_active_mode_{0};    // 0=none, 1=heat, 2=cool
+  ActiveMode last_active_mode_{MODE_NONE};
   int current_cs_{22};
   int furrion_setpoint_c_{22}; // Dynamic Furrion setpoint in °C (16-30)
   climate::ClimateMode active_ir_mode_{climate::CLIMATE_MODE_OFF};

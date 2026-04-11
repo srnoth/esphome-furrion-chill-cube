@@ -474,11 +474,16 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 
     // Abort active kickstart on mode change — user override takes priority
     if (kick_phase_ != KickPhase::IDLE) {
+      bool fan_low_sent = (kick_phase_ != KickPhase::FRESH_PRE_CS);
       ESP_LOGI(TAG, "Kickstart aborted — user mode change to %d", (int)new_mode);
       kick_phase_ = KickPhase::IDLE;
       mode_resend_at_ = 0;
       fan_clamp_start_ = 0;
       cs_reinforce_count_ = 0;
+      // Re-send mode to restore fan=AUTO if kickstart already sent fan=LOW
+      if (fan_low_sent && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+        transmit_mode_command_();
+      }
     }
   }
 
@@ -508,11 +513,16 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   }
 
   if (temp_changed && kick_phase_ != KickPhase::IDLE) {
+    bool fan_low_sent = (kick_phase_ != KickPhase::FRESH_PRE_CS);
     ESP_LOGI(TAG, "Kickstart aborted — user target temp change");
     kick_phase_ = KickPhase::IDLE;
     fan_clamp_start_ = 0;
     mode_resend_at_ = 0;
     cs_reinforce_count_ = 0;
+    // Re-send mode to restore fan=AUTO if kickstart already sent fan=LOW
+    if (fan_low_sent && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+      transmit_mode_command_();
+    }
   }
 
   // Fan mode change — works during kickstart, explicit non-AUTO terminates clamp

@@ -40,7 +40,7 @@ static const int FURRION_MAX_TEMP_C = 30;
 //                        0      1       2       3        4        5
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
 static const uint32_t IDLE_BEFORE_OFF_MS = 900000;  // 15 min
-static const uint32_t FAN_CLAMP_DURATION_MS = 330000;  // 5 min + 30s buffer
+static const uint32_t CLAMP_DURATION_MS = 330000;  // 5 min 30s
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
 static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
@@ -359,29 +359,29 @@ void FurrionChillCube::setup() {
 void FurrionChillCube::loop() {
   uint32_t now = millis();
 
-  // 1. Advance kickstart state machine
-  if (kick_phase_ != KickPhase::IDLE) {
-    advance_kickstart_(now);
-  }
-
-  // 2. Advance keep-alive state machine
+  // 1. Advance keep-alive state machine
   if (keepalive_phase_ != KeepAlivePhase::IDLE) {
     advance_keepalive_(now);
   }
 
-  // 3. Run gear controller if triggered
+  // 2. Run gear controller if triggered (not blocked by kickstart — kickstart suppresses CS writes)
   bool should_run = false;
   if (temp_dirty_) { should_run = true; temp_dirty_ = false; }
   if (last_gear_run_ == 0 || (now - last_gear_run_) >= GEAR_INTERVAL_MS) should_run = true;
   if (user_changed_) should_run = true;
 
-  if (should_run && kick_phase_ == KickPhase::IDLE && keepalive_phase_ == KeepAlivePhase::IDLE) {
+  if (should_run && keepalive_phase_ == KeepAlivePhase::IDLE) {
     run_gear_controller_();
     last_gear_run_ = now;
   }
 
+  // 3. Advance kickstart (after gear controller so it can check gear thresholds)
+  if (kickstart_active_()) {
+    advance_kickstart_(now);
+  }
+
   // 4. Keep-alive trigger for low-CS gears (cool 1-2, heat 1)
-  if (kick_phase_ == KickPhase::IDLE && keepalive_phase_ == KeepAlivePhase::IDLE &&
+  if (!kickstart_active_() && keepalive_phase_ == KeepAlivePhase::IDLE &&
       boot_ready_ && !failsafe_active_) {
     bool cool_eligible = (cool_gear_ >= 1 && cool_gear_ <= 2 &&
                           active_ir_mode_ == climate::CLIMATE_MODE_COOL);
@@ -395,41 +395,12 @@ void FurrionChillCube::loop() {
     }
   }
 
-  // 5. Post-kickstart CS reinforcement (re-transmit gear controller's CS at 5s intervals)
-  if (cs_reinforce_count_ > 0 && (now - cs_reinforce_at_) >= 5000) {
-    transmit_cs_update_(true);
-    last_cs_heartbeat_ = now;
-    cs_reinforce_count_--;
-    cs_reinforce_at_ = now;
-    ESP_LOGI(TAG, "CS reinforce cs=%d (%d left)", current_cs_, cs_reinforce_count_);
-  }
-
-  // 6. CS heartbeat every 30s
+  // 5. CS heartbeat every 30s (current_cs_ is kickstart CS during kickstart — correct)
   if (boot_ready_ && !failsafe_active_ &&
       active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
       (now - last_cs_heartbeat_) >= CS_HEARTBEAT_MS) {
     transmit_cs_update_(true);
     last_cs_heartbeat_ = now;
-  }
-
-  // 7. Fan clamp management (release clamp when expired)
-  if (fan_clamp_start_ > 0 && (now - fan_clamp_start_) >= FAN_CLAMP_DURATION_MS) {
-    fan_clamp_start_ = 0;
-    // Re-send mode with AUTO fan if unit is on
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
-      transmit_mode_command_();
-      mode_resend_at_ = now;
-      ESP_LOGI(TAG, "Fan clamp expired — fan → AUTO (re-send in 5s)");
-    }
-  }
-
-  // 8. Mode command re-send (one-shot, 5s after fan recovery)
-  if (mode_resend_at_ > 0 && (now - mode_resend_at_) >= 5000) {
-    mode_resend_at_ = 0;
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
-      transmit_mode_command_();
-      ESP_LOGI(TAG, "Mode re-send (fan recovery)");
-    }
   }
 }
 
@@ -472,22 +443,33 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 
     this->mode = new_mode;
 
-    // Abort active kickstart on mode change — user override takes priority
-    if (kick_phase_ != KickPhase::IDLE) {
-      bool fan_low_sent = (kick_phase_ != KickPhase::FRESH_PRE_CS);
-      ESP_LOGI(TAG, "Kickstart aborted — user mode change to %d", (int)new_mode);
-      kick_phase_ = KickPhase::IDLE;
-      mode_resend_at_ = 0;
-      fan_clamp_start_ = 0;
-      cs_reinforce_count_ = 0;
-      // Re-send mode to restore fan=AUTO if kickstart already sent fan=LOW
-      if (fan_low_sent && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-        transmit_mode_command_();
+    // Abort kickstart only if new mode is incompatible with the active IR mode.
+    if (kickstart_active_()) {
+      bool compatible = false;
+      if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
+        compatible = (new_mode == climate::CLIMATE_MODE_COOL || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
+      } else if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
+        compatible = (new_mode == climate::CLIMATE_MODE_HEAT || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
+      }
+      if (!compatible) {
+        ESP_LOGI(TAG, "Kickstart aborted — mode %d incompatible with IR mode %d",
+                 (int)new_mode, (int)active_ir_mode_);
+        end_kickstart_(millis());
+        // If switching COOL↔HEAT, trigger 60s cooldown
+        if ((active_ir_mode_ == climate::CLIMATE_MODE_COOL &&
+             (new_mode == climate::CLIMATE_MODE_HEAT)) ||
+            (active_ir_mode_ == climate::CLIMATE_MODE_HEAT &&
+             (new_mode == climate::CLIMATE_MODE_COOL))) {
+          set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+          transmit_mode_command_();
+          mode_switch_off_at_ = millis();
+          last_mode_event_at_ = millis();
+        }
       }
     }
   }
 
-  // Target temperature changes — abort kickstart for immediate gear re-evaluation
+  // Target temperature changes — setpoint changes don't affect kickstart
   bool temp_changed = false;
   if (call.get_target_temperature().has_value()) {
     this->target_temperature = *call.get_target_temperature();
@@ -512,29 +494,11 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     this->target_temperature = this->target_temperature_high;
   }
 
-  if (temp_changed && kick_phase_ != KickPhase::IDLE) {
-    bool fan_low_sent = (kick_phase_ != KickPhase::FRESH_PRE_CS);
-    ESP_LOGI(TAG, "Kickstart aborted — user target temp change");
-    kick_phase_ = KickPhase::IDLE;
-    fan_clamp_start_ = 0;
-    mode_resend_at_ = 0;
-    cs_reinforce_count_ = 0;
-    // Re-send mode to restore fan=AUTO if kickstart already sent fan=LOW
-    if (fan_low_sent && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      transmit_mode_command_();
-    }
-  }
-
-  // Fan mode change — works during kickstart, explicit non-AUTO terminates clamp
+  // Fan mode change
   if (call.get_fan_mode().has_value()) {
     auto new_fan = *call.get_fan_mode();
     this->fan_mode = new_fan;
-    // Explicit non-AUTO fan selection overrides the 5-min LOW clamp
-    if (new_fan != climate::CLIMATE_FAN_AUTO && fan_clamp_start_ > 0) {
-      fan_clamp_start_ = 0;
-      ESP_LOGI(TAG, "Fan clamp terminated — user set fan=%d", (int)new_fan);
-    }
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
       transmit_mode_command_();
       ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)new_fan);
     }
@@ -586,18 +550,41 @@ void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
              furrion_setpoint_c_, new_sp, is_heat ? "heat" : "cool");
     furrion_setpoint_c_ = new_sp;
     // Retransmit mode command so unit gets the new setpoint
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && kick_phase_ == KickPhase::IDLE) {
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
       transmit_mode_command_();
     }
   }
 }
 
 climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
-  bool clamp_active = fan_clamp_start_ > 0 && (millis() - fan_clamp_start_) < FAN_CLAMP_DURATION_MS;
-  if (clamp_active) {
+  if (clamp_phase_ == ClampPhase::CLAMPED) {
     return climate::CLIMATE_FAN_LOW;
   }
   return this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
+}
+
+int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
+  if (is_heat) {
+    int hi = furrion_setpoint_c_ + 2;
+    int offset = (hi > 30) ? (30 - hi) : 0;
+    switch (gear) {
+      case 3:  return furrion_setpoint_c_ - 1 + offset;
+      case 2:  return furrion_setpoint_c_     + offset;
+      case 1:  return furrion_setpoint_c_ + 1 + offset;
+      default: return furrion_setpoint_c_ + 2 + offset;
+    }
+  } else {
+    int lo = furrion_setpoint_c_ - 3;
+    int offset = (lo < 15) ? (15 - lo) : 0;
+    switch (gear) {
+      case 5:  return furrion_setpoint_c_ + 2 + offset;
+      case 4:  return furrion_setpoint_c_ + 1 + offset;
+      case 3:  return furrion_setpoint_c_     + offset;
+      case 2:  return furrion_setpoint_c_ - 1 + offset;
+      case 1:  return furrion_setpoint_c_ - 2 + offset;
+      default: return furrion_setpoint_c_ - 3 + offset;
+    }
+  }
 }
 
 void FurrionChillCube::set_cs_value_(int cs) {
@@ -640,98 +627,117 @@ void FurrionChillCube::send_swing_state_() {
 // Kickstart State Machine
 // ============================================================
 
-void FurrionChillCube::start_fresh_kickstart_(int mode, int target_cs) {
-  kick_mode_ = mode;
-  kick_target_cs_ = target_cs;
+void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
+  clamp_is_heat_ = is_heat;
+  // Kickstart CS: heat=gear2 (setpoint), cool=gear4 (setpoint+1)
+  clamp_kickstart_cs_ = is_heat ? furrion_setpoint_c_ : (furrion_setpoint_c_ + 1);
+  clamp_kickstart_cs_ = std::max(15, std::min(30, clamp_kickstart_cs_));
 
-  // Step 1: Set kickstart CS BEFORE mode change
-  // Heat restart = setpoint (at anchor), Cool restart = setpoint + 1 (above anchor)
-  int restart_cs = (mode == 1) ? furrion_setpoint_c_ : (furrion_setpoint_c_ + 1);
-  restart_cs = std::max(15, std::min(30, restart_cs));
-  current_cs_ = restart_cs;
+  // PRE_CS: set kickstart CS before mode-on (500ms lead)
+  current_cs_ = clamp_kickstart_cs_;
   if (boot_ready_ && !failsafe_active_) {
     transmit_cs_update_(true);
-    last_cs_heartbeat_ = millis();
+    last_cs_heartbeat_ = now;
   }
-  if (cs_value_sensor_) cs_value_sensor_->publish_state(restart_cs);
+  if (cs_value_sensor_) cs_value_sensor_->publish_state(clamp_kickstart_cs_);
 
-  kick_phase_ = KickPhase::FRESH_PRE_CS;
-  kick_phase_start_ = millis();
-  mode_resend_at_ = 0;
-  ESP_LOGI(TAG, "Kickstart: PRE-SET cs=%d, target_cs=%d", restart_cs, target_cs);
+  clamp_phase_ = ClampPhase::PRE_CS;
+  clamp_phase_start_ = now;
+  ESP_LOGI(TAG, "Clamped kickstart: PRE_CS %s cs=%d", is_heat ? "HEAT" : "COOL", clamp_kickstart_cs_);
 }
 
-void FurrionChillCube::start_idle_kickstart_(int target_cs) {
-  kick_target_cs_ = target_cs;
-  kick_mode_ = 2;  // cool only
+void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, int target_cs, uint32_t now) {
+  quick_kick_active_ = true;
+  quick_kick_start_ = now;
+  quick_kick_cs_ = std::max(15, std::min(30, kickstart_cs));
+  quick_kick_is_heat_ = is_heat;
 
-  int restart_cs = std::max(15, std::min(30, furrion_setpoint_c_));
-  current_cs_ = restart_cs;  // cool idle restart threshold (at anchor)
-  if (boot_ready_ && !failsafe_active_) {
+  // Set and transmit kickstart CS immediately
+  current_cs_ = quick_kick_cs_;
+  if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     transmit_cs_update_(true);
-    last_cs_heartbeat_ = millis();
+    last_cs_heartbeat_ = now;
   }
-  if (cs_value_sensor_) cs_value_sensor_->publish_state(restart_cs);
+  if (cs_value_sensor_) cs_value_sensor_->publish_state(quick_kick_cs_);
 
-  kick_phase_ = KickPhase::IDLE_KICK_CS;
-  kick_phase_start_ = millis();
-  mode_resend_at_ = 0;
-  ESP_LOGI(TAG, "Idle kickstart: cs=%d target_cs=%d", restart_cs, target_cs);
+  // If unit is OFF, turn it on now (no fan clamp, fan=AUTO)
+  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
+    set_active_ir_mode_(is_heat ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
+    transmit_mode_command_();
+  }
+
+  ESP_LOGI(TAG, "Quick kickstart: %s cs=%d target_cs=%d", is_heat ? "HEAT" : "COOL", quick_kick_cs_, target_cs);
 }
 
 void FurrionChillCube::advance_kickstart_(uint32_t now) {
-  uint32_t elapsed = now - kick_phase_start_;
-
-  switch (kick_phase_) {
-    case KickPhase::FRESH_PRE_CS:
-      if (elapsed >= 500) {
-        // Step 2: Turn on mode — first IR frame has correct CS
-        set_active_ir_mode_((kick_mode_ == 1) ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
-        fan_clamp_start_ = now;
-        transmit_mode_command_();
-        kick_phase_ = KickPhase::FRESH_MODE_ON;
-        kick_phase_start_ = now;
-        ESP_LOGI(TAG, "Kickstart: MODE ON + fan=LOW, clamp=310s");
-      }
-      break;
-
-    case KickPhase::FRESH_MODE_ON:
-      if (elapsed >= 60000) {
-        // Step 3: Release to gear controller + reinforce drop
-        cs_reinforce_count_ = 2;
-        cs_reinforce_at_ = now;
-        kick_phase_ = KickPhase::IDLE;
-        uint32_t clamp_elapsed = now - fan_clamp_start_;
-        int remaining = (clamp_elapsed < FAN_CLAMP_DURATION_MS) ?
-                        (int)(FAN_CLAMP_DURATION_MS - clamp_elapsed) : 0;
-        ESP_LOGI(TAG, "Kickstart: released, clamp %dms left", remaining);
-      }
-      break;
-
-    case KickPhase::IDLE_KICK_CS:
-      if (elapsed >= 5000) {
-        // t=5s: reinforce CS=25
-        transmit_cs_update_(true);
-        kick_phase_ = KickPhase::IDLE_KICK_CS2;
-        kick_phase_start_ = now;
-        ESP_LOGI(TAG, "Idle kickstart: reinforce cs=%d", current_cs_);
-      }
-      break;
-
-    case KickPhase::IDLE_KICK_CS2:
-      if (elapsed >= 5000) {
-        // t=10s: release to gear controller, start CS reinforcement
-        cs_reinforce_count_ = 2;
-        cs_reinforce_at_ = now;
-        kick_phase_ = KickPhase::IDLE;
-        ESP_LOGI(TAG, "Idle kickstart: released, gear controller will set CS");
-      }
-      break;
-
-    default:
-      kick_phase_ = KickPhase::IDLE;
-      break;
+  // === Clamped kickstart state machine ===
+  if (clamp_phase_ == ClampPhase::PRE_CS) {
+    if ((now - clamp_phase_start_) >= 500) {
+      // Mode ON + fan=LOW
+      set_active_ir_mode_(clamp_is_heat_ ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
+      transmit_mode_command_();
+      clamp_phase_ = ClampPhase::CLAMPED;
+      clamp_start_ = now;
+      ESP_LOGI(TAG, "Clamped kickstart: MODE ON + fan=LOW, clamp=5:30");
+    }
+  } else if (clamp_phase_ == ClampPhase::CLAMPED) {
+    // Check gear threshold: cool 3+, heat 2+
+    int drop_gear = clamp_is_heat_ ? 2 : 3;
+    int current_gear = clamp_is_heat_ ? heat_gear_ : cool_gear_;
+    if (current_gear >= drop_gear) {
+      ESP_LOGI(TAG, "Clamped kickstart: ended — gear %d >= %d", current_gear, drop_gear);
+      end_kickstart_(now);
+      return;
+    }
+    // Check 5:30 timeout
+    if ((now - clamp_start_) >= CLAMP_DURATION_MS) {
+      ESP_LOGI(TAG, "Clamped kickstart: ended — 5:30 timeout");
+      end_kickstart_(now);
+      return;
+    }
   }
+
+  // === Quick kickstart ===
+  if (quick_kick_active_) {
+    uint32_t elapsed = now - quick_kick_start_;
+    if (elapsed >= 5000 && elapsed < 6000) {
+      // 5s: reinforce kickstart CS (one-shot, guarded by 1s window)
+      transmit_cs_update_(true);
+      last_cs_heartbeat_ = now;
+      ESP_LOGI(TAG, "Quick kickstart: reinforce cs=%d", quick_kick_cs_);
+    }
+    if (elapsed >= 10000) {
+      // 10s: release — transmit current gear's CS
+      ESP_LOGI(TAG, "Quick kickstart: ended — 10s");
+      end_kickstart_(now);
+    }
+  }
+}
+
+void FurrionChillCube::end_kickstart_(uint32_t now) {
+  bool was_clamped = (clamp_phase_ == ClampPhase::CLAMPED);
+
+  // Clear all kickstart state
+  clamp_phase_ = ClampPhase::IDLE;
+  clamp_start_ = 0;
+  clamp_phase_start_ = 0;
+  quick_kick_active_ = false;
+  quick_kick_start_ = 0;
+
+  // Determine current gear and compute the correct CS
+  bool is_heat = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT);
+  int gear = is_heat ? heat_gear_ : cool_gear_;
+  if (gear >= 0) {
+    int cs = compute_gear_cs_(is_heat, gear);
+    set_cs_value_(cs);
+  }
+
+  // If we were clamped (fan=LOW), re-send mode with fan=AUTO
+  if (was_clamped && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    transmit_mode_command_();
+  }
+
+  ESP_LOGI(TAG, "Kickstart released: cs=%d fan=%s", current_cs_, was_clamped ? "AUTO (was LOW)" : "unchanged");
 }
 
 // ============================================================
@@ -849,9 +855,8 @@ void FurrionChillCube::run_gear_controller_() {
     idle_since_ = 0;
     last_active_mode_ = 0;
     last_mode_event_at_ = 0;
-    fan_clamp_start_ = 0;
-    mode_resend_at_ = 0;
-    cs_reinforce_count_ = 0;
+    clamp_phase_ = ClampPhase::IDLE;
+    quick_kick_active_ = false;
     abort_keepalive_();
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
@@ -972,9 +977,8 @@ void FurrionChillCube::run_gear_controller_() {
     if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
       cool_gear_ = -1;
       heat_gear_ = -1;
-      fan_clamp_start_ = 0;
-      mode_resend_at_ = 0;
-      cs_reinforce_count_ = 0;
+      clamp_phase_ = ClampPhase::IDLE;
+      quick_kick_active_ = false;
       abort_keepalive_();
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
@@ -1062,58 +1066,32 @@ void FurrionChillCube::run_gear_controller_() {
     }
 
     // CS + kickstart logic
-    bool heat_kickstart_pending = false;
-    if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
-      // Offset to keep all gear CS values distinct at high setpoints
-      // (gear 0 CS = setpoint+2 would exceed 30 when setpoint > 28)
-      int hi = furrion_setpoint_c_ + 2;  // gear 0 = highest CS
-      int offset = (hi > 30) ? (30 - hi) : 0;
-      int cs;
-      switch (new_gear) {
-        case 3:  cs = furrion_setpoint_c_ - 1 + offset; break;
-        case 2:  cs = furrion_setpoint_c_     + offset; break;
-        case 1:  cs = furrion_setpoint_c_ + 1 + offset; break;
-        default: cs = furrion_setpoint_c_ + 2 + offset; break;
-      }
-      // Heat kickstart: only -1→1 (asymmetric with cool path by design).
-      // Gear 1 CS = setpoint+1 tells the unit room is ABOVE heat target,
-      // so it won't start heating without the kickstart pre-CS walk.
-      // Gears 2-3 CS ≤ setpoint — unit sees "room at/below target" and
-      // starts the compressor naturally. Cool gears 1-3 are the opposite
-      // (CS ≤ cool target), so they ALL need kickstart.
-      bool needs_fresh_start = (gear == -1 && new_gear == 1);
-      if (needs_fresh_start) {
+    if (new_gear >= 0) {
+      int cs = compute_gear_cs_(true, new_gear);
+      if (gear == -1 && new_gear == 1) {
+        // OFF→gear 1: clamped kickstart (fan=LOW 5:30, CS=gear2 level)
         last_mode_event_at_ = now;
-        start_fresh_kickstart_(1, cs);
-        heat_kickstart_pending = true;
-      } else if (current_cs_ != cs) {
+        start_clamped_kickstart_(true, now);
+      } else if (gear == -1 && new_gear >= 2) {
+        // OFF→gear 2+: direct start, no kickstart needed
+        if (!kickstart_active_() && current_cs_ != cs) {
+          set_cs_value_(cs);
+        }
+      } else if (!kickstart_active_() && current_cs_ != cs) {
         set_cs_value_(cs);
       }
     }
 
     // HVAC on/off
-    if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !heat_kickstart_pending) {
+    if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !kickstart_active_()) {
       set_active_ir_mode_(climate::CLIMATE_MODE_HEAT);
       transmit_mode_command_();
-      transmit_cs_update_(true);  // Ensure CS_DATA sent on cold start (kickstart path handles its own)
+      transmit_cs_update_(true);
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
-      fan_clamp_start_ = 0;
-      mode_resend_at_ = 0;
-      cs_reinforce_count_ = 0;
-    }
-
-    // Fan clamp: drop if heat gear 2+
-    if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
-      bool clamp_active = fan_clamp_start_ > 0 && (now - fan_clamp_start_) < FAN_CLAMP_DURATION_MS;
-      if (clamp_active && new_gear >= 2) {
-        fan_clamp_start_ = 0;
-        transmit_mode_command_();
-        mode_resend_at_ = now;
-        ESP_LOGI(TAG, "HEAT clamp dropped — gear %d (re-send in 5s)", new_gear);
-      }
+      if (kickstart_active_()) end_kickstart_(now);
     }
 
     update_action_();
@@ -1126,9 +1104,8 @@ void FurrionChillCube::run_gear_controller_() {
     if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
       heat_gear_ = -1;
       cool_gear_ = -1;
-      fan_clamp_start_ = 0;
-      mode_resend_at_ = 0;
-      cs_reinforce_count_ = 0;
+      clamp_phase_ = ClampPhase::IDLE;
+      quick_kick_active_ = false;
       abort_keepalive_();
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
@@ -1193,6 +1170,9 @@ void FurrionChillCube::run_gear_controller_() {
       }
     }
 
+    // Block -1→1 for cooling (can't cold-start at gear 1)
+    if (gear == -1 && new_gear == 1) new_gear = 2;
+
     // Track idle_since
     if (new_gear == 0 && gear != 0) {
       idle_since_ = now;
@@ -1228,57 +1208,41 @@ void FurrionChillCube::run_gear_controller_() {
     }
 
     // CS + kickstart logic
-    bool cool_kickstart_pending = false;
-    if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
-      // Offset to keep all gear CS values distinct at low setpoints
-      // (gear 0 CS = setpoint-3 would go below 15 when setpoint < 18)
-      int lo = furrion_setpoint_c_ - 3;  // gear 0 = lowest CS
-      int offset = (lo < 15) ? (15 - lo) : 0;
-      int cs;
-      switch (new_gear) {
-        case 5:  cs = furrion_setpoint_c_ + 2 + offset; break;
-        case 4:  cs = furrion_setpoint_c_ + 1 + offset; break;
-        case 3:  cs = furrion_setpoint_c_     + offset; break;
-        case 2:  cs = furrion_setpoint_c_ - 1 + offset; break;
-        case 1:  cs = furrion_setpoint_c_ - 2 + offset; break;
-        default: cs = furrion_setpoint_c_ - 3 + offset; break;
-      }
-      bool needs_fresh_start = (gear == -1 && new_gear >= 1 && new_gear <= 3);
-      bool needs_idle_kick = (gear == 0 && new_gear >= 1 && new_gear <= 2);
-      if (needs_fresh_start) {
+    if (new_gear >= 0) {
+      int cs = compute_gear_cs_(false, new_gear);
+      if (gear == -1 && new_gear == 2) {
+        // OFF→gear 2: clamped kickstart (fan=LOW 5:30, CS=gear4 level)
         last_mode_event_at_ = now;
-        start_fresh_kickstart_(2, cs);
-        cool_kickstart_pending = true;
-      } else if (needs_idle_kick) {
-        start_idle_kickstart_(cs);
-      } else if (current_cs_ != cs) {
+        start_clamped_kickstart_(false, now);
+      } else if (gear == -1 && new_gear == 3) {
+        // OFF→gear 3: quick kickstart (CS=gear4 for 10s, then gear 3)
+        last_mode_event_at_ = now;
+        int kick_cs = std::max(15, std::min(30, furrion_setpoint_c_ + 1));
+        start_quick_kickstart_(false, kick_cs, cs, now);
+      } else if (gear == -1 && new_gear >= 4) {
+        // OFF→gear 4+: direct, no kickstart
+        if (!kickstart_active_() && current_cs_ != cs) {
+          set_cs_value_(cs);
+        }
+      } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
+        // Idle→gear 1-2: quick kickstart (CS=setpoint for 10s)
+        int kick_cs = std::max(15, std::min(30, furrion_setpoint_c_));
+        start_quick_kickstart_(false, kick_cs, cs, now);
+      } else if (!kickstart_active_() && current_cs_ != cs) {
         set_cs_value_(cs);
       }
     }
 
     // HVAC on/off
-    if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !cool_kickstart_pending) {
+    if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !kickstart_active_()) {
       set_active_ir_mode_(climate::CLIMATE_MODE_COOL);
       transmit_mode_command_();
-      transmit_cs_update_(true);  // Ensure CS_DATA sent on cold start (kickstart path handles its own)
+      transmit_cs_update_(true);
     }
     if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
-      fan_clamp_start_ = 0;
-      mode_resend_at_ = 0;
-      cs_reinforce_count_ = 0;
-    }
-
-    // Fan clamp: drop if cool gear 4+
-    if (new_gear >= 0 && kick_phase_ == KickPhase::IDLE) {
-      bool clamp_active = fan_clamp_start_ > 0 && (now - fan_clamp_start_) < FAN_CLAMP_DURATION_MS;
-      if (clamp_active && new_gear >= 4) {
-        fan_clamp_start_ = 0;
-        transmit_mode_command_();
-        mode_resend_at_ = now;
-        ESP_LOGI(TAG, "COOL clamp dropped — gear %d (re-send in 5s)", new_gear);
-      }
+      if (kickstart_active_()) end_kickstart_(now);
     }
 
     update_action_();
@@ -1291,9 +1255,8 @@ void FurrionChillCube::run_gear_controller_() {
     if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
       set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
       transmit_mode_command_();
-      fan_clamp_start_ = 0;
-      mode_resend_at_ = 0;
-      cs_reinforce_count_ = 0;
+      clamp_phase_ = ClampPhase::IDLE;
+      quick_kick_active_ = false;
       abort_keepalive_();
       if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
       ESP_LOGI(TAG, "NEITHER ACTIVE — HVAC OFF");
@@ -1355,8 +1318,11 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   if (debug_last_active_mode_sensor_)
     debug_last_active_mode_sensor_->publish_state((float)last_active_mode_);
 
-  if (debug_kick_phase_sensor_)
-    debug_kick_phase_sensor_->publish_state((float)(uint8_t)kick_phase_);
+  if (debug_kick_phase_sensor_) {
+    float phase = (float)(uint8_t)clamp_phase_;
+    if (quick_kick_active_) phase = 10.0f;  // distinct value for quick kick
+    debug_kick_phase_sensor_->publish_state(phase);
+  }
 
   if (debug_gear_diff_sensor_)
     debug_gear_diff_sensor_->publish_state(isnan(diff) ? NAN : diff);
@@ -1382,9 +1348,9 @@ void FurrionChillCube::publish_debug_state_(float diff) {
 
   if (debug_fan_clamp_remaining_sensor_) {
     float clamp = 0.0f;
-    if (fan_clamp_start_ > 0) {
-      uint32_t elapsed = now - fan_clamp_start_;
-      clamp = (elapsed < FAN_CLAMP_DURATION_MS) ? (float)((FAN_CLAMP_DURATION_MS - elapsed) / 1000) : 0.0f;
+    if (clamp_phase_ == ClampPhase::CLAMPED && clamp_start_ > 0) {
+      uint32_t elapsed = now - clamp_start_;
+      clamp = (elapsed < CLAMP_DURATION_MS) ? (float)((CLAMP_DURATION_MS - elapsed) / 1000) : 0.0f;
     }
     debug_fan_clamp_remaining_sensor_->publish_state(clamp);
   }

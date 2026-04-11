@@ -67,18 +67,21 @@ class FurrionChillCube : public climate::Climate, public Component {
   void run_gear_controller_();
   float get_heat_target_();
   float get_cool_target_();
+  int compute_gear_cs_(bool is_heat, int gear);
 
-  // Kickstart state machine
-  enum class KickPhase : uint8_t {
+  // Kickstart system
+  // Clamped kickstart: OFF→low gear, fan=LOW for 5:30, gear controller runs but CS overridden
+  // Quick kickstart: borderline restart, CS override for 10s, no fan clamp
+  enum class ClampPhase : uint8_t {
     IDLE,
-    FRESH_PRE_CS,       // CS set, waiting 500ms before mode
-    FRESH_MODE_ON,      // Mode sent, waiting 60s
-    IDLE_KICK_CS,       // Idle kickstart CS=25 sent at t=0, waiting 5s
-    IDLE_KICK_CS2,      // CS=25 reinforcement at t=5s, waiting until t=10s
+    PRE_CS,     // 500ms: kickstart CS pre-set before mode-on
+    CLAMPED,    // 5:30: fan=LOW, kickstart CS retransmitted, gear controller monitored
   };
+  void start_clamped_kickstart_(bool is_heat, uint32_t now);
+  void start_quick_kickstart_(bool is_heat, int kickstart_cs, int target_cs, uint32_t now);
   void advance_kickstart_(uint32_t now);
-  void start_fresh_kickstart_(int mode, int target_cs);
-  void start_idle_kickstart_(int target_cs);
+  void end_kickstart_(uint32_t now);
+  bool kickstart_active_() { return clamp_phase_ != ClampPhase::IDLE || quick_kick_active_; }
 
   // Keep-alive pulse (sustain compressor at low CS gears)
   enum class KeepAlivePhase : uint8_t {
@@ -92,7 +95,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void advance_keepalive_(uint32_t now);
   void abort_keepalive_();
 
-  // Fan clamp
+  // Fan mode
   climate::ClimateFanMode get_effective_fan_mode_();
 
   // Dynamic setpoint
@@ -153,16 +156,19 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t last_mode_event_at_{0};  // last mode switch or fresh start (time-based lockout)
   uint32_t ha_disconnect_time_{0};
   uint32_t temp_nan_since_{0};
-  uint32_t fan_clamp_start_{0};
-  uint32_t mode_resend_at_{0};
 
-  // Kickstart
-  KickPhase kick_phase_{KickPhase::IDLE};
-  uint32_t kick_phase_start_{0};
-  int kick_mode_{0};           // 1=heat, 2=cool
-  int kick_target_cs_{22};
-  uint8_t cs_reinforce_count_{0};
-  uint32_t cs_reinforce_at_{0};
+  // Clamped kickstart (OFF→low gear: fan=LOW + CS override for 5:30)
+  ClampPhase clamp_phase_{ClampPhase::IDLE};
+  uint32_t clamp_start_{0};           // when CLAMPED phase began (for 5:30 timeout)
+  uint32_t clamp_phase_start_{0};     // when current phase began (for PRE_CS 500ms)
+  int clamp_kickstart_cs_{0};         // CS to hold during clamp
+  bool clamp_is_heat_{false};         // which mode the clamp is for
+
+  // Quick kickstart (borderline restart: CS override for 10s, no fan clamp)
+  bool quick_kick_active_{false};
+  uint32_t quick_kick_start_{0};
+  int quick_kick_cs_{0};              // kickstart CS to hold for 10s
+  bool quick_kick_is_heat_{false};
 
   // Keep-alive
   KeepAlivePhase keepalive_phase_{KeepAlivePhase::IDLE};

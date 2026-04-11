@@ -103,7 +103,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void update_furrion_setpoint_(bool is_heat);
 
   // Helpers
-  void set_cs_value_(int cs);
+  void set_cs_value_(int cs, uint32_t now);
   void force_mode_switch_off_(const char *label, uint32_t now);
   void update_action_();
   void send_swing_state_();

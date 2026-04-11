@@ -371,11 +371,12 @@ void FurrionChillCube::loop() {
 
   // 2. Run gear controller if triggered (not blocked by kickstart — kickstart suppresses CS writes)
   bool should_run = false;
-  if (temp_dirty_) { should_run = true; temp_dirty_ = false; }
+  if (temp_dirty_) should_run = true;
   if (last_gear_run_ == 0 || (now - last_gear_run_) >= GEAR_INTERVAL_MS) should_run = true;
   if (user_changed_) should_run = true;
 
   if (should_run && keepalive_phase_ == KeepAlivePhase::IDLE) {
+    temp_dirty_ = false;  // only consume when gear controller actually runs
     run_gear_controller_();
     last_gear_run_ = now;
   }
@@ -457,9 +458,10 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
         compatible = (new_mode == climate::CLIMATE_MODE_HEAT || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
       }
       if (!compatible) {
+        uint32_t now = millis();
         ESP_LOGI(TAG, "Kickstart aborted — mode %d incompatible with IR mode %d",
                  (int)new_mode, (int)active_ir_mode_);
-        end_kickstart_(millis());
+        end_kickstart_(now);
         // If switching COOL↔HEAT, trigger 60s cooldown
         if ((active_ir_mode_ == climate::CLIMATE_MODE_COOL &&
              (new_mode == climate::CLIMATE_MODE_HEAT)) ||
@@ -467,8 +469,8 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
              (new_mode == climate::CLIMATE_MODE_COOL))) {
           set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
           transmit_mode_command_();
-          mode_switch_off_at_ = millis();
-          last_mode_event_at_ = millis();
+          mode_switch_off_at_ = now;
+          last_mode_event_at_ = now;
         }
       }
     }
@@ -584,7 +586,8 @@ int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
     }
   } else {
     int lo = furrion_setpoint_c_ - 3;  // gear 0 = lowest cool CS
-    int offset = (lo < 15) ? (15 - lo) : 0;
+    int hi = furrion_setpoint_c_ + 2;  // gear 5 = highest cool CS
+    int offset = (lo < 15) ? (15 - lo) : (hi > 30) ? (30 - hi) : 0;
     switch (gear) {
       case 5:  return furrion_setpoint_c_ + 2 + offset;
       case 4:  return furrion_setpoint_c_ + 1 + offset;
@@ -596,12 +599,12 @@ int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
   }
 }
 
-void FurrionChillCube::set_cs_value_(int cs) {
+void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
   cs = std::max(15, std::min(30, cs));
   current_cs_ = cs;
   if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     transmit_cs_update_(true);
-    last_cs_heartbeat_ = millis();
+    last_cs_heartbeat_ = now;
   }
   if (cs_value_sensor_) cs_value_sensor_->publish_state(cs);
 }
@@ -656,8 +659,8 @@ void FurrionChillCube::send_swing_state_() {
 
 void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
   clamp_is_heat_ = is_heat;
-  // Kickstart CS: heat=gear2 (setpoint), cool=gear4 (setpoint+1)
-  clamp_kickstart_cs_ = is_heat ? furrion_setpoint_c_ : (furrion_setpoint_c_ + 1);
+  // Kickstart CS: heat=gear2 CS, cool=gear4 CS (includes boundary offset)
+  clamp_kickstart_cs_ = compute_gear_cs_(is_heat, is_heat ? 2 : 4);
   clamp_kickstart_cs_ = std::max(15, std::min(30, clamp_kickstart_cs_));
 
   // PRE_CS: set kickstart CS before mode-on (500ms lead)
@@ -758,7 +761,7 @@ void FurrionChillCube::end_kickstart_(uint32_t now) {
   int gear = is_heat ? heat_gear_ : cool_gear_;
   if (gear >= 0) {
     int cs = compute_gear_cs_(is_heat, gear);
-    set_cs_value_(cs);
+    set_cs_value_(cs, now);
   }
 
   // If we were clamped (fan=LOW), re-send mode with fan=AUTO
@@ -784,7 +787,7 @@ void FurrionChillCube::start_keepalive_(bool is_heat, uint32_t now) {
     ESP_LOGD(TAG, "Keep-alive: skipped (boundary setpoint, no CS swing)");
     return;
   }
-  set_cs_value_(anchor);  // Step 1: setpoint CS
+  set_cs_value_(anchor, now);  // Step 1: setpoint CS
   keepalive_phase_ = KeepAlivePhase::STEP1;
   keepalive_phase_start_ = now;
   ESP_LOGI(TAG, "Keep-alive: start %s pulse, anchor=%d step2=%d restore=%d",
@@ -797,7 +800,7 @@ void FurrionChillCube::advance_keepalive_(uint32_t now) {
   switch (keepalive_phase_) {
     case KeepAlivePhase::STEP1:
       if (elapsed >= KEEPALIVE_STEP_MS) {
-        set_cs_value_(keepalive_step2_cs_);  // Step 2: over-anchor (heat=19, cool=26)
+        set_cs_value_(keepalive_step2_cs_, now);  // Step 2: over-anchor (heat=19, cool=26)
         keepalive_phase_ = KeepAlivePhase::STEP2;
         keepalive_phase_start_ = now;
         ESP_LOGI(TAG, "Keep-alive: cs=%d", keepalive_step2_cs_);
@@ -806,7 +809,7 @@ void FurrionChillCube::advance_keepalive_(uint32_t now) {
 
     case KeepAlivePhase::STEP2:
       if (elapsed >= KEEPALIVE_STEP_MS) {
-        set_cs_value_(keepalive_restore_cs_);  // Step 3: restore (1/2)
+        set_cs_value_(keepalive_restore_cs_, now);  // Step 3: restore (1/2)
         keepalive_phase_ = KeepAlivePhase::STEP_RESTORE1;
         keepalive_phase_start_ = now;
         ESP_LOGI(TAG, "Keep-alive: restore cs=%d (1/2)", keepalive_restore_cs_);
@@ -815,7 +818,7 @@ void FurrionChillCube::advance_keepalive_(uint32_t now) {
 
     case KeepAlivePhase::STEP_RESTORE1:
       if (elapsed >= KEEPALIVE_STEP_MS) {
-        set_cs_value_(keepalive_restore_cs_);  // Step 4: restore (2/2) — done
+        set_cs_value_(keepalive_restore_cs_, now);  // Step 4: restore (2/2) — done
         keepalive_phase_ = KeepAlivePhase::IDLE;
         keepalive_last_ = now;
         ESP_LOGI(TAG, "Keep-alive: restore cs=%d (2/2), done", keepalive_restore_cs_);
@@ -1089,11 +1092,12 @@ void FurrionChillCube::run_gear_controller_() {
         start_clamped_kickstart_(true, now);
       } else if (gear == -1 && new_gear >= 2) {
         // OFF→gear 2+: direct start, no kickstart needed
+        last_mode_event_at_ = now;
         if (!kickstart_active_() && current_cs_ != cs) {
-          set_cs_value_(cs);
+          set_cs_value_(cs, now);
         }
       } else if (!kickstart_active_() && current_cs_ != cs) {
-        set_cs_value_(cs);
+        set_cs_value_(cs, now);
       }
     }
 
@@ -1215,19 +1219,20 @@ void FurrionChillCube::run_gear_controller_() {
       } else if (gear == -1 && new_gear == 3) {
         // OFF→gear 3: quick kickstart (CS=gear4 for 10s, then gear 3)
         last_mode_event_at_ = now;
-        int kick_cs = std::max(15, std::min(30, furrion_setpoint_c_ + 1));
+        int kick_cs = compute_gear_cs_(false, 4);  // gear 4 CS (includes boundary offset)
         start_quick_kickstart_(false, kick_cs, now);
       } else if (gear == -1 && new_gear >= 4) {
         // OFF→gear 4+: direct, no kickstart
+        last_mode_event_at_ = now;
         if (!kickstart_active_() && current_cs_ != cs) {
-          set_cs_value_(cs);
+          set_cs_value_(cs, now);
         }
       } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
         // Idle→gear 1-2: quick kickstart (CS=setpoint for 10s)
         int kick_cs = std::max(15, std::min(30, furrion_setpoint_c_));
         start_quick_kickstart_(false, kick_cs, now);
       } else if (!kickstart_active_() && current_cs_ != cs) {
-        set_cs_value_(cs);
+        set_cs_value_(cs, now);
       }
     }
 
@@ -1262,7 +1267,7 @@ void FurrionChillCube::run_gear_controller_() {
 
     // Enforce neutral CS (at setpoint — unit is OFF so doesn't matter much)
     if (current_cs_ != furrion_setpoint_c_) {
-      set_cs_value_(furrion_setpoint_c_);
+      set_cs_value_(furrion_setpoint_c_, now);
     }
 
     // Force gears to -1

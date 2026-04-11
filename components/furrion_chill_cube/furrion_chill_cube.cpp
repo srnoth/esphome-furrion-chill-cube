@@ -637,6 +637,7 @@ void FurrionChillCube::start_fresh_kickstart_(int mode, int target_cs) {
   // Step 1: Set kickstart CS BEFORE mode change
   // Heat restart = setpoint (at anchor), Cool restart = setpoint + 1 (above anchor)
   int restart_cs = (mode == 1) ? furrion_setpoint_c_ : (furrion_setpoint_c_ + 1);
+  restart_cs = std::max(15, std::min(30, restart_cs));
   current_cs_ = restart_cs;
   if (boot_ready_ && !failsafe_active_) {
     transmit_cs_update_(true);
@@ -654,17 +655,18 @@ void FurrionChillCube::start_idle_kickstart_(int target_cs) {
   kick_target_cs_ = target_cs;
   kick_mode_ = 2;  // cool only
 
-  current_cs_ = furrion_setpoint_c_;  // cool idle restart threshold (at anchor)
+  int restart_cs = std::max(15, std::min(30, furrion_setpoint_c_));
+  current_cs_ = restart_cs;  // cool idle restart threshold (at anchor)
   if (boot_ready_ && !failsafe_active_) {
     transmit_cs_update_(true);
     last_cs_heartbeat_ = millis();
   }
-  if (cs_value_sensor_) cs_value_sensor_->publish_state(furrion_setpoint_c_);
+  if (cs_value_sensor_) cs_value_sensor_->publish_state(restart_cs);
 
   kick_phase_ = KickPhase::IDLE_KICK_CS;
   kick_phase_start_ = millis();
   mode_resend_at_ = 0;
-  ESP_LOGI(TAG, "Idle kickstart: cs=%d target_cs=%d", furrion_setpoint_c_, target_cs);
+  ESP_LOGI(TAG, "Idle kickstart: cs=%d target_cs=%d", restart_cs, target_cs);
 }
 
 void FurrionChillCube::advance_kickstart_(uint32_t now) {
@@ -729,7 +731,14 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
 void FurrionChillCube::start_keepalive_(bool is_heat, uint32_t now) {
   keepalive_restore_cs_ = current_cs_;
   int anchor = furrion_setpoint_c_;
-  keepalive_step2_cs_ = is_heat ? (anchor - 1) : (anchor + 1);
+  int step2_raw = is_heat ? (anchor - 1) : (anchor + 1);
+  keepalive_step2_cs_ = std::max(15, std::min(30, step2_raw));
+  // At boundary setpoints (cool@30, heat@16), step2 clamps to anchor — no swing possible
+  if (keepalive_step2_cs_ == anchor) {
+    keepalive_last_ = now;  // reset timer without pulsing
+    ESP_LOGD(TAG, "Keep-alive: skipped (boundary setpoint, no CS swing)");
+    return;
+  }
   set_cs_value_(anchor);  // Step 1: setpoint CS
   keepalive_phase_ = KeepAlivePhase::STEP1;
   keepalive_phase_start_ = now;

@@ -457,10 +457,17 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     // Abort kickstart only if new mode is incompatible with the active IR mode.
     // Clear state directly (don't call end_kickstart_ which would re-send old mode).
     if (kickstart_active_()) {
+      // Determine the kickstart's intended mode (active_ir_mode_ may still be OFF during PRE_CS)
+      bool kick_is_cool = (active_ir_mode_ == climate::CLIMATE_MODE_COOL) ||
+                          (clamp_phase_ != ClampPhase::IDLE && !clamp_is_heat_) ||
+                          (quick_kick_active_ && !quick_kick_is_heat_);
+      bool kick_is_heat = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ||
+                          (clamp_phase_ != ClampPhase::IDLE && clamp_is_heat_) ||
+                          (quick_kick_active_ && quick_kick_is_heat_);
       bool compatible = false;
-      if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
+      if (kick_is_cool) {
         compatible = (new_mode == climate::CLIMATE_MODE_COOL || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
-      } else if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
+      } else if (kick_is_heat) {
         compatible = (new_mode == climate::CLIMATE_MODE_HEAT || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
       }
       if (!compatible) {
@@ -778,8 +785,6 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
 }
 
 void FurrionChillCube::end_kickstart_(uint32_t now) {
-  bool was_clamped = (clamp_phase_ == ClampPhase::CLAMPED);
-
   // Determine heat/cool BEFORE clearing state (active_ir_mode_ may be OFF during PRE_CS)
   bool is_heat = (clamp_phase_ != ClampPhase::IDLE) ? clamp_is_heat_ :
                  quick_kick_active_ ? quick_kick_is_heat_ :
@@ -923,6 +928,7 @@ void FurrionChillCube::run_gear_controller_() {
     idle_since_ = 0;
     last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
+    heater_locked_out_ = false;
     clamp_phase_ = ClampPhase::IDLE;
     quick_kick_active_ = false;
     abort_keepalive_();
@@ -991,6 +997,10 @@ void FurrionChillCube::run_gear_controller_() {
       heater_locked_out_ = false;
       ESP_LOGI(TAG, "Outside %.1f°C >= lockout — heating re-enabled", outside_temp_c_);
     }
+  } else if (heater_locked_out_) {
+    // Outside sensor unavailable — fail-open to allow heating
+    heater_locked_out_ = false;
+    ESP_LOGW(TAG, "Outside temp unavailable — heating lockout cleared (fail-open)");
   }
 
   // Determine active modes from user's climate mode

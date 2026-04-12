@@ -322,10 +322,14 @@ void FurrionChillCube::setup() {
     if (saved_mode == 1) {
       heat_gear_ = 0;
       last_active_mode_ = MODE_HEAT;
+      boot_ready_ = true;          // restored state is valid — skip imm_off
+      idle_since_ = millis();       // 10-min lockout before mode switch allowed
       ESP_LOGI(TAG, "Restored prior mode: HEAT (gear → idle, skip kickstart)");
     } else if (saved_mode == 2) {
       cool_gear_ = 0;
       last_active_mode_ = MODE_COOL;
+      boot_ready_ = true;          // restored state is valid — skip imm_off
+      idle_since_ = millis();       // 10-min lockout before mode switch allowed
       ESP_LOGI(TAG, "Restored prior mode: COOL (gear → idle, skip kickstart)");
     }
   }

@@ -32,6 +32,24 @@ CONF_INSIDE_TEMPERATURE_IS_FAHRENHEIT = "inside_temperature_is_fahrenheit"
 CONF_OUTSIDE_TEMPERATURE = "outside_temperature"
 CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT = "outside_temperature_is_fahrenheit"
 CONF_OUTSIDE_LOCKOUT_TEMP = "outside_lockout_temp"
+CONF_MODE_SWITCH_IDLE_MIN = "mode_switch_idle_min"
+CONF_MODE_SWITCH_EVENT_MIN = "mode_switch_event_min"
+CONF_MODE_SWITCH_TEMP_OFFSET = "mode_switch_temp_offset"
+CONF_MODE_SWITCH_OFF_MIN = "mode_switch_off_min"
+
+
+def validate_mode_switch_temp_offset(value):
+    """Parse '1F', '0.56C', or bare number (= Celsius). Returns float in °C."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().upper()
+    if s.endswith("F"):
+        num = float(s[:-1].strip())
+        return num * (5.0 / 9.0)  # °F delta → °C delta
+    elif s.endswith("C"):
+        return float(s[:-1].strip())
+    else:
+        return float(s)
 CONF_HEAT_GEAR = "heat_gear"
 CONF_COOL_GEAR = "cool_gear"
 CONF_COMPRESSOR_OUTPUT = "compressor_output"
@@ -131,6 +149,15 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_OUTSIDE_LOCKOUT_TEMP, default=35.0): cv.float_range(
                 min=-40.0, max=120.0
             ),
+            # Mode switch tunables (all optional with sensible defaults)
+            # Minutes the compressor must be at idle (gear 0) before allowing mode switch
+            cv.Optional(CONF_MODE_SWITCH_IDLE_MIN, default=10): cv.int_range(min=1, max=60),
+            # Minutes since last fresh start before another mode change is allowed
+            cv.Optional(CONF_MODE_SWITCH_EVENT_MIN, default=20): cv.int_range(min=1, max=120),
+            # Room must be this far past the setpoint before 0→-1. Accepts "1F", "0.56C", or bare = °C
+            cv.Optional(CONF_MODE_SWITCH_TEMP_OFFSET, default="1F"): validate_mode_switch_temp_offset,
+            # Minimum minutes at -1 before re-engagement (hardware wind-down, no bypass)
+            cv.Optional(CONF_MODE_SWITCH_OFF_MIN, default=1): cv.int_range(min=1, max=10),
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -214,6 +241,10 @@ async def to_code(config):
 
     # Configuration values (in Fahrenheit, converted to Celsius internally)
     cg.add(var.set_outside_lockout_temp(config[CONF_OUTSIDE_LOCKOUT_TEMP]))
+    cg.add(var.set_mode_switch_idle_min(config[CONF_MODE_SWITCH_IDLE_MIN]))
+    cg.add(var.set_mode_switch_event_min(config[CONF_MODE_SWITCH_EVENT_MIN]))
+    cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
+    cg.add(var.set_mode_switch_off_min(config[CONF_MODE_SWITCH_OFF_MIN]))
 
     # Diagnostic sensors
     for key, setter in [

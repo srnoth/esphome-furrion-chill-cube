@@ -25,6 +25,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_outside_temperature_sensor(sensor::Sensor *s) { outside_temp_sensor_ = s; }
   void set_outside_temperature_fahrenheit(bool f) { outside_temp_fahrenheit_ = f; }
   void set_outside_lockout_temp(float temp_f);
+  void set_mode_switch_idle_min(int min);
+  void set_mode_switch_event_min(int min);
+  void set_mode_switch_temp_offset(float offset_c);
+  void set_mode_switch_off_min(int min);
 
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
@@ -104,7 +108,6 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Helpers
   void set_cs_value_(int cs, uint32_t now);
-  void force_mode_switch_off_(const char *label, uint32_t now);
   void update_action_();
   void send_swing_state_();
   void set_active_ir_mode_(climate::ClimateMode mode);
@@ -155,7 +158,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t idle_since_{0};
   uint32_t last_cs_heartbeat_{0};
   uint32_t last_gear_run_{0};
-  uint32_t mode_switch_off_at_{0};
+  uint32_t off_since_{0};               // timestamp when gear transitioned to -1 (for 1-min off lockout)
+
+  // Mode switch tunables (configurable via YAML; defaults = 10min/20min/1°F/1min)
+  uint32_t mode_switch_idle_ms_{600000};    // 10 min at gear 0 before mode switch allowed
+  uint32_t mode_switch_event_ms_{1200000};  // 20 min since last fresh start
+  float mode_switch_temp_offset_c_{0.556f}; // room must be this far past setpoint (°C delta)
+  uint32_t mode_switch_off_ms_{60000};      // 1 min minimum in -1 before fresh start
   uint32_t last_mode_event_at_{0};  // last mode switch or fresh start (time-based lockout)
   uint32_t ha_disconnect_time_{0};
   uint32_t temp_nan_since_{0};

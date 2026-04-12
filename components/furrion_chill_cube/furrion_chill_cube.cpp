@@ -41,14 +41,12 @@ static const int FURRION_MAX_TEMP_C = 30;
 // kept for direct array indexing by gear number without offset.
 //                        0      1       2       3        4        5
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
-static const uint32_t IDLE_BEFORE_OFF_MS = 900000;  // 15 min
 static const uint32_t CLAMP_DURATION_MS = 330000;  // 5 min 30s
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
 static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
 static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
-static const uint32_t MODE_SWITCH_IDLE_MS = 600000;   // 10 min idle before mode switch allowed
-static const uint32_t MODE_SWITCH_EVENT_MS = 1200000;  // 20 min lockout after mode switch or fresh start
+// Mode switch lockouts are now configurable member variables (mode_switch_*_ms_, mode_switch_temp_offset_c_)
 
 // Heating deadbands (diff = room - target, negative = cold)
 static const float H_UP_01 = -0.3f;   // 0->1: room 0.5F below target
@@ -72,7 +70,8 @@ static const float C_DN_21 =  0.0f;
 static const float C_DN_10 = -0.15f;
 static const float C_IDLE  = -0.15f;
 
-// Mode-switching protection is time-based (MODE_SWITCH_IDLE_MS / MODE_SWITCH_EVENT_MS)
+// Mode-switching protection lives in the 0→-1 gate and -1→active gate
+// (see mode_switch_idle_ms_, mode_switch_event_ms_, mode_switch_temp_offset_c_, mode_switch_off_ms_)
 
 // ============================================================
 // Configuration Setters
@@ -81,6 +80,20 @@ static const float C_IDLE  = -0.15f;
 void FurrionChillCube::set_outside_lockout_temp(float temp_f) {
   // Convert Fahrenheit to Celsius
   outside_lockout_temp_c_ = (temp_f - 32.0f) * (5.0f / 9.0f);
+}
+
+void FurrionChillCube::set_mode_switch_idle_min(int min) {
+  mode_switch_idle_ms_ = (uint32_t)min * 60000;
+}
+void FurrionChillCube::set_mode_switch_event_min(int min) {
+  mode_switch_event_ms_ = (uint32_t)min * 60000;
+}
+void FurrionChillCube::set_mode_switch_temp_offset(float offset_c) {
+  // Value already converted to °C at config time (Python validator handles F/C suffix)
+  mode_switch_temp_offset_c_ = offset_c;
+}
+void FurrionChillCube::set_mode_switch_off_min(int min) {
+  mode_switch_off_ms_ = (uint32_t)min * 60000;
 }
 
 // ============================================================
@@ -478,27 +491,16 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
         uint32_t now = millis();
         ESP_LOGI(TAG, "Kickstart aborted — mode %d incompatible with IR mode %d",
                  (int)new_mode, (int)active_ir_mode_);
-        // Clear kickstart state directly (no end_kickstart_ — avoids spurious
-        // old-mode IR retransmit; gear controller handles CS/mode on next loop)
+        // Clear kickstart state, force to OFF. All mode changes (including
+        // COOL↔HEAT and to OFF) now go through -1 with 1-min off_since_ lockout.
         clamp_phase_ = ClampPhase::IDLE;
         quick_kick_active_ = false;
         heat_gear_ = -1;
         cool_gear_ = -1;
-        idle_since_ = 0;
+        off_since_ = now;  // start 1-min off lockout
         if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
         if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
-        // If switching COOL↔HEAT, trigger 60s cooldown
-        if ((active_ir_mode_ == climate::CLIMATE_MODE_COOL &&
-             (new_mode == climate::CLIMATE_MODE_HEAT)) ||
-            (active_ir_mode_ == climate::CLIMATE_MODE_HEAT &&
-             (new_mode == climate::CLIMATE_MODE_COOL))) {
-          set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-          transmit_mode_command_();
-          mode_switch_off_at_ = now;
-          last_mode_event_at_ = now;
-        }
-        // If switching to OFF, send immediately (don't wait for next loop)
-        if (new_mode == climate::CLIMATE_MODE_OFF) {
+        if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
           set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
           transmit_mode_command_();
         }
@@ -643,25 +645,6 @@ void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
   if (cs_value_sensor_) cs_value_sensor_->publish_state(cs);
 }
 
-void FurrionChillCube::force_mode_switch_off_(const char *label, uint32_t now) {
-  heat_gear_ = -1;
-  cool_gear_ = -1;
-  idle_since_ = 0;
-  clamp_phase_ = ClampPhase::IDLE;
-  quick_kick_active_ = false;
-  abort_keepalive_();
-  if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
-  if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
-  if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-  set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-  transmit_mode_command_();
-  mode_switch_off_at_ = now;
-  last_mode_event_at_ = now;
-  ESP_LOGI(TAG, "MODE SWITCH %s — OFF for 60s", label);
-  update_action_();
-  publish_debug_state_(NAN);
-}
-
 void FurrionChillCube::update_action_() {
   climate::ClimateAction action;
   if (this->mode == climate::CLIMATE_MODE_OFF) {
@@ -743,14 +726,16 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
   // === Clamped kickstart state machine ===
   if (clamp_phase_ == ClampPhase::PRE_CS) {
     if ((now - clamp_phase_start_) >= 500) {
-      // Mode ON + fan=LOW, then send CS with CS_DATA (PRE_CS transmit was
-      // swallowed because active_ir_mode_ was still OFF at that point)
+      // Mode ON + fan=LOW, then send CS with CS_DATA.
+      // NOTE: clamp_phase_ MUST be set to CLAMPED BEFORE transmit_mode_command_()
+      // so get_effective_fan_mode_() returns LOW when building the IR frame.
+      // (Previous ordering transmitted with fan=AUTO, defeating the clamp entirely.)
       set_active_ir_mode_(clamp_is_heat_ ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
+      clamp_phase_ = ClampPhase::CLAMPED;
+      clamp_start_ = now;
       transmit_mode_command_();
       transmit_cs_update_(true);
       last_cs_heartbeat_ = now;
-      clamp_phase_ = ClampPhase::CLAMPED;
-      clamp_start_ = now;
       ESP_LOGI(TAG, "Clamped kickstart: MODE ON + fan=LOW, clamp=5:30");
     }
   } else if (clamp_phase_ == ClampPhase::CLAMPED) {
@@ -932,6 +917,7 @@ void FurrionChillCube::run_gear_controller_() {
     idle_since_ = 0;
     last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
+    off_since_ = 0;
     heater_locked_out_ = false;
     clamp_phase_ = ClampPhase::IDLE;
     quick_kick_active_ = false;
@@ -967,16 +953,8 @@ void FurrionChillCube::run_gear_controller_() {
     idle_since_ = now;
   }
 
-  // === Mode switch guard: 60s OFF between heat↔cool ===
-  if (mode_switch_off_at_ > 0) {
-    if ((now - mode_switch_off_at_) < 60000) {
-      ESP_LOGD(TAG, "Mode switch cooldown — %lus remaining",
-               (60000 - (now - mode_switch_off_at_)) / 1000);
-      publish_debug_state_(NAN);
-      return;
-    }
-    mode_switch_off_at_ = 0;
-  }
+  // Mode switch guard removed: all mode changes now go through -1 (off state)
+  // with the 1-min off_since_ lockout enforced in the fresh-start path.
 
   bool user_input = user_changed_;
   if (user_input) user_changed_ = false;
@@ -988,8 +966,7 @@ void FurrionChillCube::run_gear_controller_() {
     return user_input || (time_in_gear >= HOLD_MS[target_gear]);
   };
 
-  bool idle_long_enough = (idle_since_ > 0) &&
-                          (now - idle_since_ >= IDLE_BEFORE_OFF_MS);
+  // idle_long_enough is computed per-gear (0→-1 gate uses mode_switch_idle_ms_)
 
   // Outside temperature lockout for heating
   if (!isnan(outside_temp_c_)) {
@@ -1024,33 +1001,22 @@ void FurrionChillCube::run_gear_controller_() {
     if (!isnan(h_target) && !isnan(c_target) && h_target > c_target) {
       float tmp = h_target; h_target = c_target; c_target = tmp;
     }
-    ActiveMode last_mode = last_active_mode_;
 
-    // Time-based mode switch lockout (replaces temperature-based MODE_SWITCH_EXTRA)
-    bool mode_switch_allowed = user_input;  // user override cancels all lockouts
-    if (!mode_switch_allowed && last_mode != MODE_NONE) {
-      bool idle_enough = idle_since_ > 0 && (now - idle_since_) >= MODE_SWITCH_IDLE_MS;
-      bool no_recent_event = last_mode_event_at_ == 0 || (now - last_mode_event_at_) >= MODE_SWITCH_EVENT_MS;
-      mode_switch_allowed = idle_enough && no_recent_event;
-    }
-
-    if (!mode_switch_allowed && last_mode == MODE_HEAT) {
-      do_cool = false;    // locked: stay in heat path
-    } else if (!mode_switch_allowed && last_mode == MODE_COOL) {
-      do_heat = false;    // locked: stay in cool path
-    } else if (room <= h_target) {
-      do_cool = false;
-    } else if (room >= c_target) {
-      do_heat = false;
+    // Mode change protection now lives in the 0→-1 gate (idle/event/temp lockouts)
+    // and -1→active gate (1-min off lockout). Here we just pick the active mode
+    // based on current gear state and temperature.
+    if (heat_gear_ >= 0) {
+      do_cool = false;  // heat already engaged — stay in heat
+    } else if (cool_gear_ >= 0) {
+      do_heat = false;  // cool already engaged — stay in cool
     } else {
-      // Deadband — keep whichever was last active
-      if (heat_gear_ >= 0) { do_cool = false; }
-      else if (cool_gear_ >= 0) { do_heat = false; }
+      // Both gears -1 (fully off). Pick based on temperature.
+      if (room <= h_target) { do_cool = false; }
+      else if (room >= c_target) { do_heat = false; }
       else {
-        float h_dist = h_target - room;
-        float c_dist = room - c_target;
-        if (h_dist >= c_dist) { do_cool = false; }
-        else { do_heat = false; }
+        // Room in deadband — neither mode should engage. Stay off.
+        do_heat = false;
+        do_cool = false;
       }
     }
   }
@@ -1059,11 +1025,9 @@ void FurrionChillCube::run_gear_controller_() {
   // HEATING
   // ==========================
   if (do_heat) {
-    // Mode switch: if HVAC is actively in cool mode, force 60s OFF first
-    if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
-      force_mode_switch_off_("cool→heat", now);
-      return;
-    }
+    // No more direct cool→heat switch. If cool is active, the gear controller
+    // would have computed do_cool (not do_heat) because cool_gear_ >= 0 above.
+    // Reaching here with active_ir_mode_ == COOL would be an inconsistent state.
     if (cool_gear_ != -1) {
       cool_gear_ = -1;
       if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
@@ -1077,18 +1041,32 @@ void FurrionChillCube::run_gear_controller_() {
     int new_gear = gear;
 
     if (gear == -1 || user_input) {
-      // Fresh start or user change: jump directly to appropriate gear
-      // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
-      if (diff < H_UP_23)         new_gear = 3;
-      else if (diff < H_UP_12)    new_gear = 2;
-      else if (diff < H_UP_01)    new_gear = 1;
-      else                        new_gear = (gear == -1) ? -1 : 0;
+      // Fresh start from -1 requires 1-min off lockout (hardware wind-down).
+      // No bypass — applies even to user_input.
+      bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
+      if (gear == -1 && !off_long_enough) {
+        new_gear = -1;  // still in 1-min wind-down period
+      } else {
+        // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
+        if (diff < H_UP_23)         new_gear = 3;
+        else if (diff < H_UP_12)    new_gear = 2;
+        else if (diff < H_UP_01)    new_gear = 1;
+        else if (gear == -1)        new_gear = -1;  // stays off
+        // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
+        else if (user_input && diff > H_IDLE) new_gear = -1;
+        else                        new_gear = 0;
+      }
     } else {
       switch (gear) {
         case 0: {
           if (can_upshift_to(1) && diff < H_UP_01) new_gear = 1;
+          // 0→-1 gate (natural path only — user_input handled in fresh-start above)
           bool imm_off = !boot_ready_;
-          if ((imm_off || idle_long_enough) && diff > H_IDLE) new_gear = -1;
+          bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
+          bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
+          bool past_setpoint = diff > mode_switch_temp_offset_c_;
+          bool natural_off = idle_enough && event_ok && past_setpoint;
+          if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
           break;
         }
         case 1:
@@ -1110,6 +1088,11 @@ void FurrionChillCube::run_gear_controller_() {
       idle_since_ = now;
     } else if (new_gear != 0) {
       idle_since_ = 0;
+    }
+
+    // Track off_since_ for the 1-min off lockout
+    if (new_gear == -1 && gear != -1) {
+      off_since_ = now;
     }
 
     // Publish gear and compressor on change
@@ -1173,11 +1156,8 @@ void FurrionChillCube::run_gear_controller_() {
   // COOLING
   // ==========================
   } else if (do_cool) {
-    // Mode switch: if HVAC is actively in heat mode, force 60s OFF first
-    if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
-      force_mode_switch_off_("heat→cool", now);
-      return;
-    }
+    // No more direct heat→cool switch. Reaching here with active_ir_mode_ == HEAT
+    // would be an inconsistent state (heat_gear_ should have been -1 first).
     if (heat_gear_ != -1) {
       heat_gear_ = -1;
       if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
@@ -1191,20 +1171,34 @@ void FurrionChillCube::run_gear_controller_() {
     int new_gear = gear;
 
     if (gear == -1 || user_input) {
-      // Fresh start or user change: jump directly to appropriate gear
-      // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
-      // and never gear 0 (only reachable by downshift from 1)
-      if (diff > C_UP_45)         new_gear = 5;
-      else if (diff > C_UP_34)    new_gear = 4;
-      else if (diff > C_UP_23)    new_gear = 3;
-      else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;
-      else                        new_gear = (gear == -1) ? -1 : 0;
+      // Fresh start from -1 requires 1-min off lockout (hardware wind-down).
+      // No bypass — applies even to user_input.
+      bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
+      if (gear == -1 && !off_long_enough) {
+        new_gear = -1;  // still in 1-min wind-down period
+      } else {
+        // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
+        // and never gear 0 (only reachable by downshift from 1)
+        if (diff > C_UP_45)         new_gear = 5;
+        else if (diff > C_UP_34)    new_gear = 4;
+        else if (diff > C_UP_23)    new_gear = 3;
+        else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;
+        else if (gear == -1)        new_gear = -1;  // stays off
+        // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
+        else if (user_input && diff < C_IDLE) new_gear = -1;
+        else                        new_gear = 0;
+      }
     } else {
       switch (gear) {
         case 0: {
           if (can_upshift_to(1) && diff > C_UP_01) new_gear = 1;
+          // 0→-1 gate (natural path only — user_input handled in fresh-start above)
           bool imm_off = !boot_ready_;
-          if ((imm_off || idle_long_enough) && diff < C_IDLE) new_gear = -1;
+          bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
+          bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
+          bool past_setpoint = diff < -mode_switch_temp_offset_c_;
+          bool natural_off = idle_enough && event_ok && past_setpoint;
+          if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
           break;
         }
         case 1:
@@ -1234,6 +1228,11 @@ void FurrionChillCube::run_gear_controller_() {
       idle_since_ = now;
     } else if (new_gear != 0) {
       idle_since_ = 0;
+    }
+
+    // Track off_since_ for the 1-min off lockout
+    if (new_gear == -1 && gear != -1) {
+      off_since_ = now;
     }
 
     // Publish gear and compressor on change
@@ -1392,10 +1391,11 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   float idle = (idle_since_ == 0) ? -1.0f : (float)((now - idle_since_) / 1000);
   pub(debug_idle_duration_sensor_, idle);
 
+  // Debug "mode_switch_cooldown" sensor now reflects off_since_ 1-min lockout
   float cd = 0.0f;
-  if (mode_switch_off_at_ > 0) {
-    uint32_t elapsed = now - mode_switch_off_at_;
-    cd = (elapsed < 60000) ? (float)((60000 - elapsed) / 1000) : 0.0f;
+  if (off_since_ > 0) {
+    uint32_t elapsed = now - off_since_;
+    cd = (elapsed < mode_switch_off_ms_) ? (float)((mode_switch_off_ms_ - elapsed) / 1000) : 0.0f;
   }
   pub(debug_mode_switch_cooldown_sensor_, cd);
 

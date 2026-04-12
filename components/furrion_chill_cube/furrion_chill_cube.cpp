@@ -334,12 +334,17 @@ void FurrionChillCube::setup() {
   if (mode_pref_.load(&saved_mode)) {
     if (saved_mode == 1) {
       heat_gear_ = 0;
+      // Also restore active_ir_mode_ to match the gear state — otherwise
+      // first controller run sees gear≥0 with active_ir_mode_=OFF and sends
+      // a spurious MODE_ON IR command, waking the Furrion from idle.
+      active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
       last_active_mode_ = MODE_HEAT;
       boot_ready_ = true;          // restored state is valid — skip imm_off
       idle_since_ = millis();       // 10-min lockout before mode switch allowed
       ESP_LOGI(TAG, "Restored prior mode: HEAT (gear → idle, skip kickstart)");
     } else if (saved_mode == 2) {
       cool_gear_ = 0;
+      active_ir_mode_ = climate::CLIMATE_MODE_COOL;
       last_active_mode_ = MODE_COOL;
       boot_ready_ = true;          // restored state is valid — skip imm_off
       idle_since_ = millis();       // 10-min lockout before mode switch allowed
@@ -925,6 +930,14 @@ void FurrionChillCube::run_gear_controller_() {
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
+    // Sync active_ir_mode_ (and mode_pref_) to OFF to match gear state.
+    // No IR is transmitted — set_active_ir_mode_() only updates state + saves flash.
+    // Without this, mode_pref_ stays at HEAT/COOL and a reboot during failsafe
+    // causes setup() to restore gear=0, producing a spurious MODE_ON IR command
+    // on the next controller run (6A compressor spike).
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+    }
     // Stop all IR transmission — failsafe_active_ gates CS heartbeat.
     // Unit's setpoint is already near the desired target (dynamic setpoint).
     // After ~7 min with no CS, unit reverts to its own internal sensor.

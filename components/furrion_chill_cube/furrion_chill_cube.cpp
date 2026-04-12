@@ -449,6 +449,11 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 
     this->mode = new_mode;
 
+    // Abort keepalive immediately so gear controller can respond on next loop
+    if (keepalive_phase_ != KeepAlivePhase::IDLE) {
+      abort_keepalive_();
+    }
+
     // Abort kickstart only if new mode is incompatible with the active IR mode.
     if (kickstart_active_()) {
       bool compatible = false;
@@ -462,6 +467,11 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
         ESP_LOGI(TAG, "Kickstart aborted — mode %d incompatible with IR mode %d",
                  (int)new_mode, (int)active_ir_mode_);
         end_kickstart_(now);
+        // Reset gears to prevent stale values if user switches back
+        heat_gear_ = -1;
+        cool_gear_ = -1;
+        if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+        if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
         // If switching COOL↔HEAT, trigger 60s cooldown
         if ((active_ir_mode_ == climate::CLIMATE_MODE_COOL &&
              (new_mode == climate::CLIMATE_MODE_HEAT)) ||
@@ -704,9 +714,12 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
   // === Clamped kickstart state machine ===
   if (clamp_phase_ == ClampPhase::PRE_CS) {
     if ((now - clamp_phase_start_) >= 500) {
-      // Mode ON + fan=LOW
+      // Mode ON + fan=LOW, then send CS with CS_DATA (PRE_CS transmit was
+      // swallowed because active_ir_mode_ was still OFF at that point)
       set_active_ir_mode_(clamp_is_heat_ ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
       transmit_mode_command_();
+      transmit_cs_update_(true);
+      last_cs_heartbeat_ = now;
       clamp_phase_ = ClampPhase::CLAMPED;
       clamp_start_ = now;
       ESP_LOGI(TAG, "Clamped kickstart: MODE ON + fan=LOW, clamp=5:30");
@@ -749,27 +762,32 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
 void FurrionChillCube::end_kickstart_(uint32_t now) {
   bool was_clamped = (clamp_phase_ == ClampPhase::CLAMPED);
 
+  // Determine heat/cool BEFORE clearing state (active_ir_mode_ may be OFF during PRE_CS)
+  bool is_heat = (clamp_phase_ != ClampPhase::IDLE) ? clamp_is_heat_ :
+                 quick_kick_active_ ? quick_kick_is_heat_ :
+                 (active_ir_mode_ == climate::CLIMATE_MODE_HEAT);
+
   // Clear all kickstart state
   clamp_phase_ = ClampPhase::IDLE;
   clamp_start_ = 0;
   clamp_phase_start_ = 0;
   quick_kick_active_ = false;
   quick_kick_start_ = 0;
-
-  // Determine current gear and compute the correct CS
-  bool is_heat = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT);
   int gear = is_heat ? heat_gear_ : cool_gear_;
   if (gear >= 0) {
     int cs = compute_gear_cs_(is_heat, gear);
     set_cs_value_(cs, now);
   }
 
-  // If we were clamped (fan=LOW), re-send mode with fan=AUTO
-  if (was_clamped && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+  // Always re-send mode command when unit is ON — ensures Furrion display
+  // setpoint is current (fixes stale display after quick kickstart) and
+  // restores fan=AUTO after clamped kickstart
+  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     transmit_mode_command_();
   }
 
-  ESP_LOGI(TAG, "Kickstart released: cs=%d fan=%s", current_cs_, was_clamped ? "AUTO (was LOW)" : "unchanged");
+  ESP_LOGI(TAG, "Kickstart released: cs=%d mode_resent=%d", current_cs_,
+           active_ir_mode_ != climate::CLIMATE_MODE_OFF);
 }
 
 // ============================================================

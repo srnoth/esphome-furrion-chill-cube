@@ -128,7 +128,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_OUTSIDE_TEMPERATURE): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_OUTSIDE_TEMPERATURE_IS_FAHRENHEIT, default=False): cv.boolean,
             # Below this outside temp (°F), heating is locked out. Default 35°F ≈ 1.7°C
-            cv.Optional(CONF_OUTSIDE_LOCKOUT_TEMP, default=35.0): cv.float_,
+            cv.Optional(CONF_OUTSIDE_LOCKOUT_TEMP, default=35.0): cv.float_range(
+                min=-40.0, max=120.0
+            ),
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,

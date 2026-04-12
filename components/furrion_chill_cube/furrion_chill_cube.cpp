@@ -238,8 +238,8 @@ void FurrionChillCube::transmit_cs_update_(bool send_data) {
   message[0] = 0xBA;
   message[1] = ~message[0];  // 0x45
 
-  // CS temperature (clamped 0-30°C)
-  message[2] = (uint8_t)std::max(0, std::min(30, current_cs_));
+  // CS temperature (clamped 15-30°C — Furrion protocol range)
+  message[2] = (uint8_t)std::max(15, std::min(30, current_cs_));
 
   // Feature flags
   if (send_data) {
@@ -435,7 +435,10 @@ climate::ClimateTraits FurrionChillCube::traits() {
 void FurrionChillCube::control(const climate::ClimateCall &call) {
   if (call.get_mode().has_value()) {
     auto new_mode = *call.get_mode();
-    auto old_mode = this->mode;
+
+    // Ensure two-point values valid for first boot (BEFORE sync to avoid NaN copy)
+    if (isnan(this->target_temperature_low)) this->target_temperature_low = 20.0f;
+    if (isnan(this->target_temperature_high)) this->target_temperature_high = 25.0f;
 
     // Sync target_temperature for HA single-slider display in HEAT/COOL modes
     if (new_mode == climate::CLIMATE_MODE_HEAT) {
@@ -443,9 +446,6 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     } else if (new_mode == climate::CLIMATE_MODE_COOL) {
       this->target_temperature = this->target_temperature_high;
     }
-    // Ensure two-point values valid for first boot
-    if (isnan(this->target_temperature_low)) this->target_temperature_low = 20.0f;
-    if (isnan(this->target_temperature_high)) this->target_temperature_high = 25.0f;
 
     this->mode = new_mode;
 
@@ -455,6 +455,7 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     }
 
     // Abort kickstart only if new mode is incompatible with the active IR mode.
+    // Clear state directly (don't call end_kickstart_ which would re-send old mode).
     if (kickstart_active_()) {
       bool compatible = false;
       if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
@@ -466,10 +467,13 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
         uint32_t now = millis();
         ESP_LOGI(TAG, "Kickstart aborted — mode %d incompatible with IR mode %d",
                  (int)new_mode, (int)active_ir_mode_);
-        end_kickstart_(now);
-        // Reset gears to prevent stale values if user switches back
+        // Clear kickstart state directly (no end_kickstart_ — avoids spurious
+        // old-mode IR retransmit; gear controller handles CS/mode on next loop)
+        clamp_phase_ = ClampPhase::IDLE;
+        quick_kick_active_ = false;
         heat_gear_ = -1;
         cool_gear_ = -1;
+        idle_since_ = 0;
         if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
         if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
         // If switching COOL↔HEAT, trigger 60s cooldown
@@ -481,6 +485,11 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
           transmit_mode_command_();
           mode_switch_off_at_ = now;
           last_mode_event_at_ = now;
+        }
+        // If switching to OFF, send immediately (don't wait for next loop)
+        if (new_mode == climate::CLIMATE_MODE_OFF) {
+          set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+          transmit_mode_command_();
         }
       }
     }
@@ -537,6 +546,10 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
                        call.get_fan_mode().has_value();
   if (gear_relevant) {
     this->user_changed_ = true;
+    // Abort keepalive on any gear-relevant change so gear controller responds immediately
+    if (keepalive_phase_ != KeepAlivePhase::IDLE) {
+      abort_keepalive_();
+    }
   }
   this->publish_state();
 }
@@ -622,6 +635,7 @@ void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
 void FurrionChillCube::force_mode_switch_off_(const char *label, uint32_t now) {
   heat_gear_ = -1;
   cool_gear_ = -1;
+  idle_since_ = 0;
   clamp_phase_ = ClampPhase::IDLE;
   quick_kick_active_ = false;
   abort_keepalive_();
@@ -668,6 +682,8 @@ void FurrionChillCube::send_swing_state_() {
 // ============================================================
 
 void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
+  // Defensive: clear any prior kickstart state
+  quick_kick_active_ = false;
   clamp_is_heat_ = is_heat;
   // Kickstart CS: heat=gear2 CS, cool=gear4 CS (includes boundary offset)
   clamp_kickstart_cs_ = compute_gear_cs_(is_heat, is_heat ? 2 : 4);
@@ -687,6 +703,8 @@ void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
 }
 
 void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, uint32_t now) {
+  // Defensive: clear any prior clamped kickstart state
+  clamp_phase_ = ClampPhase::IDLE;
   quick_kick_active_ = true;
   quick_kick_start_ = now;
   quick_kick_cs_ = std::max(15, std::min(30, kickstart_cs));
@@ -853,7 +871,7 @@ void FurrionChillCube::abort_keepalive_() {
   if (keepalive_phase_ != KeepAlivePhase::IDLE) {
     ESP_LOGI(TAG, "Keep-alive: aborted (phase=%d)", (int)keepalive_phase_);
     keepalive_phase_ = KeepAlivePhase::IDLE;
-    keepalive_last_ = 0;
+    keepalive_last_ = millis();  // fresh 5-min window (not 0, which could cause immediate retrigger)
   }
 }
 
@@ -988,6 +1006,10 @@ void FurrionChillCube::run_gear_controller_() {
   if (heater_on && cooler_on) {
     float h_target = get_heat_target_();
     float c_target = get_cool_target_();
+    // Guard: if targets are inverted (low >= high), swap to prevent stuck mode
+    if (!isnan(h_target) && !isnan(c_target) && h_target > c_target) {
+      float tmp = h_target; h_target = c_target; c_target = tmp;
+    }
     ActiveMode last_mode = last_active_mode_;
 
     // Time-based mode switch lockout (replaces temperature-based MODE_SWITCH_EXTRA)

@@ -467,6 +467,14 @@ climate::ClimateTraits FurrionChillCube::traits() {
 }
 
 void FurrionChillCube::control(const climate::ClimateCall &call) {
+  // Track whether each field *actually* changed. user_changed_ is set only for
+  // real, mode-relevant changes — not for redundant HA re-syncs after reconnect
+  // (which send the same values we already have) and not for tweaks to the
+  // inactive endpoint (low in cool mode, high in heat mode).
+  bool mode_changed = false;
+  bool temp_changed = false;
+  bool fan_changed = false;
+
   if (call.get_mode().has_value()) {
     auto new_mode = *call.get_mode();
 
@@ -481,63 +489,83 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
       this->target_temperature = this->target_temperature_high;
     }
 
+    mode_changed = (new_mode != this->mode);
     this->mode = new_mode;
 
-    // Abort keepalive immediately so gear controller can respond on next loop
-    if (keepalive_phase_ != KeepAlivePhase::IDLE) {
-      abort_keepalive_();
-    }
-
-    // Abort kickstart only if new mode is incompatible with the active IR mode.
-    // Clear state directly (don't call end_kickstart_ which would re-send old mode).
-    if (kickstart_active_()) {
-      // Determine the kickstart's intended mode (active_ir_mode_ may still be OFF during PRE_CS)
-      bool kick_is_cool = (active_ir_mode_ == climate::CLIMATE_MODE_COOL) ||
-                          (clamp_phase_ != ClampPhase::IDLE && !clamp_is_heat_) ||
-                          (quick_kick_active_ && !quick_kick_is_heat_);
-      bool kick_is_heat = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ||
-                          (clamp_phase_ != ClampPhase::IDLE && clamp_is_heat_) ||
-                          (quick_kick_active_ && quick_kick_is_heat_);
-      bool compatible = false;
-      if (kick_is_cool) {
-        compatible = (new_mode == climate::CLIMATE_MODE_COOL || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
-      } else if (kick_is_heat) {
-        compatible = (new_mode == climate::CLIMATE_MODE_HEAT || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
+    if (mode_changed) {
+      // Abort keepalive immediately so gear controller can respond on next loop
+      if (keepalive_phase_ != KeepAlivePhase::IDLE) {
+        abort_keepalive_();
       }
-      if (!compatible) {
-        uint32_t now = millis();
-        ESP_LOGI(TAG, "Kickstart aborted — mode %d incompatible with IR mode %d",
-                 (int)new_mode, (int)active_ir_mode_);
-        // Clear kickstart state, force to OFF. All mode changes (including
-        // COOL↔HEAT and to OFF) now go through -1 with 1-min off_since_ lockout.
-        clamp_phase_ = ClampPhase::IDLE;
-        quick_kick_active_ = false;
-        heat_gear_ = -1;
-        cool_gear_ = -1;
-        off_since_ = now;  // start 1-min off lockout
-        if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
-        if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
-        if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-          set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-          transmit_mode_command_();
+
+      // Abort kickstart only if new mode is incompatible with the active IR mode.
+      // Clear state directly (don't call end_kickstart_ which would re-send old mode).
+      if (kickstart_active_()) {
+        // Determine the kickstart's intended mode (active_ir_mode_ may still be OFF during PRE_CS)
+        bool kick_is_cool = (active_ir_mode_ == climate::CLIMATE_MODE_COOL) ||
+                            (clamp_phase_ != ClampPhase::IDLE && !clamp_is_heat_) ||
+                            (quick_kick_active_ && !quick_kick_is_heat_);
+        bool kick_is_heat = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ||
+                            (clamp_phase_ != ClampPhase::IDLE && clamp_is_heat_) ||
+                            (quick_kick_active_ && quick_kick_is_heat_);
+        bool compatible = false;
+        if (kick_is_cool) {
+          compatible = (new_mode == climate::CLIMATE_MODE_COOL || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
+        } else if (kick_is_heat) {
+          compatible = (new_mode == climate::CLIMATE_MODE_HEAT || new_mode == climate::CLIMATE_MODE_HEAT_COOL);
+        }
+        if (!compatible) {
+          uint32_t now = millis();
+          ESP_LOGI(TAG, "Kickstart aborted — mode %d incompatible with IR mode %d",
+                   (int)new_mode, (int)active_ir_mode_);
+          // Clear kickstart state, force to OFF. All mode changes (including
+          // COOL↔HEAT and to OFF) now go through -1 with 1-min off_since_ lockout.
+          clamp_phase_ = ClampPhase::IDLE;
+          quick_kick_active_ = false;
+          heat_gear_ = -1;
+          cool_gear_ = -1;
+          off_since_ = now;  // start 1-min off lockout
+          if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+          if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+          if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+            set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+            transmit_mode_command_();
+          }
         }
       }
     }
   }
 
-  // Target temperature changes — setpoint changes don't affect kickstart
-  bool temp_changed = false;
+  // Target temperature changes. Only flag as user-relevant when:
+  //   (a) the value actually changed (idempotent re-sync from HA is a no-op), AND
+  //   (b) the endpoint drives the active mode's gear math:
+  //         target_temperature_low  → heat target (HEAT, HEAT_COOL)
+  //         target_temperature_high → cool target (COOL, HEAT_COOL)
+  //         target_temperature      → active target in HEAT or COOL single modes
+  bool is_heat_mode = (this->mode == climate::CLIMATE_MODE_HEAT ||
+                       this->mode == climate::CLIMATE_MODE_HEAT_COOL);
+  bool is_cool_mode = (this->mode == climate::CLIMATE_MODE_COOL ||
+                       this->mode == climate::CLIMATE_MODE_HEAT_COOL);
+  bool is_single_active_mode = (this->mode == climate::CLIMATE_MODE_HEAT ||
+                                this->mode == climate::CLIMATE_MODE_COOL);
+
   if (call.get_target_temperature().has_value()) {
-    this->target_temperature = *call.get_target_temperature();
-    temp_changed = true;
+    float v = *call.get_target_temperature();
+    bool changed = isnan(this->target_temperature) || v != this->target_temperature;
+    if (changed && is_single_active_mode) temp_changed = true;
+    this->target_temperature = v;
   }
   if (call.get_target_temperature_low().has_value()) {
-    this->target_temperature_low = *call.get_target_temperature_low();
-    temp_changed = true;
+    float v = *call.get_target_temperature_low();
+    bool changed = isnan(this->target_temperature_low) || v != this->target_temperature_low;
+    if (changed && is_heat_mode) temp_changed = true;
+    this->target_temperature_low = v;
   }
   if (call.get_target_temperature_high().has_value()) {
-    this->target_temperature_high = *call.get_target_temperature_high();
-    temp_changed = true;
+    float v = *call.get_target_temperature_high();
+    bool changed = isnan(this->target_temperature_high) || v != this->target_temperature_high;
+    if (changed && is_cool_mode) temp_changed = true;
+    this->target_temperature_high = v;
   }
   // Sync target_temperature when low/high change in single modes.
   // Without this, get_heat/cool_target_() returns a stale value in HEAT/COOL modes.
@@ -550,11 +578,13 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     this->target_temperature = this->target_temperature_high;
   }
 
-  // Fan mode change
+  // Fan mode change — idempotent: same-value sync is a no-op (no IR, no user flag)
   if (call.get_fan_mode().has_value()) {
     auto new_fan = *call.get_fan_mode();
+    auto cur_fan = this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
+    fan_changed = (new_fan != cur_fan);
     this->fan_mode = new_fan;
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
+    if (fan_changed && active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
       transmit_mode_command_();
       ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)new_fan);
     }
@@ -569,11 +599,9 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     ESP_LOGI(TAG, "User swing change → %d", (int)*call.get_swing_mode());
   }
 
-  // Only flag gear recalculation for changes that affect cooling/heating
-  // (mode, setpoint, fan). Swing is purely cosmetic.
-  bool gear_relevant = call.get_mode().has_value() ||
-                       temp_changed ||
-                       call.get_fan_mode().has_value();
+  // Only flag gear recalculation for real, gear-relevant changes.
+  // Swing is cosmetic. Same-value re-syncs from HA are filtered above.
+  bool gear_relevant = mode_changed || temp_changed || fan_changed;
   if (gear_relevant) {
     this->user_changed_ = true;
     // Abort keepalive on any gear-relevant change so gear controller responds immediately

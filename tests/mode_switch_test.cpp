@@ -18,7 +18,7 @@
 // ============================================================
 
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
-static const uint32_t CLAMP_DURATION_MS = 330000;
+static const uint32_t CLAMP_DURATION_MS = 305000;
 
 static const float H_UP_01 = -0.3f;
 static const float H_UP_12 = -0.8f;

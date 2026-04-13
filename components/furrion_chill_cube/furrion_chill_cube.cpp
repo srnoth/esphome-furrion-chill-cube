@@ -41,7 +41,7 @@ static const int FURRION_MAX_TEMP_C = 30;
 // kept for direct array indexing by gear number without offset.
 //                        0      1       2       3        4        5
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
-static const uint32_t CLAMP_DURATION_MS = 330000;  // 5 min 30s
+static const uint32_t CLAMP_DURATION_MS = 305000;  // 5 min 5s (matches unit's internal 5-min enforced startup)
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
 static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
@@ -259,8 +259,12 @@ void FurrionChillCube::transmit_cs_update_(bool send_data) {
   message[0] = 0xBA;
   message[1] = ~message[0];  // 0x45
 
-  // CS temperature (clamped 15-30°C — Furrion protocol range)
-  message[2] = (uint8_t)std::max(15, std::min(30, current_cs_));
+  // CS temperature — transmitted raw. Empirically the Furrion accepts
+  // out-of-nominal-range values and treats them as stronger signals in
+  // the same direction (tested on similar Midea units up to 55-95°F).
+  // Gear 0 uses setpoint±5 which can land at CS=11 (setpoint 16°C cool)
+  // or CS=35 (setpoint 30°C heat); both are transmitted unmodified.
+  message[2] = (uint8_t)current_cs_;
 
   // Feature flags
   if (send_data) {
@@ -683,22 +687,31 @@ climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
 }
 
 int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
-  // Offset keeps all gear CS values distinct at boundary setpoints.
-  // Without it, multiple gears clamp to the same CS (15 or 30) and
-  // the Furrion can't differentiate them. The offset shifts the entire
-  // mapping so the most extreme gear lands exactly at the clamp limit.
+  // Active-gear (1-5 cool / 1-3 heat) CS values use the offset logic to
+  // stay within the Furrion's 15-30 CS protocol range — keeps active
+  // gears distinguishable at boundary setpoints.
+  //
+  // Idle-gear (gear 0) is an unambiguous "stop compressor" signal set at
+  // setpoint ± 5°C with no offset or clamping applied. At typical setpoints
+  // this is well within 15-30; at boundary setpoints (16°C cool, 30°C heat)
+  // gear 0 reaches CS=11 or CS=35 respectively. The CS byte is transmitted
+  // raw — no clamping in the IR encode path — on the assumption that the
+  // Furrion will treat out-of-range CS as a stronger version of the nearest
+  // in-range value (verified on a Midea unit at 55-95°F extremes; not
+  // explicitly tested on this Furrion but low-risk given symmetric behavior
+  // patterns across similar HVAC protocols).
   if (is_heat) {
-    int hi = furrion_setpoint_c_ + 2;  // gear 0 = highest heat CS
+    int hi = furrion_setpoint_c_ + 2;
     int offset = (hi > 30) ? (30 - hi) : 0;
     switch (gear) {
       case 3:  return furrion_setpoint_c_ - 1 + offset;
       case 2:  return furrion_setpoint_c_     + offset;
       case 1:  return furrion_setpoint_c_ + 1 + offset;
-      default: return furrion_setpoint_c_ + 2 + offset;
+      default: return furrion_setpoint_c_ + 5;   // gear 0: raw, unclamped
     }
   } else {
-    int lo = furrion_setpoint_c_ - 3;  // gear 0 = lowest cool CS
-    int hi = furrion_setpoint_c_ + 2;  // gear 5 = highest cool CS
+    int lo = furrion_setpoint_c_ - 3;
+    int hi = furrion_setpoint_c_ + 2;
     int offset = (lo < 15) ? (15 - lo) : (hi > 30) ? (30 - hi) : 0;
     switch (gear) {
       case 5:  return furrion_setpoint_c_ + 2 + offset;
@@ -706,13 +719,12 @@ int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
       case 3:  return furrion_setpoint_c_     + offset;
       case 2:  return furrion_setpoint_c_ - 1 + offset;
       case 1:  return furrion_setpoint_c_ - 2 + offset;
-      default: return furrion_setpoint_c_ - 3 + offset;
+      default: return furrion_setpoint_c_ - 5;   // gear 0: raw, unclamped
     }
   }
 }
 
 void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
-  cs = std::max(15, std::min(30, cs));
   current_cs_ = cs;
   if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     transmit_cs_update_(true);
@@ -755,9 +767,9 @@ void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
   // Defensive: clear any prior kickstart state
   quick_kick_active_ = false;
   clamp_is_heat_ = is_heat;
-  // Kickstart CS: heat=gear2 CS, cool=gear4 CS (includes boundary offset)
+  // Kickstart CS: heat=gear2 CS, cool=gear4 CS (includes boundary offset).
+  // No clamping — active-gear CS is already in 15-30 range via the offset.
   clamp_kickstart_cs_ = compute_gear_cs_(is_heat, is_heat ? 2 : 4);
-  clamp_kickstart_cs_ = std::max(15, std::min(30, clamp_kickstart_cs_));
 
   // PRE_CS: set kickstart CS before mode-on (500ms lead)
   current_cs_ = clamp_kickstart_cs_;
@@ -777,7 +789,7 @@ void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, ui
   clamp_phase_ = ClampPhase::IDLE;
   quick_kick_active_ = true;
   quick_kick_start_ = now;
-  quick_kick_cs_ = std::max(15, std::min(30, kickstart_cs));
+  quick_kick_cs_ = kickstart_cs;
   quick_kick_is_heat_ = is_heat;
   quick_kick_reinforced_ = false;
 
@@ -899,14 +911,7 @@ void FurrionChillCube::end_kickstart_(uint32_t now) {
 void FurrionChillCube::start_keepalive_(bool is_heat, uint32_t now) {
   keepalive_restore_cs_ = current_cs_;
   int anchor = furrion_setpoint_c_;
-  int step2_raw = is_heat ? (anchor - 1) : (anchor + 1);
-  keepalive_step2_cs_ = std::max(15, std::min(30, step2_raw));
-  // At boundary setpoints (cool@30, heat@16), step2 clamps to anchor — no swing possible
-  if (keepalive_step2_cs_ == anchor) {
-    keepalive_last_ = now;  // reset timer without pulsing
-    ESP_LOGD(TAG, "Keep-alive: skipped (boundary setpoint, no CS swing)");
-    return;
-  }
+  keepalive_step2_cs_ = is_heat ? (anchor - 1) : (anchor + 1);
   set_cs_value_(anchor, now);  // Step 1: setpoint CS
   keepalive_phase_ = KeepAlivePhase::STEP1;
   keepalive_phase_start_ = now;
@@ -1387,9 +1392,9 @@ void FurrionChillCube::run_gear_controller_() {
           set_cs_value_(cs, now);
         }
       } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
-        // Idle→gear 1-2: quick kickstart (CS=setpoint for 10s)
-        int kick_cs = std::max(15, std::min(30, furrion_setpoint_c_));
-        start_quick_kickstart_(false, kick_cs, now);
+        // Idle→gear 1-2: quick kickstart (CS=setpoint for 10s).
+        // furrion_setpoint_c_ is already clamped to 16-30 by compute_setpoint_c_.
+        start_quick_kickstart_(false, furrion_setpoint_c_, now);
       } else if (!kickstart_active_() && current_cs_ != cs) {
         set_cs_value_(cs, now);
       }

@@ -22,7 +22,7 @@ static const float H_UP_12 = -0.8f;
 static const float H_UP_23 = -1.5f;
 static const float H_DN_32 = -0.8f;
 static const float H_DN_21 = -0.3f;
-static const float H_DN_10 =  0.3f;
+static const float H_DN_10 = -0.15f;   // below setpoint — compensates for shutdown thermal carry
 static const float H_IDLE  =  0.3f;
 
 // Cooling deadbands (diff = room - target, positive = hot)
@@ -344,13 +344,44 @@ TEST(heat_setpoint_raise_user_input) {
     float target_68 = f_to_c(68.0f);
     float room = f_to_c(63.5f);
 
-    // At gear 1, target 63, room 63.5: diff = +0.28°C, H_DN_10=0.3 — not met yet
+    // At gear 1, target 63, room 63.5: diff = +0.28°C, H_DN_10=-0.15 — already past
+    // the new downshift threshold (we drop before reaching setpoint to compensate
+    // for thermal carry).
     int gear = select_heat_gear(1, room, target_63, false, 999999, true, 0, 100000);
-    EXPECT_GEAR(1, gear, "Heat gear 1, room 0.28°C above target (< H_DN_10=0.3): hold gear 1");
+    EXPECT_GEAR(0, gear, "Heat gear 1, room 0.28°C above target (> H_DN_10=-0.15): downshift");
 
     // User raises setpoint to 68: diff = 63.5 - 68 = -4.5°F = -2.5°C — max heat
     gear = select_heat_gear(1, room, target_68, true, 0, true, 0, 100000);
     EXPECT_GEAR(3, gear, "Heat setpoint raise to 68°F: jump to gear 3 (max heat)");
+}
+
+TEST(heat_gear_1_downshift_at_thermal_carry_point) {
+    printf("\n=== Heating: H_DN_10 thermal-carry compensation ===\n");
+
+    // Heat target 68°F. Gear 1 should drop to 0 when room reaches setpoint-0.27°F
+    // (0.15°C below target), not at setpoint-0.54°F above target like before.
+    // Room continues warming ~0.85°F post-drop (measured 2026-04-13 cycle),
+    // putting peak near setpoint+0.58°F — inside 1°F mode-switch safety margin.
+    float target = f_to_c(68.0f);
+
+    // Room 0.4°F below setpoint (67.6) — above new downshift threshold, still heating
+    int gear = select_heat_gear(1, f_to_c(67.6f), target, false, 999999, true, 0, 100000);
+    EXPECT_GEAR(1, gear, "Room 0.4°F below setpoint: diff=-0.22°C < H_DN_10=-0.15 → hold gear 1");
+
+    // Room 0.2°F below setpoint (67.8) — past new downshift, should drop
+    gear = select_heat_gear(1, f_to_c(67.8f), target, false, 999999, true, 0, 100000);
+    EXPECT_GEAR(0, gear, "Room 0.2°F below setpoint: diff=-0.11°C > H_DN_10=-0.15 → downshift");
+
+    // Room exactly at setpoint — past threshold, drop
+    gear = select_heat_gear(1, target, target, false, 999999, true, 0, 100000);
+    EXPECT_GEAR(0, gear, "Room at setpoint: diff=0 > H_DN_10=-0.15 → downshift (thermal carry will push past)");
+
+    // Sanity: gear 0 only upshifts at 0.54°F below setpoint (H_UP_01 unchanged)
+    gear = select_heat_gear(0, f_to_c(67.5f), target, false, 999999, true, 0, 100000);
+    EXPECT_GEAR(0, gear, "Gear 0, room 0.5F below setpoint: diff=-0.28°C < H_UP_01=-0.3 (not cold enough) → stay");
+
+    gear = select_heat_gear(0, f_to_c(67.4f), target, false, 999999, true, 0, 100000);
+    EXPECT_GEAR(1, gear, "Gear 0, room 0.6F below setpoint: diff=-0.33°C > H_UP_01=-0.3 → upshift");
 }
 
 TEST(heat_user_lowers_setpoint_below_room) {
@@ -435,6 +466,7 @@ int main() {
     test_cool_fresh_start_various_diffs();
     test_heat_setpoint_raise_user_input();
     test_heat_user_lowers_setpoint_below_room();
+    test_heat_gear_1_downshift_at_thermal_carry_point();
     test_replay_april4_incident();
 
     printf("\n========================================\n");

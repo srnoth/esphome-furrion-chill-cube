@@ -25,7 +25,7 @@ static const float H_UP_12 = -0.8f;
 static const float H_UP_23 = -1.5f;
 static const float H_DN_32 = -0.8f;
 static const float H_DN_21 = -0.3f;
-static const float H_DN_10 =  0.3f;
+static const float H_DN_10 = -0.15f;   // below setpoint — compensates for shutdown thermal carry
 static const float H_IDLE  =  0.3f;
 
 static const float C_UP_01 =  0.15f;
@@ -652,7 +652,9 @@ void test_user_input_preserves_gear_in_band() {
     run_gear_controller(s2, now, tx);
     check(s2.cool_gear == 0, "user event w/ diff below gear-2 band: falls through to 0");
 
-    // Heat mirror: gear 1 heat, diff in band [-0.8, 0.3]. Room 66.2°F, target 66°F → diff ~0.11°C.
+    // Heat mirror: gear 1 heat, diff in new band [-0.8, -0.15]. With H_DN_10 lowered
+    // to -0.15°C, gear 1 is only in-band when room is 0.27-1.44°F below target.
+    // Room 65.5°F, target 66°F → diff = -0.5°F = -0.28°C, safely in band.
     SystemState sh;
     sh.heat_cool_mode = true;
     sh.heat_target_c = f_to_c(66.0f);
@@ -661,7 +663,7 @@ void test_user_input_preserves_gear_in_band() {
     sh.cool_gear = -1;
     sh.last_active_mode = MODE_HEAT;
     sh.boot_ready = true;
-    sh.room_c = f_to_c(66.2f);
+    sh.room_c = f_to_c(65.5f);
     sh.user_input = true;
     std::vector<IrTransmission> tx2;
     run_gear_controller(sh, now, tx2);

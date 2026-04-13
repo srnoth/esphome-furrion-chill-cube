@@ -54,7 +54,13 @@ static const float H_UP_12 = -0.8f;   // 1->2
 static const float H_UP_23 = -1.5f;   // 2->3
 static const float H_DN_32 = -0.8f;   // 3->2
 static const float H_DN_21 = -0.3f;   // 2->1
-static const float H_DN_10 =  0.3f;   // 1->0: room 0.5F above target
+// H_DN_10 triggers gear 1 → 0 before reaching setpoint, compensating for
+// the Furrion's post-drop thermal carry (~0.85°F observed on 2026-04-13).
+// Old value (+0.3°C / room 0.54°F above target) let peak reach +1.44°F
+// above setpoint — exceeds mode_switch_temp_offset_c_, triggered heat→cool
+// pong. New value drops gear at 0.27°F *below* setpoint; thermal carry
+// brings peak to ~+0.58°F, well inside mode-switch-offset safety margin.
+static const float H_DN_10 = -0.15f;  // 1->0: room 0.27F below target
 static const float H_IDLE  =  0.3f;   // 0->-1 threshold
 
 // Cooling deadbands (diff = room - target, positive = hot)

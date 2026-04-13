@@ -66,7 +66,9 @@ static const float C_UP_45 =  0.8f;
 static const float C_DN_54 =  0.45f;
 static const float C_DN_43 =  0.25f;
 static const float C_DN_32 =  0.10f;
-static const float C_DN_21 =  0.0f;
+// C_DN_21 sits below setpoint so a sub-0.1°C dip below setpoint doesn't
+// collapse gear 2 → gear 1. Matches the asymmetry of C_DN_10 = -0.15.
+static const float C_DN_21 = -0.1f;
 static const float C_DN_10 = -0.15f;
 static const float C_IDLE  = -0.15f;
 
@@ -584,6 +586,31 @@ float FurrionChillCube::get_cool_target_() {
   return this->target_temperature_high;
 }
 
+// Returns true iff the given heat gear's hysteresis band covers `diff`.
+// Used on user_input events to avoid collapsing a stable hunting gear when
+// the user change doesn't actually move the room out of the current gear's band.
+bool FurrionChillCube::gear_in_band_heat_(int gear, float diff) {
+  switch (gear) {
+    case 0: return diff >= H_UP_01 && diff <= H_DN_10;      // (-0.3, 0.3)
+    case 1: return diff >= H_UP_12 && diff <= H_DN_10;      // (-0.8, 0.3)
+    case 2: return diff >= H_UP_23 && diff <= H_DN_21;      // (-1.5, -0.3)
+    case 3: return diff <= H_DN_32;                          // max heat, no lower bound
+    default: return false;
+  }
+}
+
+bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
+  switch (gear) {
+    case 0: return diff >= C_DN_10 && diff <= C_UP_01;      // (-0.15, 0.15)
+    case 1: return diff >= C_DN_21 && diff <= C_UP_12;      // (-0.1, 0.25)
+    case 2: return diff >= C_DN_32 && diff <= C_UP_23;      // (0.10, 0.40)
+    case 3: return diff >= C_DN_43 && diff <= C_UP_34;      // (0.25, 0.60)
+    case 4: return diff >= C_DN_54 && diff <= C_UP_45;      // (0.45, 0.80)
+    case 5: return diff >= C_DN_54;                          // max cool, no upper bound
+    default: return false;
+  }
+}
+
 int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
   float target_c = is_heat ? get_heat_target_() : get_cool_target_();
   if (isnan(target_c)) return 22;  // safe default
@@ -1059,6 +1086,10 @@ void FurrionChillCube::run_gear_controller_() {
       bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
       if (gear == -1 && !off_long_enough) {
         new_gear = -1;  // still in 1-min wind-down period
+      } else if (user_input && gear >= 0 && gear_in_band_heat_(gear, diff)) {
+        // User event (setpoint/fan tweak) but current gear is still valid for
+        // the current diff — preserve hunting state instead of recomputing.
+        new_gear = gear;
       } else {
         // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
         if (diff < H_UP_23)         new_gear = 3;
@@ -1189,6 +1220,10 @@ void FurrionChillCube::run_gear_controller_() {
       bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
       if (gear == -1 && !off_long_enough) {
         new_gear = -1;  // still in 1-min wind-down period
+      } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, diff)) {
+        // User event (setpoint/fan tweak) but current gear is still valid for
+        // the current diff — preserve hunting state instead of recomputing.
+        new_gear = gear;
       } else {
         // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
         // and never gear 0 (only reachable by downshift from 1)

@@ -34,7 +34,7 @@ static const float C_UP_45 =  0.8f;
 static const float C_DN_54 =  0.45f;
 static const float C_DN_43 =  0.25f;
 static const float C_DN_32 =  0.10f;
-static const float C_DN_21 =  0.0f;
+static const float C_DN_21 = -0.1f;   // below setpoint — gives gear 2 real downshift hysteresis
 static const float C_DN_10 = -0.15f;
 static const float C_IDLE  = -0.15f;
 
@@ -43,6 +43,28 @@ static const float C_IDLE  = -0.15f;
 // ============================================================
 
 float f_to_c(float f) { return (f - 32.0f) * (5.0f / 9.0f); }
+
+bool gear_in_band_cool(int gear, float diff) {
+    switch (gear) {
+        case 0: return diff >= C_DN_10 && diff <= C_UP_01;
+        case 1: return diff >= C_DN_21 && diff <= C_UP_12;
+        case 2: return diff >= C_DN_32 && diff <= C_UP_23;
+        case 3: return diff >= C_DN_43 && diff <= C_UP_34;
+        case 4: return diff >= C_DN_54 && diff <= C_UP_45;
+        case 5: return diff >= C_DN_54;
+        default: return false;
+    }
+}
+
+bool gear_in_band_heat(int gear, float diff) {
+    switch (gear) {
+        case 0: return diff >= H_UP_01 && diff <= H_DN_10;
+        case 1: return diff >= H_UP_12 && diff <= H_DN_10;
+        case 2: return diff >= H_UP_23 && diff <= H_DN_21;
+        case 3: return diff <= H_DN_32;
+        default: return false;
+    }
+}
 
 int select_cool_gear(int current_gear, float room_c, float target_c,
                      bool user_input, uint32_t time_in_gear, bool boot_ready,
@@ -58,6 +80,9 @@ int select_cool_gear(int current_gear, float room_c, float target_c,
     };
 
     if (gear == -1 || user_input) {
+        if (user_input && gear >= 0 && gear_in_band_cool(gear, diff)) {
+            new_gear = gear;   // preserve stable hunting gear on user event
+        } else {
         // Fresh start or user change: jump directly to appropriate gear
         // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
         if (diff > C_UP_45)         new_gear = 5;
@@ -66,6 +91,7 @@ int select_cool_gear(int current_gear, float room_c, float target_c,
         else if (diff > C_UP_12)    new_gear = 2;
         else if (diff > C_UP_01)    new_gear = 1;
         else                        new_gear = (gear == -1) ? -1 : 0;
+        }
     } else {
         switch (gear) {
             case 0: {
@@ -113,12 +139,16 @@ int select_heat_gear(int current_gear, float room_c, float target_c,
     };
 
     if (gear == -1 || user_input) {
+        if (user_input && gear >= 0 && gear_in_band_heat(gear, diff)) {
+            new_gear = gear;   // preserve stable hunting gear on user event
+        } else {
         // Fresh start or user change: jump directly to appropriate gear
         // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
         if (diff < H_UP_23)         new_gear = 3;
         else if (diff < H_UP_12)    new_gear = 2;
         else if (diff < H_UP_01)    new_gear = 1;
         else                        new_gear = (gear == -1) ? -1 : 0;
+        }
     } else {
         switch (gear) {
             case 0: {

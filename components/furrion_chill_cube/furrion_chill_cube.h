@@ -72,6 +72,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   float get_heat_target_();
   float get_cool_target_();
   int compute_gear_cs_(bool is_heat, int gear);
+  bool gear_in_band_heat_(int gear, float diff);
+  bool gear_in_band_cool_(int gear, float diff);
 
   // Kickstart system
   // Clamped kickstart: OFF→low gear, fan=LOW for 5:30, gear controller runs but CS overridden

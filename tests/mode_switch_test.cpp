@@ -36,7 +36,7 @@ static const float C_UP_45 =  0.8f;
 static const float C_DN_54 =  0.45f;
 static const float C_DN_43 =  0.25f;
 static const float C_DN_32 =  0.10f;
-static const float C_DN_21 =  0.0f;
+static const float C_DN_21 = -0.1f;   // below setpoint — gives gear 2 real downshift hysteresis
 static const float C_DN_10 = -0.15f;
 static const float C_IDLE  = -0.15f;
 
@@ -110,6 +110,28 @@ FanMode get_effective_fan(const SystemState &s) {
 // Gear computation (heat) — mirrors heat path in run_gear_controller_
 // ============================================================
 
+bool gear_in_band_heat(int gear, float diff) {
+    switch (gear) {
+        case 0: return diff >= H_UP_01 && diff <= H_DN_10;
+        case 1: return diff >= H_UP_12 && diff <= H_DN_10;
+        case 2: return diff >= H_UP_23 && diff <= H_DN_21;
+        case 3: return diff <= H_DN_32;
+        default: return false;
+    }
+}
+
+bool gear_in_band_cool(int gear, float diff) {
+    switch (gear) {
+        case 0: return diff >= C_DN_10 && diff <= C_UP_01;
+        case 1: return diff >= C_DN_21 && diff <= C_UP_12;
+        case 2: return diff >= C_DN_32 && diff <= C_UP_23;
+        case 3: return diff >= C_DN_43 && diff <= C_UP_34;
+        case 4: return diff >= C_DN_54 && diff <= C_UP_45;
+        case 5: return diff >= C_DN_54;
+        default: return false;
+    }
+}
+
 int compute_heat_new_gear(const SystemState &s, uint32_t now) {
     float diff = s.room_c - s.heat_target_c;
     int gear = s.heat_gear;
@@ -124,6 +146,8 @@ int compute_heat_new_gear(const SystemState &s, uint32_t now) {
         bool off_long_enough = (s.off_since == 0) || (now - s.off_since >= s.mode_switch_off_ms);
         if (gear == -1 && !off_long_enough) {
             new_gear = -1;
+        } else if (s.user_input && gear >= 0 && gear_in_band_heat(gear, diff)) {
+            new_gear = gear;   // preserve stable hunting gear on user event
         } else {
             if (diff < H_UP_23)      new_gear = 3;
             else if (diff < H_UP_12) new_gear = 2;
@@ -174,6 +198,8 @@ int compute_cool_new_gear(const SystemState &s, uint32_t now) {
         bool off_long_enough = (s.off_since == 0) || (now - s.off_since >= s.mode_switch_off_ms);
         if (gear == -1 && !off_long_enough) {
             new_gear = -1;
+        } else if (s.user_input && gear >= 0 && gear_in_band_cool(gear, diff)) {
+            new_gear = gear;   // preserve stable hunting gear on user event
         } else {
             if (diff > C_UP_45)      new_gear = 5;
             else if (diff > C_UP_34) new_gear = 4;
@@ -590,6 +616,95 @@ void test_full_cycle() {
 }
 
 // ============================================================
+// TEST 9: user_input preserves stable hunting gear (Fix #1)
+// ============================================================
+//
+// Scenario from 2026-04-12: cool-mode hunting between gears 2 and 3, user
+// tweaks target_temp_low (an inactive endpoint in cool) while diff sits in
+// gear 1's band. Old behavior: any user_input recomputed from scratch and
+// with diff just below C_UP_01 fell through to new_gear = 0, wiping the
+// running gear. New behavior: gear_in_band_cool preserves the current gear.
+void test_user_input_preserves_gear_in_band() {
+    printf("\n=== Test 9: user_input preserves gear when diff stays in band ===\n");
+    SystemState s;
+    s.heat_cool_mode = true;
+    s.heat_target_c = f_to_c(66.0f);
+    s.cool_target_c = f_to_c(68.0f);
+    s.cool_gear = 1;
+    s.heat_gear = -1;
+    s.last_active_mode = MODE_COOL;
+    s.idle_since = 0;
+    s.boot_ready = true;
+
+    std::vector<IrTransmission> tx;
+    uint32_t now = 1000000;
+
+    // Room = 68.12°F → diff ≈ +0.067°C, safely inside gear 1's band [-0.1, 0.25].
+    s.room_c = f_to_c(68.12f);
+    s.user_input = true;
+    run_gear_controller(s, now, tx);
+    check(s.cool_gear == 1, "user event w/ diff in gear-1 band: gear 1 preserved (was 0 in old code)");
+
+    // Gear 2, same diff — gear 2 band is [0.10, 0.40], diff 0.067 NOT in band → should recompute.
+    SystemState s2 = s;
+    s2.cool_gear = 2;
+    s2.user_input = true;
+    run_gear_controller(s2, now, tx);
+    check(s2.cool_gear == 0, "user event w/ diff below gear-2 band: falls through to 0");
+
+    // Heat mirror: gear 1 heat, diff in band [-0.8, 0.3]. Room 66.2°F, target 66°F → diff ~0.11°C.
+    SystemState sh;
+    sh.heat_cool_mode = true;
+    sh.heat_target_c = f_to_c(66.0f);
+    sh.cool_target_c = f_to_c(75.0f);
+    sh.heat_gear = 1;
+    sh.cool_gear = -1;
+    sh.last_active_mode = MODE_HEAT;
+    sh.boot_ready = true;
+    sh.room_c = f_to_c(66.2f);
+    sh.user_input = true;
+    std::vector<IrTransmission> tx2;
+    run_gear_controller(sh, now, tx2);
+    check(sh.heat_gear == 1, "heat user event w/ diff in gear-1 band: gear 1 preserved");
+}
+
+// ============================================================
+// TEST 10: C_DN_21 asymmetric hysteresis (Fix #2)
+// ============================================================
+//
+// Scenario from 2026-04-12 17:16: gear 2 cooling, room dipped 0.03°C below
+// setpoint (diff = -0.03°C). Old C_DN_21 = 0.0 → gear 2→1 on this tiny dip,
+// gear 1 undersized, room overshot to 69.7°F triggering gear 4 cascade.
+// New C_DN_21 = -0.1 absorbs sub-0.1°C dips.
+void test_c_dn_21_hysteresis() {
+    printf("\n=== Test 10: C_DN_21 hysteresis absorbs sub-0.1°C dips ===\n");
+    SystemState s;
+    s.heat_cool_mode = true;
+    s.heat_target_c = f_to_c(66.0f);
+    s.cool_target_c = f_to_c(68.0f);
+    s.cool_gear = 2;
+    s.heat_gear = -1;
+    s.last_active_mode = MODE_COOL;
+    s.last_gear_change = 0;  // plenty of time-in-gear
+    s.boot_ready = true;
+
+    std::vector<IrTransmission> tx;
+    uint32_t now = 1000000;
+
+    // Room 67.94°F, target 68°F → diff ≈ -0.033°C. With old C_DN_21 = 0.0
+    // this would step down to gear 1. With new C_DN_21 = -0.1 it holds.
+    s.room_c = f_to_c(67.94f);
+    s.user_input = false;
+    run_gear_controller(s, now, tx);
+    check(s.cool_gear == 2, "gear 2 holds at diff=-0.03°C (new C_DN_21=-0.1 absorbs tiny dip)");
+
+    // Deeper dip — diff = -0.15°C, now below C_DN_21 = -0.1: downshift.
+    s.room_c = f_to_c(67.73f);  // ~-0.15°C below 68
+    run_gear_controller(s, now, tx);
+    check(s.cool_gear == 1, "gear 2 downshifts to 1 at diff=-0.15°C (past C_DN_21)");
+}
+
+// ============================================================
 
 int main() {
     printf("Mode Switch Virtual Test Suite\n");
@@ -603,6 +718,8 @@ int main() {
     test_deadband_after_off();
     test_temp_offset_parsing();
     test_full_cycle();
+    test_user_input_preserves_gear_in_band();
+    test_c_dn_21_hysteresis();
 
     printf("\n================================\n");
     printf("Results: %d/%d passed, %d failed\n",

@@ -340,17 +340,27 @@ void FurrionChillCube::setup() {
       // first controller run sees gear≥0 with active_ir_mode_=OFF and sends
       // a spurious MODE_ON IR command, waking the Furrion from idle.
       active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
+      // Also sync furrion_setpoint_c_ and current_cs_ to the restored target +
+      // gear 0 CS, so update_furrion_setpoint_() and the gear-0 CS check on
+      // first run don't detect a bogus mismatch (default 22 vs. actual) and
+      // transmit a spurious MODE_ON / CS frame to a physically-off Furrion.
+      furrion_setpoint_c_ = compute_setpoint_c_(true);
+      current_cs_ = compute_gear_cs_(true, 0);
       last_active_mode_ = MODE_HEAT;
       boot_ready_ = true;          // restored state is valid — skip imm_off
       idle_since_ = millis();       // 10-min lockout before mode switch allowed
-      ESP_LOGI(TAG, "Restored prior mode: HEAT (gear → idle, skip kickstart)");
+      ESP_LOGI(TAG, "Restored prior mode: HEAT (gear → idle, skip kickstart, sp=%d°C cs=%d)",
+               furrion_setpoint_c_, current_cs_);
     } else if (saved_mode == 2) {
       cool_gear_ = 0;
       active_ir_mode_ = climate::CLIMATE_MODE_COOL;
+      furrion_setpoint_c_ = compute_setpoint_c_(false);
+      current_cs_ = compute_gear_cs_(false, 0);
       last_active_mode_ = MODE_COOL;
       boot_ready_ = true;          // restored state is valid — skip imm_off
       idle_since_ = millis();       // 10-min lockout before mode switch allowed
-      ESP_LOGI(TAG, "Restored prior mode: COOL (gear → idle, skip kickstart)");
+      ESP_LOGI(TAG, "Restored prior mode: COOL (gear → idle, skip kickstart, sp=%d°C cs=%d)",
+               furrion_setpoint_c_, current_cs_);
     }
   }
 

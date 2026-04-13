@@ -840,8 +840,22 @@ void FurrionChillCube::end_kickstart_(uint32_t now) {
     transmit_mode_command_();
   }
 
-  ESP_LOGI(TAG, "Kickstart released: cs=%d mode_resent=%d", current_cs_,
-           active_ir_mode_ != climate::CLIMATE_MODE_OFF);
+  // Reset keep-alive window so the next pulse fires 5 min from kickstart-end,
+  // not immediately. The clamped kickstart lasts 5:30 (>KEEPALIVE_INTERVAL_MS),
+  // which leaves keepalive_last_ stale by end-of-clamp — without this reset,
+  // step 4 in loop() fires a keep-alive pulse on the same iteration that
+  // released the clamp. The pulse's step2 CS (anchor±1 = gear 3 CS for heat,
+  // gear 3+ CS for cool) over-stimulates the compressor harder than the clamp
+  // did, undoing the careful ramp-up.
+  bool keepalive_eligible = is_heat ? (heat_gear_ == 1)
+                                    : (cool_gear_ >= 1 && cool_gear_ <= 2);
+  if (keepalive_eligible) {
+    keepalive_last_ = now;
+  }
+
+  ESP_LOGI(TAG, "Kickstart released: cs=%d mode_resent=%d ka_reset=%d",
+           current_cs_, active_ir_mode_ != climate::CLIMATE_MODE_OFF,
+           keepalive_eligible);
 }
 
 // ============================================================

@@ -431,7 +431,7 @@ void FurrionChillCube::loop() {
   }
 
   // 4. Keep-alive trigger for low-CS gears (cool 1-2, heat 1)
-  if (!kickstart_active_() && keepalive_phase_ == KeepAlivePhase::IDLE &&
+  if (keepalive_enable_ && !kickstart_active_() && keepalive_phase_ == KeepAlivePhase::IDLE &&
       boot_ready_ && !failsafe_active_) {
     bool cool_eligible = (cool_gear_ >= 1 && cool_gear_ <= 2 &&
                           active_ir_mode_ == climate::CLIMATE_MODE_COOL);

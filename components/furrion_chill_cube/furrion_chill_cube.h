@@ -29,6 +29,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_mode_switch_event_min(int min);
   void set_mode_switch_temp_offset(float offset_c);
   void set_mode_switch_off_min(int min);
+  void set_keepalive_enable(bool enable) { keepalive_enable_ = enable; }
 
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
@@ -186,6 +187,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool quick_kick_reinforced_{false}; // one-shot guard for 5s reinforce
 
   // Keep-alive
+  bool keepalive_enable_{true};      // configurable via YAML; disables pulse trigger
   KeepAlivePhase keepalive_phase_{KeepAlivePhase::IDLE};
   uint32_t keepalive_phase_start_{0};
   uint32_t keepalive_last_{0};       // last completion (or gear entered eligible range)

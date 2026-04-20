@@ -36,6 +36,7 @@ CONF_MODE_SWITCH_IDLE_MIN = "mode_switch_idle_min"
 CONF_MODE_SWITCH_EVENT_MIN = "mode_switch_event_min"
 CONF_MODE_SWITCH_TEMP_OFFSET = "mode_switch_temp_offset"
 CONF_MODE_SWITCH_OFF_MIN = "mode_switch_off_min"
+CONF_KEEPALIVE_ENABLE = "keepalive_enable"
 
 
 def validate_mode_switch_temp_offset(value):
@@ -158,6 +159,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_MODE_SWITCH_TEMP_OFFSET, default="1F"): validate_mode_switch_temp_offset,
             # Minimum minutes at -1 before re-engagement (hardware wind-down, no bypass)
             cv.Optional(CONF_MODE_SWITCH_OFF_MIN, default=1): cv.int_range(min=1, max=10),
+            # Keep-alive pulse: periodic CS bump to sustain compressor at low gears.
+            # Disable if the bump causes unwanted compressor spikes.
+            cv.Optional(CONF_KEEPALIVE_ENABLE, default=True): cv.boolean,
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -245,6 +249,7 @@ async def to_code(config):
     cg.add(var.set_mode_switch_event_min(config[CONF_MODE_SWITCH_EVENT_MIN]))
     cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
     cg.add(var.set_mode_switch_off_min(config[CONF_MODE_SWITCH_OFF_MIN]))
+    cg.add(var.set_keepalive_enable(config[CONF_KEEPALIVE_ENABLE]))
 
     # Diagnostic sensors
     for key, setter in [

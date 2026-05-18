@@ -82,11 +82,19 @@ static const float H_IDLE  =  0.3f;   // 0->-1 threshold
 static const float C_UP_01 =  0.15f;
 static const float C_UP_12 =  0.25f;
 static const float C_UP_23 =  0.4f;
-static const float C_UP_34 =  0.6f;
-static const float C_UP_45 =  0.8f;
+// C_UP_34 / C_DN_32 / C_DN_43 widened on 2026-05-18 to break a 2↔4 hunt
+// observed on the production unit. Old (0.60/0.10/0.25) let gear 3 act only
+// as a transient: HOLD_MS[4]=5min forced 3→4 once diff cleared 0.60, and
+// post-step-down thermal carry from gear 4 dragged diff straight through
+// gear 3's 0.15°C window into gear 2. New values give gear 3 a 0.90°C
+// hysteresis window and step gear 4 down ~0.15°C earlier so residual cool
+// lands inside gear 3's range instead of below it. Power swings ~3A↔11A
+// → expected to settle near gear 3 (~7A) with brief 2/4 excursions only.
+static const float C_UP_34 =  0.85f;
+static const float C_UP_45 =  1.0f;   // bumped from 0.80 to preserve up-ladder monotonicity
 static const float C_DN_54 =  0.45f;
-static const float C_DN_43 =  0.25f;
-static const float C_DN_32 =  0.10f;
+static const float C_DN_43 =  0.40f;
+static const float C_DN_32 = -0.05f;
 // C_DN_21 sits below setpoint so a sub-0.1°C dip below setpoint doesn't
 // collapse gear 2 → gear 1. Matches the asymmetry of C_DN_10 = -0.15.
 static const float C_DN_21 = -0.1f;

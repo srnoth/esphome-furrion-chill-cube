@@ -30,9 +30,24 @@ static const uint8_t TEMP_C_TABLE[] = {
     0x10, 0x00, 0x01, 0x03, 0x02, 0x06, 0x07, 0x05,
     0x04, 0x0C, 0x0D, 0x09, 0x08, 0x0A, 0x0B};
 
+// RAC-PT1411HWRU Fahrenheit table (index 0=60°F, 26=86°F)
+// Same flag bits as the C table. Source: esphome PR #14666
+// (esphome/components/toshiba/toshiba.cpp RAC_PT1411HWRU_TEMPERATURE_F).
+// In F-mode, message[9] also gets bit 0x01 (FLAG_FAH) set so the unit's
+// panel displays in °F.
+static const uint8_t TEMP_F_TABLE[] = {
+    0x10, 0x30, 0x00, 0x20, 0x01, 0x21, 0x03, 0x23, 0x02,
+    0x22, 0x06, 0x26, 0x07, 0x05, 0x25, 0x04, 0x24, 0x0C,
+    0x2C, 0x0D, 0x2D, 0x09, 0x08, 0x28, 0x0A, 0x2A, 0x0B};
+
 // Celsius setpoint range (Furrion accepts 16-30°C)
 static const int FURRION_MIN_TEMP_C = 16;
 static const int FURRION_MAX_TEMP_C = 30;
+
+// Fahrenheit setpoint range (Toshiba F-protocol bounds, 60-86°F).
+// Approximately equivalent to the C range; F resolution is 1°F.
+static const int FURRION_MIN_TEMP_F = 60;
+static const int FURRION_MAX_TEMP_F = 86;
 
 // Gear controller constants — no fixed anchors; setpoint is dynamic
 
@@ -153,10 +168,23 @@ void FurrionChillCube::transmit_mode_command_() {
   message[0] = 0xB2;
   message[1] = ~message[0];
 
-  // Temperature code (dynamic Celsius setpoint → Gray code lookup)
+  // Temperature code (dynamic setpoint → Gray code lookup).
+  // F-mode encodes the user's precise °F target (1°F resolution, ranges
+  // 60–86°F). C-mode encodes furrion_setpoint_c_ (the °C-rounded HA target,
+  // ranges 16–30°C). Gear-CS math elsewhere always uses furrion_setpoint_c_
+  // regardless of which path runs here — the only difference is what gets
+  // shown on the unit's panel and which protocol the byte rides on.
   uint8_t temp_code;
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
-    temp_code = 0x0E;  // OFF special value
+    temp_code = 0x0E;  // OFF special value (same for both protocols)
+  } else if (use_fahrenheit_) {
+    float target_c = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT)
+                       ? get_heat_target_()
+                       : get_cool_target_();
+    if (isnan(target_c)) target_c = 22.0f;  // safe default (~72°F)
+    int target_f = (int)roundf(target_c * 1.8f + 32.0f);
+    target_f = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, target_f));
+    temp_code = TEMP_F_TABLE[target_f - FURRION_MIN_TEMP_F];
   } else {
     int temp_c = std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, furrion_setpoint_c_));
     temp_code = TEMP_C_TABLE[temp_c - FURRION_MIN_TEMP_C];
@@ -210,7 +238,7 @@ void FurrionChillCube::transmit_mode_command_() {
     // message[7] already set (fan code2)
     if (temp_code & 0x20) message[8] |= 0x20;  // FRAC flag
     if (temp_code & 0x10) message[9] |= 0x10;  // NEG flag
-    // FAH flag NOT set — Celsius mode
+    if (use_fahrenheit_) message[9] |= 0x01;   // FAH flag — F-mode display
     message[10] = 0x00;
     message[11] = 0;
     for (int i = 6; i <= 10; i++) message[11] += message[i];

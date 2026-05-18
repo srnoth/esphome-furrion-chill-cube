@@ -37,6 +37,7 @@ CONF_MODE_SWITCH_EVENT_MIN = "mode_switch_event_min"
 CONF_MODE_SWITCH_TEMP_OFFSET = "mode_switch_temp_offset"
 CONF_MODE_SWITCH_OFF_MIN = "mode_switch_off_min"
 CONF_KEEPALIVE_ENABLE = "keepalive_enable"
+CONF_USE_FAHRENHEIT = "use_fahrenheit"
 
 
 def validate_mode_switch_temp_offset(value):
@@ -162,6 +163,17 @@ CONFIG_SCHEMA = cv.All(
             # Keep-alive pulse: periodic CS bump to sustain compressor at low gears.
             # Disable if the bump causes unwanted compressor spikes.
             cv.Optional(CONF_KEEPALIVE_ENABLE, default=True): cv.boolean,
+            # Target temperature encoding sent to the unit via Toshiba IR.
+            # true (default) = Fahrenheit (RAC-PT1411HWRU F-protocol, 60-86°F,
+            #   FAH flag set, unit panel displays °F).
+            # false          = Celsius (RAC-PT1411HWRU C-protocol, 16-30°C,
+            #   unit panel displays °C).
+            # NOTE: This only affects the on-the-wire target byte and what the
+            # unit's own display shows — gear-CS math is unchanged because it
+            # anchors on the °C-rounded HA target (furrion_setpoint_c_), which
+            # tracks the unit's internal target regardless of the F/C protocol
+            # used to transmit it.
+            cv.Optional(CONF_USE_FAHRENHEIT, default=True): cv.boolean,
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -250,6 +262,7 @@ async def to_code(config):
     cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
     cg.add(var.set_mode_switch_off_min(config[CONF_MODE_SWITCH_OFF_MIN]))
     cg.add(var.set_keepalive_enable(config[CONF_KEEPALIVE_ENABLE]))
+    cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
 
     # Diagnostic sensors
     for key, setter in [

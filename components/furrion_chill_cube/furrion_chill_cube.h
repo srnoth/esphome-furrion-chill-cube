@@ -30,6 +30,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_mode_switch_temp_offset(float offset_c);
   void set_mode_switch_off_min(int min);
   void set_keepalive_enable(bool enable) { keepalive_enable_ = enable; }
+  void set_use_fahrenheit(bool enable) { use_fahrenheit_ = enable; }
 
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
@@ -185,6 +186,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   int quick_kick_cs_{0};              // kickstart CS to hold for 10s
   bool quick_kick_is_heat_{false};
   bool quick_kick_reinforced_{false}; // one-shot guard for 5s reinforce
+
+  // Target encoding (F vs C) — configurable via YAML, default Fahrenheit.
+  // Selects whether transmit_mode_command_() encodes the target temperature
+  // byte using the Toshiba RAC-PT1411HWRU F-protocol (60–86 °F) or
+  // C-protocol (16–30 °C). Does NOT affect gear-CS math, which still
+  // anchors on furrion_setpoint_c_ (the °C-rounded HA target).
+  bool use_fahrenheit_{true};
 
   // Keep-alive
   bool keepalive_enable_{true};      // configurable via YAML; disables pulse trigger

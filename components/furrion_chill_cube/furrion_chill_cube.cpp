@@ -287,6 +287,11 @@ void FurrionChillCube::transmit_mode_command_() {
 
 void FurrionChillCube::transmit_cs_update_(bool send_data) {
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) return;
+  // NaN inside_temp_c_ → no authoritative anchor for the gear-CS demand
+  // signal. Covers both initial-boot (current_cs_ is the stale setup() pre-load)
+  // and HA-disconnect (unit's own ~7-min CS-mode timeout falls back to its
+  // internal sensor — the documented graceful-degradation path).
+  if (isnan(inside_temp_c_)) return;
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
@@ -674,9 +679,11 @@ float FurrionChillCube::get_cool_target_() {
 // Used on user_input events to avoid collapsing a stable hunting gear when
 // the user change doesn't actually move the room out of the current gear's band.
 bool FurrionChillCube::gear_in_band_heat_(int gear, float diff) {
+  // Gear N stays in (H_UP_N(N+1), H_DN_N(N-1)) — its own transition thresholds.
+  // (For heat, diff is negative when cold, so H_UP_* are the lower bounds.)
   switch (gear) {
-    case 0: return diff >= H_UP_01 && diff <= H_DN_10;      // (-0.3, 0.3)
-    case 1: return diff >= H_UP_12 && diff <= H_DN_10;      // (-0.8, 0.3)
+    case 0: return diff >= H_UP_01 && diff <= H_IDLE;       // (-0.3, 0.3)
+    case 1: return diff >= H_UP_12 && diff <= H_DN_10;      // (-0.8, -0.15)
     case 2: return diff >= H_UP_23 && diff <= H_DN_21;      // (-1.5, -0.3)
     case 3: return diff <= H_DN_32;                          // max heat, no lower bound
     default: return false;
@@ -684,12 +691,13 @@ bool FurrionChillCube::gear_in_band_heat_(int gear, float diff) {
 }
 
 bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
+  // Gear N stays in (C_DN_N(N-1), C_UP_N(N+1)) — its own transition thresholds.
   switch (gear) {
-    case 0: return diff >= C_DN_10 && diff <= C_UP_01;      // (-0.15, 0.15)
-    case 1: return diff >= C_DN_21 && diff <= C_UP_12;      // (-0.1, 0.25)
-    case 2: return diff >= C_DN_32 && diff <= C_UP_23;      // (0.10, 0.40)
-    case 3: return diff >= C_DN_43 && diff <= C_UP_34;      // (0.25, 0.60)
-    case 4: return diff >= C_DN_54 && diff <= C_UP_45;      // (0.45, 0.80)
+    case 0: return diff >= C_IDLE  && diff <= C_UP_01;      // (-0.15, 0.15)
+    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // (-0.15, 0.25)
+    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // (-0.10, 0.40)
+    case 3: return diff >= C_DN_32 && diff <= C_UP_34;      // (-0.05, 0.85)
+    case 4: return diff >= C_DN_43 && diff <= C_UP_45;      // (0.40, 1.00)
     case 5: return diff >= C_DN_54;                          // max cool, no upper bound
     default: return false;
   }
@@ -1202,7 +1210,15 @@ void FurrionChillCube::run_gear_controller_() {
     } else {
       switch (gear) {
         case 0: {
-          if (can_upshift_to(1) && diff < H_UP_01) new_gear = 1;
+          // First compute post-restore: skip the 0→1→2→3 HOLD_MS ladder
+          // (~6 min) and jump straight to the correct gear.
+          if (last_gear_change_ == 0) {
+            if (diff < H_UP_23)         new_gear = 3;
+            else if (diff < H_UP_12)    new_gear = 2;
+            else if (diff < H_UP_01)    new_gear = 1;
+          } else {
+            if (can_upshift_to(1) && diff < H_UP_01) new_gear = 1;
+          }
           // 0→-1 gate (natural path only — user_input handled in fresh-start above)
           bool imm_off = !boot_ready_;
           bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
@@ -1338,7 +1354,17 @@ void FurrionChillCube::run_gear_controller_() {
     } else {
       switch (gear) {
         case 0: {
-          if (can_upshift_to(1) && diff > C_UP_01) new_gear = 1;
+          // First compute post-restore: skip the 0→1→2→3 HOLD_MS ladder
+          // (~6 min) and jump straight to the correct gear.
+          if (last_gear_change_ == 0) {
+            if (diff > C_UP_45)         new_gear = 5;
+            else if (diff > C_UP_34)    new_gear = 4;
+            else if (diff > C_UP_23)    new_gear = 3;
+            else if (diff > C_UP_12)    new_gear = 2;
+            else if (diff > C_UP_01)    new_gear = 1;
+          } else {
+            if (can_upshift_to(1) && diff > C_UP_01) new_gear = 1;
+          }
           // 0→-1 gate (natural path only — user_input handled in fresh-start above)
           bool imm_off = !boot_ready_;
           bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
@@ -1419,8 +1445,7 @@ void FurrionChillCube::run_gear_controller_() {
       } else if (gear == -1 && new_gear == 3) {
         // OFF→gear 3: quick kickstart (CS=gear4 for 10s, then gear 3)
         last_mode_event_at_ = now;
-        int kick_cs = compute_gear_cs_(false, 4);  // gear 4 CS (includes boundary offset)
-        start_quick_kickstart_(false, kick_cs, now);
+        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now);
       } else if (gear == -1 && new_gear >= 4) {
         // OFF→gear 4+: direct, no kickstart
         last_mode_event_at_ = now;
@@ -1428,9 +1453,11 @@ void FurrionChillCube::run_gear_controller_() {
           set_cs_value_(cs, now);
         }
       } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
-        // Idle→gear 1-2: quick kickstart (CS=setpoint for 10s).
-        // furrion_setpoint_c_ is already clamped to 16-30 by compute_setpoint_c_.
-        start_quick_kickstart_(false, furrion_setpoint_c_, now);
+        // Idle→gear 1-2: quick kickstart at gear-4 CS (setpoint+1°C demand).
+        // CS=setpoint alone reads as "no demand" and won't reliably wake a
+        // unit that's in restart hysteresis from the prior CS=15 stop signal;
+        // setpoint+1°C cleared hysteresis empirically (2026-05-18 trace).
+        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now);
       } else if (!kickstart_active_() && current_cs_ != cs) {
         set_cs_value_(cs, now);
       }

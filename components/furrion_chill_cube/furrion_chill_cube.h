@@ -79,14 +79,15 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Kickstart system
   // Clamped kickstart: OFF→low gear, fan=LOW for 5:30, gear controller runs but CS overridden
-  // Quick kickstart: borderline restart, CS override for 10s, no fan clamp
+  // Quick kickstart: borderline restart, CS override for a per-call hold window
+  //   (QUICK_KICK_HOLD_MS for OFF→gear-3, IDLE_KICK_HOLD_MS for idle→gear-1/2), no fan clamp
   enum class ClampPhase : uint8_t {
     IDLE,
     PRE_CS,     // 500ms: kickstart CS pre-set before mode-on
     CLAMPED,    // 5:30: fan=LOW, kickstart CS retransmitted, gear controller monitored
   };
   void start_clamped_kickstart_(bool is_heat, uint32_t now);
-  void start_quick_kickstart_(bool is_heat, int kickstart_cs, uint32_t now);
+  void start_quick_kickstart_(bool is_heat, int kickstart_cs, uint32_t now, uint32_t hold_ms);
   void advance_kickstart_(uint32_t now);
   void end_kickstart_(uint32_t now);
   bool kickstart_active_() { return clamp_phase_ != ClampPhase::IDLE || quick_kick_active_; }
@@ -180,10 +181,11 @@ class FurrionChillCube : public climate::Climate, public Component {
   int clamp_kickstart_cs_{0};         // CS to hold during clamp
   bool clamp_is_heat_{false};         // which mode the clamp is for
 
-  // Quick kickstart (borderline restart: CS override for 10s, no fan clamp)
+  // Quick kickstart (borderline restart: CS override for quick_kick_hold_ms_, no fan clamp)
   bool quick_kick_active_{false};
   uint32_t quick_kick_start_{0};
-  int quick_kick_cs_{0};              // kickstart CS to hold for 10s
+  int quick_kick_cs_{0};              // kickstart CS to hold
+  uint32_t quick_kick_hold_ms_{10000}; // hold window; set per-call by start_quick_kickstart_
   bool quick_kick_is_heat_{false};
   bool quick_kick_reinforced_{false}; // one-shot guard for 5s reinforce
 

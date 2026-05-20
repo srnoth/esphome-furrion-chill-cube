@@ -57,6 +57,14 @@ static const int FURRION_MAX_TEMP_F = 86;
 //                        0      1       2       3        4        5
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
 static const uint32_t CLAMP_DURATION_MS = 305000;  // 5 min 5s (matches unit's internal 5-min enforced startup)
+// Quick-kickstart hold windows (ms). OFF→gear-3 needs only a brief CS kick because
+// start_quick_kickstart_ also sends a MODE-ON command from OFF, which does the heavy
+// lifting of waking the compressor. The idle→gear-1/2 path is CS-only (unit already in
+// COOL mode — no MODE-ON), so its kickstart CS must stay asserted long enough to outlast
+// the compressor's anti-short-cycle restart lockout (~3 min). See session_log 2026-05-20:
+// a 10s idle kick fired inside the lockout shadow and had zero effect (unit dead ~11 min).
+static const uint32_t QUICK_KICK_HOLD_MS = 10000;  // OFF→gear-3
+static const uint32_t IDLE_KICK_HOLD_MS = 90000;   // idle→gear-1/2
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
 static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
@@ -95,10 +103,16 @@ static const float C_UP_45 =  1.0f;   // bumped from 0.80 to preserve up-ladder 
 static const float C_DN_54 =  0.45f;
 static const float C_DN_43 =  0.40f;
 static const float C_DN_32 = -0.05f;
-// C_DN_21 sits below setpoint so a sub-0.1°C dip below setpoint doesn't
-// collapse gear 2 → gear 1. Matches the asymmetry of C_DN_10 = -0.15.
+// C_DN_21 sits just below setpoint so a sub-0.1°C dip doesn't collapse gear 2 → gear 1.
 static const float C_DN_21 = -0.1f;
-static const float C_DN_10 = -0.15f;
+// C_DN_10 is a deliberately deep gear-1 floor (room ~0.9°F below setpoint). Gear 1 is the
+// "catch" that absorbs a normal post-gear-3 overshoot: at ~3A it keeps the compressor
+// running instead of collapsing to a full stop (no restart needed). On 2026-05-20 the old
+// -0.15 let a trivial 0.31°F undershoot fall straight through gears 1 and 0 into idle —
+// the downshift ladder has no hold-time — forcing an unreliable cold restart. -0.5 keeps
+// gear 1 sticky; gear 1→0 now means the room is genuinely ~0.9°F cold (a real low-load
+// idle), not a transient. Down-ladder stays monotonic: 0.45 / 0.40 / -0.05 / -0.10 / -0.50.
+static const float C_DN_10 = -0.5f;
 static const float C_IDLE  = -0.15f;
 
 // Mode-switching protection lives in the 0→-1 gate and -1→active gate
@@ -694,7 +708,7 @@ bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
   // Gear N stays in (C_DN_N(N-1), C_UP_N(N+1)) — its own transition thresholds.
   switch (gear) {
     case 0: return diff >= C_IDLE  && diff <= C_UP_01;      // (-0.15, 0.15)
-    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // (-0.15, 0.25)
+    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // (-0.5, 0.25)
     case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // (-0.10, 0.40)
     case 3: return diff >= C_DN_32 && diff <= C_UP_34;      // (-0.05, 0.85)
     case 4: return diff >= C_DN_43 && diff <= C_UP_45;      // (0.40, 1.00)
@@ -828,12 +842,13 @@ void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
   ESP_LOGI(TAG, "Clamped kickstart: PRE_CS %s cs=%d", is_heat ? "HEAT" : "COOL", clamp_kickstart_cs_);
 }
 
-void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, uint32_t now) {
+void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, uint32_t now, uint32_t hold_ms) {
   // Defensive: clear any prior clamped kickstart state
   clamp_phase_ = ClampPhase::IDLE;
   quick_kick_active_ = true;
   quick_kick_start_ = now;
   quick_kick_cs_ = kickstart_cs;
+  quick_kick_hold_ms_ = hold_ms;
   quick_kick_is_heat_ = is_heat;
   quick_kick_reinforced_ = false;
 
@@ -851,7 +866,8 @@ void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, ui
     transmit_mode_command_();
   }
 
-  ESP_LOGI(TAG, "Quick kickstart: %s cs=%d", is_heat ? "HEAT" : "COOL", quick_kick_cs_);
+  ESP_LOGI(TAG, "Quick kickstart: %s cs=%d hold=%lus", is_heat ? "HEAT" : "COOL",
+           quick_kick_cs_, (unsigned long) (hold_ms / 1000));
 }
 
 void FurrionChillCube::advance_kickstart_(uint32_t now) {
@@ -891,15 +907,16 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
   if (quick_kick_active_) {
     uint32_t elapsed = now - quick_kick_start_;
     if (elapsed >= 5000 && !quick_kick_reinforced_) {
-      // 5s: reinforce kickstart CS (one-shot)
+      // 5s: reinforce kickstart CS (one-shot). Past this, the 30s CS heartbeat keeps
+      // re-asserting quick_kick_cs_, so the CS stays continuously asserted for long holds.
       quick_kick_reinforced_ = true;
       transmit_cs_update_(true);
       last_cs_heartbeat_ = now;
       ESP_LOGI(TAG, "Quick kickstart: reinforce cs=%d", quick_kick_cs_);
     }
-    if (elapsed >= 10000) {
-      // 10s: release — transmit current gear's CS
-      ESP_LOGI(TAG, "Quick kickstart: ended — 10s");
+    if (elapsed >= quick_kick_hold_ms_) {
+      // hold window elapsed: release — transmit current gear's CS
+      ESP_LOGI(TAG, "Quick kickstart: ended — %lus", (unsigned long) (quick_kick_hold_ms_ / 1000));
       end_kickstart_(now);
     }
   }
@@ -1443,9 +1460,11 @@ void FurrionChillCube::run_gear_controller_() {
         last_mode_event_at_ = now;
         start_clamped_kickstart_(false, now);
       } else if (gear == -1 && new_gear == 3) {
-        // OFF→gear 3: quick kickstart (CS=gear4 for 10s, then gear 3)
+        // OFF→gear 3: quick kickstart (CS=gear4 briefly, then gear 3). A short hold is
+        // sufficient here — start_quick_kickstart_ also sends a MODE-ON command from OFF,
+        // which does the heavy lifting of waking the compressor.
         last_mode_event_at_ = now;
-        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now);
+        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, QUICK_KICK_HOLD_MS);
       } else if (gear == -1 && new_gear >= 4) {
         // OFF→gear 4+: direct, no kickstart
         last_mode_event_at_ = now;
@@ -1453,11 +1472,15 @@ void FurrionChillCube::run_gear_controller_() {
           set_cs_value_(cs, now);
         }
       } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
-        // Idle→gear 1-2: quick kickstart at gear-4 CS (setpoint+1°C demand).
-        // CS=setpoint alone reads as "no demand" and won't reliably wake a
-        // unit that's in restart hysteresis from the prior CS=15 stop signal;
-        // setpoint+1°C cleared hysteresis empirically (2026-05-18 trace).
-        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now);
+        // Idle→gear 1-2: quick kickstart at gear-4 CS (setpoint+1°C demand), held for
+        // IDLE_KICK_HOLD_MS (90s). This path is CS-only — the unit is already in COOL
+        // mode, so there is NO MODE-ON command behind it. A 10s hold failed on
+        // 2026-05-20: the CS=21 pulse fired inside the compressor's anti-short-cycle
+        // restart lockout and was gone before the lockout cleared, leaving the unit
+        // stopped ~11 min. The 90s hold keeps CS=21 asserted across that lockout.
+        // gear-4 CS (anchor+1) is the documented restart threshold; gear-3 CS (anchor)
+        // is sustain-only — see session_log 2026-05-20.
+        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, IDLE_KICK_HOLD_MS);
       } else if (!kickstart_active_() && current_cs_ != cs) {
         set_cs_value_(cs, now);
       }

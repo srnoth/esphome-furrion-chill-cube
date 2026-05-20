@@ -154,6 +154,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   ActiveMode last_active_mode_{MODE_NONE};
   int current_cs_{22};
   int furrion_setpoint_c_{22}; // Dynamic Furrion setpoint in °C (16-30)
+  int last_tx_target_f_{0};   // Last °F target byte actually transmitted (F-protocol);
+                              // lets update_furrion_setpoint_() catch sub-°C changes
   climate::ClimateMode active_ir_mode_{climate::CLIMATE_MODE_OFF};
 
   // Timing (all uint32_t for millis())

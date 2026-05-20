@@ -207,6 +207,7 @@ void FurrionChillCube::transmit_mode_command_() {
     int target_f = (int)roundf(target_c * 1.8f + 32.0f);
     target_f = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, target_f));
     temp_code = TEMP_F_TABLE[target_f - FURRION_MIN_TEMP_F];
+    last_tx_target_f_ = target_f;  // record the °F target actually put on the wire
   } else {
     int temp_c = std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, furrion_setpoint_c_));
     temp_code = TEMP_C_TABLE[temp_c - FURRION_MIN_TEMP_C];
@@ -726,14 +727,29 @@ int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
 
 void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
   int new_sp = compute_setpoint_c_(is_heat);
-  if (new_sp != furrion_setpoint_c_) {
+  bool sp_changed = (new_sp != furrion_setpoint_c_);
+  if (sp_changed) {
     ESP_LOGI(TAG, "Furrion setpoint %d°C → %d°C (%s)",
              furrion_setpoint_c_, new_sp, is_heat ? "heat" : "cool");
     furrion_setpoint_c_ = new_sp;
-    // Retransmit mode command so unit gets the new setpoint
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
-      transmit_mode_command_();
+  }
+  // F-protocol carries 1°F resolution: the whole-°C setpoint above can be
+  // unchanged while the user's target moved (e.g. 73°F→74°F both round to
+  // 23°C). Detect a change in the °F byte transmit_mode_command_() would emit
+  // so the unit's panel display stays in sync with the HA target.
+  bool f_changed = false;
+  if (use_fahrenheit_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    float target_c = is_heat ? get_heat_target_() : get_cool_target_();
+    if (!isnan(target_c)) {
+      int target_f = (int) roundf(target_c * 1.8f + 32.0f);
+      target_f = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, target_f));
+      f_changed = (target_f != last_tx_target_f_);
     }
+  }
+  // Retransmit mode command so the unit gets the new setpoint / panel target.
+  if ((sp_changed || f_changed) &&
+      active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
+    transmit_mode_command_();
   }
 }
 

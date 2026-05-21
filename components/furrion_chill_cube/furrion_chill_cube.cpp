@@ -181,6 +181,15 @@ void FurrionChillCube::encode_(remote_base::RemoteTransmitData *data,
 // ============================================================
 
 void FurrionChillCube::transmit_mode_command_() {
+  // Don't broadcast a mode/setpoint command for an active mode without a valid
+  // setpoint — incomplete info. The OFF command carries no setpoint and is
+  // always allowed. A transient gap is harmless (the unit coasts); a gap longer
+  // than the unit's ~7-min CS-mode timeout hands control back to its internal
+  // controller. See project_failover_invariant.
+  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && isnan(get_active_ir_target_())) {
+    return;
+  }
+
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
 
@@ -200,10 +209,9 @@ void FurrionChillCube::transmit_mode_command_() {
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
     temp_code = 0x0E;  // OFF special value (same for both protocols)
   } else if (use_fahrenheit_) {
-    float target_c = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT)
-                       ? get_heat_target_()
-                       : get_cool_target_();
-    if (isnan(target_c)) target_c = 22.0f;  // safe default (~72°F)
+    // target_c is guaranteed non-NaN — the gate at the top of this function
+    // returns early for an active mode without a valid setpoint.
+    float target_c = get_active_ir_target_();
     int target_f = (int)roundf(target_c * 1.8f + 32.0f);
     target_f = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, target_f));
     temp_code = TEMP_F_TABLE[target_f - FURRION_MIN_TEMP_F];
@@ -293,20 +301,16 @@ void FurrionChillCube::transmit_mode_command_() {
 
   ESP_LOGD(TAG, "IR mode=%d fan=%d swing=%d",
            (int)active_ir_mode_, (int)fan, (int)this->swing_mode);
-
-  // === Transmission 3: CS follow-up (BA) — separate transmit object ===
-  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !failsafe_active_) {
-    this->transmit_cs_update_(false);
-  }
 }
 
-void FurrionChillCube::transmit_cs_update_(bool send_data) {
+void FurrionChillCube::transmit_cs_update_() {
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) return;
-  // NaN inside_temp_c_ → no authoritative anchor for the gear-CS demand
-  // signal. Covers both initial-boot (current_cs_ is the stale setup() pre-load)
-  // and HA-disconnect (unit's own ~7-min CS-mode timeout falls back to its
-  // internal sensor — the documented graceful-degradation path).
+  // Don't broadcast a CS demand on incomplete info: the gear-CS signal needs
+  // both a valid inside temperature and a valid setpoint. On a transient gap
+  // the unit just coasts; on a gap longer than its ~7-min CS-mode timeout it
+  // hands control back to its internal sensor. See project_failover_invariant.
   if (isnan(inside_temp_c_)) return;
+  if (isnan(get_active_ir_target_())) return;
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
@@ -322,12 +326,10 @@ void FurrionChillCube::transmit_cs_update_(bool send_data) {
   // or CS=35 (setpoint 30°C heat); both are transmitted unmodified.
   message[2] = (uint8_t)current_cs_;
 
-  // Feature flags
-  if (send_data) {
-    message[2] |= 0xC0;  // CS_ENABLED + CS_DATA
-  } else {
-    message[2] |= 0x40;  // CS_ENABLED only
-  }
+  // Feature flags: always CS_ENABLED + CS_DATA. The value-bearing frame is the
+  // only CS packet the unit acts on — a CS_DATA-clear frame is inert — and it
+  // implicitly keeps the unit in Comfort Sense mode. No separate "enable" frame.
+  message[2] |= 0xC0;  // CS_ENABLED + CS_DATA
   message[3] = ~message[2];
 
   // Mode footer
@@ -346,6 +348,25 @@ void FurrionChillCube::transmit_cs_update_(bool send_data) {
 
   this->encode_(data, message, 6, 1);
   transmit.perform();
+}
+
+// Bracket a mode/setpoint command with real CS_DATA frames so the unit is never
+// left holding a stale CS against a new setpoint. On a running setpoint change
+// the pre-CS makes the change atomic; on OFF→ON the pre-CS is transmitted but
+// ignored by the unit (a CS before mode-on has no effect) — the post-CS is the
+// one that matters there. transmit_cs_update_() no-ops only while active_ir_mode_
+// is OFF.
+void FurrionChillCube::transmit_mode_with_cs_() {
+  // Deliberately NOT gated on boot_ready_: the OFF→ON mode command must still go
+  // out on the first gear-controller pass, and boot_ready_ is not set until the
+  // end of that pass. transmit_cs_update_() has its own isnan(inside_temp_c_)
+  // gate against a boot-time CS leak, so a boot_ready_ gate here would be both
+  // unnecessary and harmful — it would silently drop the first mode-on.
+  if (failsafe_active_) return;  // no IR during failsafe — unit runs on its own sensor
+  transmit_cs_update_();
+  transmit_mode_command_();
+  transmit_cs_update_();
+  last_cs_heartbeat_ = millis();  // a CS just went out — restart the 30s heartbeat clock
 }
 
 void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg) {
@@ -505,7 +526,7 @@ void FurrionChillCube::loop() {
   if (boot_ready_ && !failsafe_active_ &&
       active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
       (now - last_cs_heartbeat_) >= CS_HEARTBEAT_MS) {
-    transmit_cs_update_(true);
+    transmit_cs_update_();
     last_cs_heartbeat_ = now;
   }
 }
@@ -690,6 +711,15 @@ float FurrionChillCube::get_cool_target_() {
   return this->target_temperature_high;
 }
 
+// Target for whichever mode the unit's IR state is in. Keyed on active_ir_mode_
+// (distinct from get_heat/cool_target_, which are keyed on the user's climate
+// mode). Returns NAN when OFF — an OFF command carries no setpoint.
+float FurrionChillCube::get_active_ir_target_() {
+  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) return get_heat_target_();
+  if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) return get_cool_target_();
+  return NAN;
+}
+
 // Returns true iff the given heat gear's hysteresis band covers `diff`.
 // Used on user_input events to avoid collapsing a stable hunting gear when
 // the user change doesn't actually move the room out of the current gear's band.
@@ -726,12 +756,28 @@ int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
 }
 
 void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
+  // NaN target → hold the last good setpoint. A NaN target can briefly arrive
+  // from an unavailable HA sensor; never let compute_setpoint_c_()'s safe
+  // default silently clobber furrion_setpoint_c_.
+  float target_c = is_heat ? get_heat_target_() : get_cool_target_();
+  if (isnan(target_c)) return;
+
   int new_sp = compute_setpoint_c_(is_heat);
   bool sp_changed = (new_sp != furrion_setpoint_c_);
+  int gear = is_heat ? heat_gear_ : cool_gear_;
   if (sp_changed) {
     ESP_LOGI(TAG, "Furrion setpoint %d°C → %d°C (%s)",
              furrion_setpoint_c_, new_sp, is_heat ? "heat" : "cool");
     furrion_setpoint_c_ = new_sp;
+    // CS is setpoint-anchored — re-anchor current_cs_ to the new setpoint for
+    // the current gear so the CS frames bracketing the mode command carry a
+    // value consistent with it. Skip during a kickstart: current_cs_ is then the
+    // kickstart CS and the kickstart state machine must keep owning it. The gear
+    // controller corrects current_cs_ below if the gear then changes.
+    if (gear >= 0 && !kickstart_active_()) {
+      current_cs_ = compute_gear_cs_(is_heat, gear);
+      if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
+    }
   }
   // F-protocol carries 1°F resolution: the whole-°C setpoint above can be
   // unchanged while the user's target moved (e.g. 73°F→74°F both round to
@@ -739,17 +785,18 @@ void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
   // so the unit's panel display stays in sync with the HA target.
   bool f_changed = false;
   if (use_fahrenheit_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    float target_c = is_heat ? get_heat_target_() : get_cool_target_();
-    if (!isnan(target_c)) {
-      int target_f = (int) roundf(target_c * 1.8f + 32.0f);
-      target_f = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, target_f));
-      f_changed = (target_f != last_tx_target_f_);
-    }
+    int target_f = (int) roundf(target_c * 1.8f + 32.0f);
+    target_f = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, target_f));
+    f_changed = (target_f != last_tx_target_f_);
   }
-  // Retransmit mode command so the unit gets the new setpoint / panel target.
-  if ((sp_changed || f_changed) &&
+  // Retransmit so the unit gets the new setpoint / panel target — but only when
+  // there is an active gear to anchor the CS to; otherwise the gear controller's
+  // own HVAC-on path handles the transmit a few lines later. transmit_mode_with_
+  // cs_() brackets the mode command with real CS frames so the new setpoint never
+  // lands against a stale CS, and a CS always follows a mode change.
+  if ((sp_changed || f_changed) && gear >= 0 &&
       active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
-    transmit_mode_command_();
+    transmit_mode_with_cs_();
   }
 }
 
@@ -801,7 +848,7 @@ int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
 void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
   current_cs_ = cs;
   if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    transmit_cs_update_(true);
+    transmit_cs_update_();
     last_cs_heartbeat_ = now;
   }
   if (cs_value_sensor_) cs_value_sensor_->publish_state(cs);
@@ -848,7 +895,7 @@ void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
   // PRE_CS: set kickstart CS before mode-on (500ms lead)
   current_cs_ = clamp_kickstart_cs_;
   if (boot_ready_ && !failsafe_active_) {
-    transmit_cs_update_(true);
+    transmit_cs_update_();
     last_cs_heartbeat_ = now;
   }
   if (cs_value_sensor_) cs_value_sensor_->publish_state(clamp_kickstart_cs_);
@@ -871,7 +918,7 @@ void FurrionChillCube::start_quick_kickstart_(bool is_heat, int kickstart_cs, ui
   // Set and transmit kickstart CS immediately
   current_cs_ = quick_kick_cs_;
   if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    transmit_cs_update_(true);
+    transmit_cs_update_();
     last_cs_heartbeat_ = now;
   }
   if (cs_value_sensor_) cs_value_sensor_->publish_state(quick_kick_cs_);
@@ -898,7 +945,7 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
       clamp_phase_ = ClampPhase::CLAMPED;
       clamp_start_ = now;
       transmit_mode_command_();
-      transmit_cs_update_(true);
+      transmit_cs_update_();
       last_cs_heartbeat_ = now;
       ESP_LOGI(TAG, "Clamped kickstart: MODE ON + fan=LOW, clamp=5:30");
     }
@@ -926,7 +973,7 @@ void FurrionChillCube::advance_kickstart_(uint32_t now) {
       // 5s: reinforce kickstart CS (one-shot). Past this, the 30s CS heartbeat keeps
       // re-asserting quick_kick_cs_, so the CS stays continuously asserted for long holds.
       quick_kick_reinforced_ = true;
-      transmit_cs_update_(true);
+      transmit_cs_update_();
       last_cs_heartbeat_ = now;
       ESP_LOGI(TAG, "Quick kickstart: reinforce cs=%d", quick_kick_cs_);
     }
@@ -1045,11 +1092,70 @@ void FurrionChillCube::abort_keepalive_() {
 // Gear Controller
 // ============================================================
 
+// Hold time in the current gear. The 999999999 sentinel ("no gear change yet
+// this boot session") reads as effectively-infinite so any can_upshift_to()
+// check passes on the first computation.
+uint32_t FurrionChillCube::time_in_gear_(uint32_t now) {
+  return (last_gear_change_ == 0) ? 999999999 : (now - last_gear_change_);
+}
+
 void FurrionChillCube::run_gear_controller_() {
   float room = inside_temp_c_;
   uint32_t now = millis();
-  float gear_diff = NAN;  // Tracks active diff for debug publishing
 
+  // Failsafe scenarios + NaN-room grace (also clears a stale failsafe). Returns
+  // true if a failsafe/grace path was taken — stop this pass.
+  if (check_failsafe_(now, room)) return;
+
+  // Fix: seed idle_since_ if gear is 0 but timer was never set (post-boot recovery)
+  if ((heat_gear_ == 0 || cool_gear_ == 0) && idle_since_ == 0) {
+    idle_since_ = now;
+  }
+
+  bool user_input = user_changed_;
+  if (user_input) user_changed_ = false;
+
+  // Captured before dispatch so the periodic state log reports the hold time the
+  // gear logic actually saw (a gear change this pass resets last_gear_change_).
+  uint32_t time_in_gear = time_in_gear_(now);
+
+  update_outside_lockout_();
+
+  bool do_heat = false, do_cool = false;
+  arbitrate_mode_(room, do_heat, do_cool);
+
+  // Dispatch to the active mode. run_heat/cool_mode_ return true if they took an
+  // early (NaN-target) hold-return — propagate it so this pass stops cleanly.
+  float gear_diff = NAN;  // active diff, for debug publishing
+  if (do_heat) {
+    if (run_heat_mode_(room, now, user_input, gear_diff)) return;
+  } else if (do_cool) {
+    if (run_cool_mode_(room, now, user_input, gear_diff)) return;
+  } else {
+    run_idle_mode_(now);
+  }
+
+  // Boot gate: first successful gear computation enables IR
+  if (!boot_ready_) {
+    boot_ready_ = true;
+    ESP_LOGI(TAG, "Boot ready — first gear computation complete, IR enabled");
+  }
+
+  // Debug sensor publishing
+  publish_debug_state_(gear_diff);
+
+  // Periodic state log
+  ESP_LOGD(TAG, "state: heat=%d cool=%d room=%.2f cs=%d hold=%lus idle=%lum mode=%d",
+           heat_gear_, cool_gear_, room, current_cs_,
+           time_in_gear / 1000,
+           idle_since_ > 0 ? (now - idle_since_) / 60000 : 0,
+           (int)last_active_mode_);
+}
+
+// Failsafe detection + NaN-room grace. Returns true if the caller should stop
+// this pass (a failsafe or NaN-grace path was taken). On the normal path it
+// also clears a stale failsafe_active_ flag.
+bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
   // === Failsafe scenario 1: Boot, HA never connects (5 min) ===
   bool never_got_update = (last_temp_update_ == 0 && (now - boot_time_) > 300000);
 
@@ -1111,7 +1217,7 @@ void FurrionChillCube::run_gear_controller_() {
     failsafe_active_ = true;
     boot_ready_ = true;
     update_action_();
-    return;
+    return true;
   }
 
   // NaN grace: hold current state
@@ -1119,7 +1225,7 @@ void FurrionChillCube::run_gear_controller_() {
     ESP_LOGD(TAG, "Room temp NaN — holding (%lus left)",
              (300000 - (now - temp_nan_since_)) / 1000);
     publish_debug_state_(NAN);
-    return;
+    return true;
   }
 
   // Clear failsafe if normal operation
@@ -1127,28 +1233,12 @@ void FurrionChillCube::run_gear_controller_() {
     failsafe_active_ = false;
     ESP_LOGI(TAG, "Failsafe cleared — normal operation resumed");
   }
+  return false;
+}
 
-  // Fix: seed idle_since_ if gear is 0 but timer was never set (post-boot recovery)
-  if ((heat_gear_ == 0 || cool_gear_ == 0) && idle_since_ == 0) {
-    idle_since_ = now;
-  }
-
-  // Mode switch guard removed: all mode changes now go through -1 (off state)
-  // with the 1-min off_since_ lockout enforced in the fresh-start path.
-
-  bool user_input = user_changed_;
-  if (user_input) user_changed_ = false;
-
-  // Per-gear upshift check
-  uint32_t time_in_gear = (last_gear_change_ == 0) ? 999999999 :
-                          (now - last_gear_change_);
-  auto can_upshift_to = [&](int target_gear) -> bool {
-    return user_input || (time_in_gear >= HOLD_MS[target_gear]);
-  };
-
-  // idle_long_enough is computed per-gear (0→-1 gate uses mode_switch_idle_ms_)
-
-  // Outside temperature lockout for heating
+// Outside-temperature lockout for heating (1°F hysteresis; fail-open if the
+// outside sensor is unavailable).
+void FurrionChillCube::update_outside_lockout_() {
   if (!isnan(outside_temp_c_)) {
     float lockout_low = outside_lockout_temp_c_ - 0.556f;  // 1°F hysteresis
     if (outside_temp_c_ < lockout_low && !heater_locked_out_) {
@@ -1163,7 +1253,10 @@ void FurrionChillCube::run_gear_controller_() {
     heater_locked_out_ = false;
     ESP_LOGW(TAG, "Outside temp unavailable — heating lockout cleared (fail-open)");
   }
+}
 
+// Picks the active mode for this pass. At most one of do_heat / do_cool is true.
+void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool) {
   // Determine active modes from user's climate mode
   bool heater_on = !heater_locked_out_ &&
                    (this->mode == climate::CLIMATE_MODE_HEAT ||
@@ -1172,8 +1265,8 @@ void FurrionChillCube::run_gear_controller_() {
                     this->mode == climate::CLIMATE_MODE_HEAT_COOL);
 
   // When both modes enabled, decide based on room temp vs targets
-  bool do_heat = heater_on;
-  bool do_cool = cooler_on;
+  do_heat = heater_on;
+  do_cool = cooler_on;
   if (heater_on && cooler_on) {
     float h_target = get_heat_target_();
     float c_target = get_cool_target_();
@@ -1200,373 +1293,378 @@ void FurrionChillCube::run_gear_controller_() {
       }
     }
   }
+}
 
-  // ==========================
-  // HEATING
-  // ==========================
-  if (do_heat) {
-    // No more direct cool→heat switch. If cool is active, the gear controller
-    // would have computed do_cool (not do_heat) because cool_gear_ >= 0 above.
-    // Reaching here with active_ir_mode_ == COOL would be an inconsistent state.
-    if (cool_gear_ != -1) {
-      cool_gear_ = -1;
-      if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
-    }
+// HEATING mode pass. Returns true if it took an early (NaN-target) hold-return.
+bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
+                                     float &gear_diff) {
+  uint32_t time_in_gear = time_in_gear_(now);
+  auto can_upshift_to = [&](int target_gear) -> bool {
+    return user_input || (time_in_gear >= HOLD_MS[target_gear]);
+  };
 
-    update_furrion_setpoint_(true);
-    float target = get_heat_target_();
-    float diff = room - target;
-    gear_diff = diff;
-    int gear = heat_gear_;
-    int new_gear = gear;
+  // No more direct cool→heat switch. If cool is active, the gear controller
+  // would have computed do_cool (not do_heat) because cool_gear_ >= 0 above.
+  // Reaching here with active_ir_mode_ == COOL would be an inconsistent state.
+  if (cool_gear_ != -1) {
+    cool_gear_ = -1;
+    if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+  }
 
-    if (gear == -1 || user_input) {
-      // Fresh start from -1 requires 1-min off lockout (hardware wind-down).
-      // No bypass — applies even to user_input.
-      bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
-      if (gear == -1 && !off_long_enough) {
-        new_gear = -1;  // still in 1-min wind-down period
-      } else if (user_input && gear >= 0 && gear_in_band_heat_(gear, diff)) {
-        // User event (setpoint/fan tweak) but current gear is still valid for
-        // the current diff — preserve hunting state instead of recomputing.
-        new_gear = gear;
-      } else {
-        // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
-        if (diff < H_UP_23)         new_gear = 3;
-        else if (diff < H_UP_12)    new_gear = 2;
-        else if (diff < H_UP_01)    new_gear = 1;
-        else if (gear == -1)        new_gear = -1;  // stays off
-        // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
-        else if (user_input && diff > H_IDLE) new_gear = -1;
-        else                        new_gear = 0;
-      }
+  update_furrion_setpoint_(true);
+  float target = get_heat_target_();
+  if (isnan(target)) {
+    ESP_LOGW(TAG, "Heat target NaN — holding gear/CS");
+    user_changed_ = user_input;  // don't consume a user event during a NaN hold
+    publish_debug_state_(NAN);
+    return true;
+  }
+  float diff = room - target;
+  gear_diff = diff;
+  int gear = heat_gear_;
+  int new_gear = gear;
+
+  if (gear == -1 || user_input) {
+    // Fresh start from -1 requires 1-min off lockout (hardware wind-down).
+    // No bypass — applies even to user_input.
+    bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
+    if (gear == -1 && !off_long_enough) {
+      new_gear = -1;  // still in 1-min wind-down period
+    } else if (user_input && gear >= 0 && gear_in_band_heat_(gear, diff)) {
+      // User event (setpoint/fan tweak) but current gear is still valid for
+      // the current diff — preserve hunting state instead of recomputing.
+      new_gear = gear;
     } else {
-      switch (gear) {
-        case 0: {
-          // First compute post-restore: skip the 0→1→2→3 HOLD_MS ladder
-          // (~6 min) and jump straight to the correct gear.
-          if (last_gear_change_ == 0) {
-            if (diff < H_UP_23)         new_gear = 3;
-            else if (diff < H_UP_12)    new_gear = 2;
-            else if (diff < H_UP_01)    new_gear = 1;
-          } else {
-            if (can_upshift_to(1) && diff < H_UP_01) new_gear = 1;
-          }
-          // 0→-1 gate (natural path only — user_input handled in fresh-start above)
-          bool imm_off = !boot_ready_;
-          bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
-          bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
-          bool past_setpoint = diff > mode_switch_temp_offset_c_;
-          bool natural_off = idle_enough && event_ok && past_setpoint;
-          if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
-          break;
-        }
-        case 1:
-          if (can_upshift_to(2) && diff < H_UP_12)  new_gear = 2;
-          else if (diff > H_DN_10)                   new_gear = 0;
-          break;
-        case 2:
-          if (can_upshift_to(3) && diff < H_UP_23)  new_gear = 3;
-          else if (diff > H_DN_21)                   new_gear = 1;
-          break;
-        case 3:
-          if (diff > H_DN_32)                        new_gear = 2;
-          break;
-      }
+      // From -1, only go to 1+ (never 0 — gear 0 is only reachable by downshift from 1)
+      if (diff < H_UP_23)         new_gear = 3;
+      else if (diff < H_UP_12)    new_gear = 2;
+      else if (diff < H_UP_01)    new_gear = 1;
+      else if (gear == -1)        new_gear = -1;  // stays off
+      // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
+      else if (user_input && diff > H_IDLE) new_gear = -1;
+      else                        new_gear = 0;
     }
-
-    // Track idle_since
-    if (new_gear == 0 && gear != 0) {
-      idle_since_ = now;
-    } else if (new_gear != 0) {
-      idle_since_ = 0;
-    }
-
-    // Track off_since_ for the 1-min off lockout
-    if (new_gear == -1 && gear != -1) {
-      off_since_ = now;
-    }
-
-    // Publish gear and compressor on change
-    if (new_gear != gear) {
-      heat_gear_ = new_gear;
-      last_gear_change_ = now;
-      if (heat_gear_sensor_) heat_gear_sensor_->publish_state(new_gear);
-      if (new_gear >= 1) last_active_mode_ = MODE_HEAT;
-      float pct;
-      switch (new_gear) {
-        case 3:  pct = 100.0f; break;
-        case 2:  pct = 66.6f;  break;
-        case 1:  pct = 33.3f;  break;
-        default: pct = 0.0f;   break;
-      }
-      if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
-      ESP_LOGI(TAG, "HEAT %d -> %d (room=%.2f target=%.2f diff=%.2f)",
-               gear, new_gear, room, target, diff);
-
-      // Keep-alive: reset timer on entering eligible range, abort on leaving
-      if (new_gear == 1) {
-        keepalive_last_ = now;  // fresh 5-min window
-      } else {
-        abort_keepalive_();
-      }
-    }
-
-    // CS + kickstart logic
-    if (new_gear >= 0) {
-      int cs = compute_gear_cs_(true, new_gear);
-      if (gear == -1 && new_gear == 1) {
-        // OFF→gear 1: clamped kickstart (fan=LOW 5:30, CS=gear2 level)
-        last_mode_event_at_ = now;
-        start_clamped_kickstart_(true, now);
-      } else if (gear == -1 && new_gear >= 2) {
-        // OFF→gear 2+: direct start, no kickstart needed
-        last_mode_event_at_ = now;
-        if (!kickstart_active_() && current_cs_ != cs) {
-          set_cs_value_(cs, now);
-        }
-      } else if (!kickstart_active_() && current_cs_ != cs) {
-        set_cs_value_(cs, now);
-      }
-    }
-
-    // HVAC on/off
-    if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !kickstart_active_()) {
-      set_active_ir_mode_(climate::CLIMATE_MODE_HEAT);
-      transmit_mode_command_();
-      transmit_cs_update_(true);
-    }
-    if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-      transmit_mode_command_();
-      if (kickstart_active_()) end_kickstart_(now);
-    }
-
-    update_action_();
-
-  // ==========================
-  // COOLING
-  // ==========================
-  } else if (do_cool) {
-    // No more direct heat→cool switch. Reaching here with active_ir_mode_ == HEAT
-    // would be an inconsistent state (heat_gear_ should have been -1 first).
-    if (heat_gear_ != -1) {
-      heat_gear_ = -1;
-      if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
-    }
-
-    update_furrion_setpoint_(false);
-    float target = get_cool_target_();
-    float diff = room - target;
-    gear_diff = diff;
-    int gear = cool_gear_;
-    int new_gear = gear;
-
-    if (gear == -1 || user_input) {
-      // Fresh start from -1 requires 1-min off lockout (hardware wind-down).
-      // No bypass — applies even to user_input.
-      bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
-      if (gear == -1 && !off_long_enough) {
-        new_gear = -1;  // still in 1-min wind-down period
-      } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, diff)) {
-        // User event (setpoint/fan tweak) but current gear is still valid for
-        // the current diff — preserve hunting state instead of recomputing.
-        new_gear = gear;
-      } else {
-        // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
-        // and never gear 0 (only reachable by downshift from 1)
-        if (diff > C_UP_45)         new_gear = 5;
-        else if (diff > C_UP_34)    new_gear = 4;
-        else if (diff > C_UP_23)    new_gear = 3;
-        else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;
-        else if (gear == -1)        new_gear = -1;  // stays off
-        // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
-        else if (user_input && diff < C_IDLE) new_gear = -1;
-        else                        new_gear = 0;
-      }
-    } else {
-      switch (gear) {
-        case 0: {
-          // First compute post-restore: skip the 0→1→2→3 HOLD_MS ladder
-          // (~6 min) and jump straight to the correct gear.
-          if (last_gear_change_ == 0) {
-            if (diff > C_UP_45)         new_gear = 5;
-            else if (diff > C_UP_34)    new_gear = 4;
-            else if (diff > C_UP_23)    new_gear = 3;
-            else if (diff > C_UP_12)    new_gear = 2;
-            else if (diff > C_UP_01)    new_gear = 1;
-          } else {
-            if (can_upshift_to(1) && diff > C_UP_01) new_gear = 1;
-          }
-          // 0→-1 gate (natural path only — user_input handled in fresh-start above)
-          bool imm_off = !boot_ready_;
-          bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
-          bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
-          bool past_setpoint = diff < -mode_switch_temp_offset_c_;
-          bool natural_off = idle_enough && event_ok && past_setpoint;
-          if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
-          break;
-        }
-        case 1:
-          if (can_upshift_to(2) && diff > C_UP_12)  new_gear = 2;
-          else if (diff < C_DN_10)                   new_gear = 0;
-          break;
-        case 2:
-          if (can_upshift_to(3) && diff > C_UP_23)  new_gear = 3;
-          else if (diff < C_DN_21)                   new_gear = 1;
-          break;
-        case 3:
-          if (can_upshift_to(4) && diff > C_UP_34)  new_gear = 4;
-          else if (diff < C_DN_32)                   new_gear = 2;
-          break;
-        case 4:
-          if (can_upshift_to(5) && diff > C_UP_45)  new_gear = 5;
-          else if (diff < C_DN_43)                   new_gear = 3;
-          break;
-        case 5:
-          if (diff < C_DN_54)                        new_gear = 4;
-          break;
-      }
-    }
-
-    // Track idle_since
-    if (new_gear == 0 && gear != 0) {
-      idle_since_ = now;
-    } else if (new_gear != 0) {
-      idle_since_ = 0;
-    }
-
-    // Track off_since_ for the 1-min off lockout
-    if (new_gear == -1 && gear != -1) {
-      off_since_ = now;
-    }
-
-    // Publish gear and compressor on change
-    if (new_gear != gear) {
-      cool_gear_ = new_gear;
-      last_gear_change_ = now;
-      if (cool_gear_sensor_) cool_gear_sensor_->publish_state(new_gear);
-      if (new_gear >= 1) last_active_mode_ = MODE_COOL;
-      float pct;
-      switch (new_gear) {
-        case 5:  pct = 100.0f; break;
-        case 4:  pct = 80.0f;  break;
-        case 3:  pct = 60.0f;  break;
-        case 2:  pct = 40.0f;  break;
-        case 1:  pct = 20.0f;  break;
-        default: pct = 0.0f;   break;
-      }
-      if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
-      ESP_LOGI(TAG, "COOL %d -> %d (room=%.2f target=%.2f diff=%.2f)",
-               gear, new_gear, room, target, diff);
-
-      // Keep-alive: reset timer on entering eligible range, abort on leaving
-      if (new_gear >= 1 && new_gear <= 2) {
-        keepalive_last_ = now;  // fresh 5-min window
-      } else {
-        abort_keepalive_();
-      }
-    }
-
-    // CS + kickstart logic
-    if (new_gear >= 0) {
-      int cs = compute_gear_cs_(false, new_gear);
-      if (gear == -1 && new_gear == 2) {
-        // OFF→gear 2: clamped kickstart (fan=LOW 5:30, CS=gear4 level)
-        last_mode_event_at_ = now;
-        start_clamped_kickstart_(false, now);
-      } else if (gear == -1 && new_gear == 3) {
-        // OFF→gear 3: quick kickstart (CS=gear4 briefly, then gear 3). A short hold is
-        // sufficient here — start_quick_kickstart_ also sends a MODE-ON command from OFF,
-        // which does the heavy lifting of waking the compressor.
-        last_mode_event_at_ = now;
-        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, QUICK_KICK_HOLD_MS);
-      } else if (gear == -1 && new_gear >= 4) {
-        // OFF→gear 4+: direct, no kickstart
-        last_mode_event_at_ = now;
-        if (!kickstart_active_() && current_cs_ != cs) {
-          set_cs_value_(cs, now);
-        }
-      } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
-        // Idle→gear 1-2: quick kickstart at gear-4 CS (setpoint+1°C demand), held for
-        // IDLE_KICK_HOLD_MS (90s). This path is CS-only — the unit is already in COOL
-        // mode, so there is NO MODE-ON command behind it. A 10s hold failed on
-        // 2026-05-20: the CS=21 pulse fired inside the compressor's anti-short-cycle
-        // restart lockout and was gone before the lockout cleared, leaving the unit
-        // stopped ~11 min. The 90s hold keeps CS=21 asserted across that lockout.
-        // gear-4 CS (anchor+1) is the documented restart threshold; gear-3 CS (anchor)
-        // is sustain-only — see session_log 2026-05-20.
-        start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, IDLE_KICK_HOLD_MS);
-      } else if (!kickstart_active_() && current_cs_ != cs) {
-        set_cs_value_(cs, now);
-      }
-    }
-
-    // HVAC on/off
-    if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !kickstart_active_()) {
-      set_active_ir_mode_(climate::CLIMATE_MODE_COOL);
-      transmit_mode_command_();
-      transmit_cs_update_(true);
-    }
-    if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-      transmit_mode_command_();
-      if (kickstart_active_()) end_kickstart_(now);
-    }
-
-    update_action_();
-
-  // ==========================
-  // NEITHER ACTIVE
-  // ==========================
   } else {
-    // Ensure HVAC is OFF
-    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
-      transmit_mode_command_();
-      clamp_phase_ = ClampPhase::IDLE;
-      quick_kick_active_ = false;
-      abort_keepalive_();
-      if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-      ESP_LOGI(TAG, "NEITHER ACTIVE — HVAC OFF");
+    switch (gear) {
+      case 0: {
+        // First compute post-restore: skip the 0→1→2→3 HOLD_MS ladder
+        // (~6 min) and jump straight to the correct gear.
+        if (last_gear_change_ == 0) {
+          if (diff < H_UP_23)         new_gear = 3;
+          else if (diff < H_UP_12)    new_gear = 2;
+          else if (diff < H_UP_01)    new_gear = 1;
+        } else {
+          if (can_upshift_to(1) && diff < H_UP_01) new_gear = 1;
+        }
+        // 0→-1 gate (natural path only — user_input handled in fresh-start above)
+        bool imm_off = !boot_ready_;
+        bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
+        bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
+        bool past_setpoint = diff > mode_switch_temp_offset_c_;
+        bool natural_off = idle_enough && event_ok && past_setpoint;
+        if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
+        break;
+      }
+      case 1:
+        if (can_upshift_to(2) && diff < H_UP_12)  new_gear = 2;
+        else if (diff > H_DN_10)                   new_gear = 0;
+        break;
+      case 2:
+        if (can_upshift_to(3) && diff < H_UP_23)  new_gear = 3;
+        else if (diff > H_DN_21)                   new_gear = 1;
+        break;
+      case 3:
+        if (diff > H_DN_32)                        new_gear = 2;
+        break;
     }
+  }
 
-    // Enforce neutral CS (at setpoint — unit is OFF so doesn't matter much)
-    if (current_cs_ != furrion_setpoint_c_) {
-      set_cs_value_(furrion_setpoint_c_, now);
-    }
-
-    // Force gears to -1
-    if (heat_gear_ != -1) {
-      ESP_LOGI(TAG, "HEAT %d -> -1 (neither active)", heat_gear_);
-      heat_gear_ = -1;
-      if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
-    }
-    if (cool_gear_ != -1) {
-      ESP_LOGI(TAG, "COOL %d -> -1 (neither active)", cool_gear_);
-      cool_gear_ = -1;
-      if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
-    }
+  // Track idle_since
+  if (new_gear == 0 && gear != 0) {
+    idle_since_ = now;
+  } else if (new_gear != 0) {
     idle_since_ = 0;
-
-    update_action_();
   }
 
-  // Boot gate: first successful gear computation enables IR
-  if (!boot_ready_) {
-    boot_ready_ = true;
-    ESP_LOGI(TAG, "Boot ready — first gear computation complete, IR enabled");
+  // Track off_since_ for the 1-min off lockout
+  if (new_gear == -1 && gear != -1) {
+    off_since_ = now;
   }
 
-  // Debug sensor publishing
-  publish_debug_state_(gear_diff);
+  // Publish gear and compressor on change
+  if (new_gear != gear) {
+    heat_gear_ = new_gear;
+    last_gear_change_ = now;
+    if (heat_gear_sensor_) heat_gear_sensor_->publish_state(new_gear);
+    if (new_gear >= 1) last_active_mode_ = MODE_HEAT;
+    float pct;
+    switch (new_gear) {
+      case 3:  pct = 100.0f; break;
+      case 2:  pct = 66.6f;  break;
+      case 1:  pct = 33.3f;  break;
+      default: pct = 0.0f;   break;
+    }
+    if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
+    ESP_LOGI(TAG, "HEAT %d -> %d (room=%.2f target=%.2f diff=%.2f)",
+             gear, new_gear, room, target, diff);
 
-  // Periodic state log
-  ESP_LOGD(TAG, "state: heat=%d cool=%d room=%.2f cs=%d hold=%lus idle=%lum mode=%d",
-           heat_gear_, cool_gear_, room, current_cs_,
-           time_in_gear / 1000,
-           idle_since_ > 0 ? (now - idle_since_) / 60000 : 0,
-           (int)last_active_mode_);
+    // Keep-alive: reset timer on entering eligible range, abort on leaving
+    if (new_gear == 1) {
+      keepalive_last_ = now;  // fresh 5-min window
+    } else {
+      abort_keepalive_();
+    }
+  }
+
+  // CS + kickstart logic
+  if (new_gear >= 0) {
+    int cs = compute_gear_cs_(true, new_gear);
+    if (gear == -1 && new_gear == 1) {
+      // OFF→gear 1: clamped kickstart (fan=LOW 5:30, CS=gear2 level)
+      last_mode_event_at_ = now;
+      start_clamped_kickstart_(true, now);
+    } else if (gear == -1 && new_gear >= 2) {
+      // OFF→gear 2+: direct start, no kickstart needed
+      last_mode_event_at_ = now;
+      if (!kickstart_active_() && current_cs_ != cs) {
+        set_cs_value_(cs, now);
+      }
+    } else if (!kickstart_active_() && current_cs_ != cs) {
+      set_cs_value_(cs, now);
+    }
+  }
+
+  // HVAC on/off
+  if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_HEAT && !kickstart_active_()) {
+    set_active_ir_mode_(climate::CLIMATE_MODE_HEAT);
+    transmit_mode_with_cs_();
+  }
+  if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+    transmit_mode_command_();
+    if (kickstart_active_()) end_kickstart_(now);
+  }
+
+  update_action_();
+  return false;
+}
+
+// COOLING mode pass. Returns true if it took an early (NaN-target) hold-return.
+bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
+                                     float &gear_diff) {
+  uint32_t time_in_gear = time_in_gear_(now);
+  auto can_upshift_to = [&](int target_gear) -> bool {
+    return user_input || (time_in_gear >= HOLD_MS[target_gear]);
+  };
+
+  // No more direct heat→cool switch. Reaching here with active_ir_mode_ == HEAT
+  // would be an inconsistent state (heat_gear_ should have been -1 first).
+  if (heat_gear_ != -1) {
+    heat_gear_ = -1;
+    if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+  }
+
+  update_furrion_setpoint_(false);
+  float target = get_cool_target_();
+  if (isnan(target)) {
+    ESP_LOGW(TAG, "Cool target NaN — holding gear/CS");
+    user_changed_ = user_input;  // don't consume a user event during a NaN hold
+    publish_debug_state_(NAN);
+    return true;
+  }
+  float diff = room - target;
+  gear_diff = diff;
+  int gear = cool_gear_;
+  int new_gear = gear;
+
+  if (gear == -1 || user_input) {
+    // Fresh start from -1 requires 1-min off lockout (hardware wind-down).
+    // No bypass — applies even to user_input.
+    bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
+    if (gear == -1 && !off_long_enough) {
+      new_gear = -1;  // still in 1-min wind-down period
+    } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, diff)) {
+      // User event (setpoint/fan tweak) but current gear is still valid for
+      // the current diff — preserve hunting state instead of recomputing.
+      new_gear = gear;
+    } else {
+      // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
+      // and never gear 0 (only reachable by downshift from 1)
+      if (diff > C_UP_45)         new_gear = 5;
+      else if (diff > C_UP_34)    new_gear = 4;
+      else if (diff > C_UP_23)    new_gear = 3;
+      else if (diff > C_UP_12)    new_gear = 2;
+      else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;
+      else if (gear == -1)        new_gear = -1;  // stays off
+      // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
+      else if (user_input && diff < C_IDLE) new_gear = -1;
+      else                        new_gear = 0;
+    }
+  } else {
+    switch (gear) {
+      case 0: {
+        // First compute post-restore: skip the 0→1→2→3 HOLD_MS ladder
+        // (~6 min) and jump straight to the correct gear.
+        if (last_gear_change_ == 0) {
+          if (diff > C_UP_45)         new_gear = 5;
+          else if (diff > C_UP_34)    new_gear = 4;
+          else if (diff > C_UP_23)    new_gear = 3;
+          else if (diff > C_UP_12)    new_gear = 2;
+          else if (diff > C_UP_01)    new_gear = 1;
+        } else {
+          if (can_upshift_to(1) && diff > C_UP_01) new_gear = 1;
+        }
+        // 0→-1 gate (natural path only — user_input handled in fresh-start above)
+        bool imm_off = !boot_ready_;
+        bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
+        bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
+        bool past_setpoint = diff < -mode_switch_temp_offset_c_;
+        bool natural_off = idle_enough && event_ok && past_setpoint;
+        if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
+        break;
+      }
+      case 1:
+        if (can_upshift_to(2) && diff > C_UP_12)  new_gear = 2;
+        else if (diff < C_DN_10)                   new_gear = 0;
+        break;
+      case 2:
+        if (can_upshift_to(3) && diff > C_UP_23)  new_gear = 3;
+        else if (diff < C_DN_21)                   new_gear = 1;
+        break;
+      case 3:
+        if (can_upshift_to(4) && diff > C_UP_34)  new_gear = 4;
+        else if (diff < C_DN_32)                   new_gear = 2;
+        break;
+      case 4:
+        if (can_upshift_to(5) && diff > C_UP_45)  new_gear = 5;
+        else if (diff < C_DN_43)                   new_gear = 3;
+        break;
+      case 5:
+        if (diff < C_DN_54)                        new_gear = 4;
+        break;
+    }
+  }
+
+  // Track idle_since
+  if (new_gear == 0 && gear != 0) {
+    idle_since_ = now;
+  } else if (new_gear != 0) {
+    idle_since_ = 0;
+  }
+
+  // Track off_since_ for the 1-min off lockout
+  if (new_gear == -1 && gear != -1) {
+    off_since_ = now;
+  }
+
+  // Publish gear and compressor on change
+  if (new_gear != gear) {
+    cool_gear_ = new_gear;
+    last_gear_change_ = now;
+    if (cool_gear_sensor_) cool_gear_sensor_->publish_state(new_gear);
+    if (new_gear >= 1) last_active_mode_ = MODE_COOL;
+    float pct;
+    switch (new_gear) {
+      case 5:  pct = 100.0f; break;
+      case 4:  pct = 80.0f;  break;
+      case 3:  pct = 60.0f;  break;
+      case 2:  pct = 40.0f;  break;
+      case 1:  pct = 20.0f;  break;
+      default: pct = 0.0f;   break;
+    }
+    if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
+    ESP_LOGI(TAG, "COOL %d -> %d (room=%.2f target=%.2f diff=%.2f)",
+             gear, new_gear, room, target, diff);
+
+    // Keep-alive: reset timer on entering eligible range, abort on leaving
+    if (new_gear >= 1 && new_gear <= 2) {
+      keepalive_last_ = now;  // fresh 5-min window
+    } else {
+      abort_keepalive_();
+    }
+  }
+
+  // CS + kickstart logic
+  if (new_gear >= 0) {
+    int cs = compute_gear_cs_(false, new_gear);
+    if (gear == -1 && new_gear == 2) {
+      // OFF→gear 2: clamped kickstart (fan=LOW 5:30, CS=gear4 level)
+      last_mode_event_at_ = now;
+      start_clamped_kickstart_(false, now);
+    } else if (gear == -1 && new_gear == 3) {
+      // OFF→gear 3: quick kickstart (CS=gear4 briefly, then gear 3). A short hold is
+      // sufficient here — start_quick_kickstart_ also sends a MODE-ON command from OFF,
+      // which does the heavy lifting of waking the compressor.
+      last_mode_event_at_ = now;
+      start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, QUICK_KICK_HOLD_MS);
+    } else if (gear == -1 && new_gear >= 4) {
+      // OFF→gear 4+: direct, no kickstart
+      last_mode_event_at_ = now;
+      if (!kickstart_active_() && current_cs_ != cs) {
+        set_cs_value_(cs, now);
+      }
+    } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
+      // Idle→gear 1-2: quick kickstart at gear-4 CS (setpoint+1°C demand), held for
+      // IDLE_KICK_HOLD_MS (90s). This path is CS-only — the unit is already in COOL
+      // mode, so there is NO MODE-ON command behind it. A 10s hold failed on
+      // 2026-05-20: the CS=21 pulse fired inside the compressor's anti-short-cycle
+      // restart lockout and was gone before the lockout cleared, leaving the unit
+      // stopped ~11 min. The 90s hold keeps CS=21 asserted across that lockout.
+      // gear-4 CS (anchor+1) is the documented restart threshold; gear-3 CS (anchor)
+      // is sustain-only — see session_log 2026-05-20.
+      start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, IDLE_KICK_HOLD_MS);
+    } else if (!kickstart_active_() && current_cs_ != cs) {
+      set_cs_value_(cs, now);
+    }
+  }
+
+  // HVAC on/off
+  if (new_gear >= 0 && active_ir_mode_ != climate::CLIMATE_MODE_COOL && !kickstart_active_()) {
+    set_active_ir_mode_(climate::CLIMATE_MODE_COOL);
+    transmit_mode_with_cs_();
+  }
+  if (new_gear == -1 && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+    transmit_mode_command_();
+    if (kickstart_active_()) end_kickstart_(now);
+  }
+
+  update_action_();
+  return false;
+}
+
+// NEITHER-active pass: ensure the unit is OFF and both gears are -1.
+void FurrionChillCube::run_idle_mode_(uint32_t now) {
+  // Ensure HVAC is OFF
+  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+    transmit_mode_command_();
+    clamp_phase_ = ClampPhase::IDLE;
+    quick_kick_active_ = false;
+    abort_keepalive_();
+    if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
+    ESP_LOGI(TAG, "NEITHER ACTIVE — HVAC OFF");
+  }
+
+  // Enforce neutral CS (at setpoint — unit is OFF so doesn't matter much)
+  if (current_cs_ != furrion_setpoint_c_) {
+    set_cs_value_(furrion_setpoint_c_, now);
+  }
+
+  // Force gears to -1
+  if (heat_gear_ != -1) {
+    ESP_LOGI(TAG, "HEAT %d -> -1 (neither active)", heat_gear_);
+    heat_gear_ = -1;
+    if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+  }
+  if (cool_gear_ != -1) {
+    ESP_LOGI(TAG, "COOL %d -> -1 (neither active)", cool_gear_);
+    cool_gear_ = -1;
+    if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+  }
+  idle_since_ = 0;
+
+  update_action_();
 }
 
 // ============================================================

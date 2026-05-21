@@ -66,13 +66,22 @@ class FurrionChillCube : public climate::Climate, public Component {
   // IR protocol
   void encode_(remote_base::RemoteTransmitData *data, const uint8_t *msg, uint8_t len, uint8_t repeat);
   void transmit_mode_command_();
-  void transmit_cs_update_(bool send_data);
+  void transmit_mode_with_cs_();
+  void transmit_cs_update_();
   void transmit_raw_6byte_(const uint8_t *msg);
 
   // Gear controller
   void run_gear_controller_();
+  bool check_failsafe_(uint32_t now, float room);
+  void update_outside_lockout_();
+  void arbitrate_mode_(float room, bool &do_heat, bool &do_cool);
+  bool run_heat_mode_(float room, uint32_t now, bool user_input, float &gear_diff);
+  bool run_cool_mode_(float room, uint32_t now, bool user_input, float &gear_diff);
+  void run_idle_mode_(uint32_t now);
+  uint32_t time_in_gear_(uint32_t now);
   float get_heat_target_();
   float get_cool_target_();
+  float get_active_ir_target_();
   int compute_gear_cs_(bool is_heat, int gear);
   bool gear_in_band_heat_(int gear, float diff);
   bool gear_in_band_cool_(int gear, float diff);

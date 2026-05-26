@@ -1,0 +1,3 @@
+# Test binaries (compiled outputs of tests/*.cpp)
+gear_controller_test
+mode_switch_test

@@ -1,3 +1,6 @@
 # Test binaries (compiled outputs of tests/*.cpp)
 gear_controller_test
 mode_switch_test
+tests/mild_test
+tests/sim_test
+tests/gear_test

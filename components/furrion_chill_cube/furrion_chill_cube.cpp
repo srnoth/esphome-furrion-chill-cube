@@ -103,16 +103,25 @@ static const float C_UP_45 =  1.0f;   // bumped from 0.80 to preserve up-ladder 
 static const float C_DN_54 =  0.45f;
 static const float C_DN_43 =  0.40f;
 static const float C_DN_32 = -0.05f;
-// C_DN_21 sits just below setpoint so a sub-0.1°C dip doesn't collapse gear 2 → gear 1.
-static const float C_DN_21 = -0.1f;
-// C_DN_10 is a deliberately deep gear-1 floor (room ~0.9°F below setpoint). Gear 1 is the
-// "catch" that absorbs a normal post-gear-3 overshoot: at ~3A it keeps the compressor
-// running instead of collapsing to a full stop (no restart needed). On 2026-05-20 the old
-// -0.15 let a trivial 0.31°F undershoot fall straight through gears 1 and 0 into idle —
-// the downshift ladder has no hold-time — forcing an unreliable cold restart. -0.5 keeps
-// gear 1 sticky; gear 1→0 now means the room is genuinely ~0.9°F cold (a real low-load
-// idle), not a transient. Down-ladder stays monotonic: 0.45 / 0.40 / -0.05 / -0.10 / -0.50.
-static const float C_DN_10 = -0.5f;
+// C_DN_21 is the gear-2 sustain floor — deliberately deep (room ~0.7°F below setpoint).
+// Gear 2 (not gear 1) is the sustain gear on mild days. 2026-06-03 drift analysis of a
+// full mild cool cycle (target 68°F, outside 72-78°F) measured the equilibrium load
+// sitting BETWEEN gear 2 (+0.047°F/min, gently under-cools) and gear 3 (-0.061°F/min,
+// gently over-cools) — the natural steady state is a quiet 2↔3 duty cycle. The old -0.10
+// (3→2 at -0.05 and 2→1 at -0.10 only 0.09°F apart) let gear 3's downward momentum coast
+// the room ~0.27°F past the 3→2 point and trip 2→1 immediately, so gear 2 never held (a
+// 6-min waypoint, 18 visits). Dropping to gear 1 buys nothing physically — g1 drift
+// (+0.065°F/min) ≈ g2's — but it deepens the bottom of the swing, and the long under-cooled
+// climb back overshoots (HOLD_MS-gated) all the way to a gear-4 spike on a mild day. -0.40
+// keeps gear 2 holding through a normal undershoot (deepest observed coast-down was only
+// -0.20°C), collapsing the 1↔2↔3↔4 churn into a clean 2↔3 toggle and removing the gear-4
+// trigger. Hot-day operation is untouched (2→1 rarely triggers when the room stays warm).
+static const float C_DN_21 = -0.40f;
+// C_DN_10 is the gear-1→idle floor. With gear 2 now the sustain floor (C_DN_21=-0.40),
+// gear 1 is a thin deep-undershoot-only sliver: it is entered only when the room is already
+// >0.7°F cold, and -0.55 gives it a small (0.15°C) band before idle rather than collapsing
+// straight to a stop. Down-ladder stays monotonic: 0.45 / 0.40 / -0.05 / -0.40 / -0.55.
+static const float C_DN_10 = -0.55f;
 static const float C_IDLE  = -0.15f;
 
 // Mode-switching protection lives in the 0→-1 gate and -1→active gate
@@ -739,8 +748,8 @@ bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
   // Gear N stays in (C_DN_N(N-1), C_UP_N(N+1)) — its own transition thresholds.
   switch (gear) {
     case 0: return diff >= C_IDLE  && diff <= C_UP_01;      // (-0.15, 0.15)
-    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // (-0.5, 0.25)
-    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // (-0.10, 0.40)
+    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // (-0.55, 0.25)
+    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // (-0.40, 0.40)
     case 3: return diff >= C_DN_32 && diff <= C_UP_34;      // (-0.05, 0.85)
     case 4: return diff >= C_DN_43 && diff <= C_UP_45;      // (0.40, 1.00)
     case 5: return diff >= C_DN_54;                          // max cool, no upper bound

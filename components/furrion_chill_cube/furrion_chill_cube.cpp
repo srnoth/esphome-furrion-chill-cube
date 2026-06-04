@@ -1614,30 +1614,30 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
     if (gear == -1 && !off_long_enough) {
       new_gear = -1;  // still in 1-min wind-down period
-    } else if (user_input && gear >= 1 && gear_in_band_cool_(gear, eff_diff)) {
-      // User event (setpoint/fan tweak) while ACTIVELY cooling, and the current gear is still
-      // valid for the adaptive-biased diff — preserve hunting state. Checked on eff_diff
-      // (consistent with how active gears are selected). gear 0/-1 fall through to the
-      // real-diff re-engage recompute below.
+    } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, diff)) {
+      // User event (setpoint/fan tweak) but the current gear is still valid for the current
+      // diff — preserve hunting state instead of recomputing.
       new_gear = gear;
     } else {
-      // Recompute. A user event while actively cooling (gear >= 1) keys its UPSHIFTS on
-      // eff_diff — consistent with the preserve check and the active switch cases, so a
-      // legitimately-learned bias isn't thrown away by a no-op tweak. A genuine cold re-engage
-      // from -1/idle keys on real diff (don't let a possibly-stale bias force an aggressive
-      // cold start). The idle/shut-off decision ALWAYS uses real diff so a setpoint-raise
-      // still idles regardless of a stale cooling bias.
-      bool active_user = (user_input && gear >= 1);
-      float sel = active_user ? eff_diff : diff;
-      if (active_user && diff < C_IDLE)  new_gear = -1;  // room genuinely at/below setpoint → idle
-      else if (sel > C_UP_45)            new_gear = 5;
-      else if (sel > C_UP_34)            new_gear = 4;
-      else if (sel > C_UP_23)            new_gear = 3;
-      else if (sel > C_UP_12)            new_gear = 2;
-      else if (sel > C_UP_01)            new_gear = (gear == -1) ? 2 : 1;
-      else if (gear == -1)               new_gear = -1;  // stays off
-      else                               new_gear = 0;
+      // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
+      // and never gear 0 (only reachable by downshift from 1)
+      if (diff > C_UP_45)         new_gear = 5;
+      else if (diff > C_UP_34)    new_gear = 4;
+      else if (diff > C_UP_23)    new_gear = 3;
+      else if (diff > C_UP_12)    new_gear = 2;
+      else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;
+      else if (gear == -1)        new_gear = -1;  // stays off
+      // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
+      else if (user_input && diff < C_IDLE) new_gear = -1;
+      else                        new_gear = 0;
     }
+    // NOTE: this whole user_input/fresh-start block deliberately uses REAL diff, NOT eff_diff.
+    // The adaptive bias governs only the STEADY-STATE switch cases (1-5) below. A user action is
+    // a transient: respond conservatively to the actual room temperature and let the bias
+    // re-apply over the next few normal passes via the switch. This keeps the path bit-identical
+    // to the non-adaptive ladder and avoids the bias ever forcing an overcool/over-collapse on a
+    // user tap. (Round-1/2 attempts to make this path bias-aware introduced regressions; reverted
+    // Round-3.)
   } else {
     switch (gear) {
       case 0: {
@@ -1865,7 +1865,8 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   // Phase 2 adaptive observability
   pub(debug_adaptive_bias_c_sensor_, bias_c_);
   pub(debug_room_drift_sensor_, room_drift_cpm_);
-  pub(debug_fan_feedforward_sensor_, vent_fan_on_() ? (float)fan_feedforward_gears_ : 0.0f);
+  pub(debug_fan_feedforward_sensor_,
+      (adaptive_enable_ && vent_fan_on_()) ? (float)fan_feedforward_gears_ : 0.0f);
 }
 
 // ============================================================

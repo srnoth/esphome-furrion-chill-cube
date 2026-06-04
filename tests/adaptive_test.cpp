@@ -293,33 +293,33 @@ void test_varying_load_tracks_setpoint() {
           "adaptive tracks setpoint tighter than static under a varying load");
 }
 
-// Mirror of the user_input/fresh-start recompute (the eff_diff-vs-real-diff split, Round 2).
-int user_recompute(int gear, float real_diff, float eff_diff, bool user_input) {
-    bool active_user = (user_input && gear >= 1);
-    float sel = active_user ? eff_diff : real_diff;
-    if (active_user && real_diff < C_IDLE) return -1;
-    if (sel > C_UP_45) return 5;
-    if (sel > C_UP_34) return 4;
-    if (sel > C_UP_23) return 3;
-    if (sel > C_UP_12) return 2;
-    if (sel > C_UP_01) return (gear == -1) ? 2 : 1;
-    if (gear == -1)    return -1;
+// Mirror of the user_input/fresh-start recompute. Round-3: this path uses REAL diff only
+// (bias-independent) — the adaptive bias governs only the steady-state switch cases. Identical
+// to the non-adaptive ladder.
+int user_recompute(int gear, float real_diff, bool user_input) {
+    if (real_diff > C_UP_45) return 5;
+    if (real_diff > C_UP_34) return 4;
+    if (real_diff > C_UP_23) return 3;
+    if (real_diff > C_UP_12) return 2;
+    if (real_diff > C_UP_01) return (gear == -1) ? 2 : 1;
+    if (gear == -1)          return -1;
+    if (user_input && real_diff < C_IDLE) return -1;
     return 0;
 }
 
-// Round-2 regression: a benign user event must not throw away a learned bias.
-void test_user_event_keeps_bias() {
-    printf("\n=== User event recompute keys upshifts on eff_diff, idles on real diff ===\n");
-    // gear 4, learned bias +0.85, real diff 0.50 → eff 1.35: a no-op tweak must move toward
-    // gear 5 (more cooling), NOT collapse to gear 3 on real diff (the Round-2 bug).
-    CHECK(user_recompute(4, 0.50f, 1.35f, true) == 5, "active user event at gear4 +bias -> gear 5 (no collapse)");
-    // Setpoint raise: room now 1C below the new setpoint, stale bias +2.0 (eff +1.0) — must
-    // idle on REAL diff regardless of the stale cooling bias.
-    CHECK(user_recompute(4, -1.0f, 1.0f, true) == -1, "setpoint raise idles despite a stale +bias");
-    // bias=0 regression: identical to the old real-diff recompute.
-    CHECK(user_recompute(4, 0.50f, 0.50f, true) == 3, "bias=0: active user event == real-diff recompute");
-    // Cold re-engage from -1 always uses real diff (gear-2 minimum), never the bias.
-    CHECK(user_recompute(-1, 0.30f, 1.50f, false) == 2, "cold re-engage from -1 uses real diff (gear 2)");
+// Round-3 regressions: the user_input path is conservative (real diff, bias-independent), and
+// the gear-0 user-event shutoff works.
+void test_user_event_conservative() {
+    printf("\n=== User event recompute uses real diff only (bias-independent) ===\n");
+    // gear 0, user event, room below setpoint → must shut OFF (the Round-3 gear-0 regression).
+    CHECK(user_recompute(0, -0.30f, true) == -1, "gear-0 user event below setpoint idles (-1)");
+    // A negative bias must NOT collapse the gear on a user tap — the path ignores bias entirely,
+    // so a warm room (real diff +0.20) recomputes to a cooling gear regardless of any bias.
+    CHECK(user_recompute(3, 0.20f, true) == 1, "user tap, room warm: real-diff recompute (bias ignored)");
+    // Big setpoint drop still jumps straight to a high gear (responsiveness preserved).
+    CHECK(user_recompute(2, 1.50f, true) == 5, "big setpoint drop jumps to gear 5");
+    // Cold re-engage from -1 uses real diff, gear-2 minimum.
+    CHECK(user_recompute(-1, 0.30f, false) == 2, "cold re-engage from -1 -> gear 2");
 }
 
 // Closed-loop: a sustained vent-fan burst raises the load; adaptive (bias + feedforward)
@@ -337,7 +337,7 @@ void test_hot_plus_fan_closed_loop() {
 
 int main() {
     test_disabled_is_identical();
-    test_user_event_keeps_bias();
+    test_user_event_conservative();
     test_hot_plus_fan_closed_loop();
     test_hot_day_centers_high();
     test_bias_clamped();

@@ -53,16 +53,17 @@ adaptive_last_advance_ = now
 ```
 
 ### Where `eff_diff` is used vs REAL `diff`
-- **`eff_diff`** → the active-cooling switch cases 1–5 only (every up *and* down comparison,
-  including 1→0), AND the `user_input` preserve-state check `gear_in_band_cool_(gear, eff_diff)`
-  (consistent with how the gear was selected). This is the only behavioral change to gear
-  selection.
-- **REAL `diff`** → (a) the fresh-start/`-1` and case-0 *re-engage* selection — a restart from
-  off/idle keys on genuine error, not a possibly-stale bias (which has decayed during idle
-  anyway), keeping cold-start conservative and the restart machinery's gear-2 minimum intact;
-  (b) the case-0 `past_setpoint` mode-switch-eligibility gate; (c) the `gear_diff` debug value;
-  (d) everything outside cool gear selection. Rationale: the adaptive cool bias must never
-  influence heat/cool arbitration, the "room is genuinely satisfied" decision, or a cold restart.
+- **`eff_diff`** → the active-cooling **steady-state switch cases 1–5 ONLY** (every up *and* down
+  comparison, including 1→0). This is the single behavioral change to gear selection, and it is
+  where the adaptive value lives.
+- **REAL `diff`** → *everything else*, including the entire `user_input`/fresh-start/`-1`/case-0
+  block (preserve check, recompute, re-engage, idle/shutoff), the `past_setpoint` mode-switch
+  gate, and the `gear_diff` debug value. Rationale: a `user_input` event is a **transient** — we
+  respond conservatively to the *actual* room temperature and let the bias re-apply over the next
+  few normal passes via the switch. Making the user_input path bias-aware caused regressions
+  (overcool/over-collapse on a benign user tap; lost gear-0 shutoff) and was reverted in Round 3.
+  This keeps the user_input path **bit-identical to the non-adaptive ladder**, so with bias=0 (or
+  `adaptive_enable=false`) the entire controller is bit-identical to main.
 
 ### Applying nothing else
 `bias_c` changes *only* which gear the ladder picks. The resulting `cool_gear_` flows through

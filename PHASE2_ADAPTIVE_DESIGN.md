@@ -84,9 +84,11 @@ concern); the restart/kickstart machinery already keys on the final `cool_gear_`
    correctness property: it stops windup behind a held upshift from cascading gears, AND lets a
    stale *positive* bias unwind at gear 1 (a prior naive `gear<=1 && e<0` freeze trapped it,
    causing indefinite overcooling — fixed Round-1).
-5. Within `FAN_EDGE_FREEZE_MS` of a *real* vent-fan edge (`vent_fan_sensor_ != null &&
+5. Within `FAN_EDGE_FREEZE_MS` of a vent-fan state publish (`vent_fan_sensor_ != null &&
    vent_fan_changed_at_ != 0`) — the transient is handled by feedforward, not the integral.
-   The `!= 0` guard prevents a spurious freeze in the first 3 min of every boot.
+   The `!= 0` guard fully suppresses the freeze when no fan is configured; with a fan, the
+   binary_sensor's initial-state publish can leave the window active for the first ~3 min of
+   boot, which is harmless (bias_c starts at 0, nothing to freeze).
 
 Failsafe/NaN never reach this code (`run_gear_controller_` returns early). `bias_c` starts
 at 0 on boot (converges within ~20–40 min; not persisted in v1) and is cleared whenever
@@ -173,7 +175,7 @@ Trip-safety / revert paths (defence in depth):
 - **Unit:** `eff_diff` shifts gear selection as specified; anti-windup freezes in each
   listed condition; idle decay relaxes bias_c; fan FF + edge-freeze; real-diff still used
   for the mode-switch gate and debug.
-- **Closed-loop sim** (`simulation_test.cpp` extension): mild / hot / hot+fan regimes with
+- **Closed-loop sim** (`tests/adaptive_test.cpp`, self-contained plant): mild / hot / hot+fan / varying-load regimes with
   drift-rate plant; assert adaptive centers on the sustaining gear, holds room near
   setpoint (smaller offset than static), and reduces swing/changes vs the static ladder —
   without winding up during idle or behind the restart lockout.

@@ -124,13 +124,17 @@ struct SimResult { int changes=0; float tmin=1e9f, tmax=-1e9f, tsum=0; int n=0;
 
 // Run a closed-loop cool sim. load_at(minute) returns the warming load.
 template <typename LoadFn>
-SimResult simulate(bool adaptive_on, LoadFn load_at, int minutes, float target_f, int fan_ff=0) {
+SimResult simulate(bool adaptive_on, LoadFn load_at, int minutes, float target_f,
+                   int fan_ff=0, int fan_start=-1, int fan_end=-1) {
     SimResult r; Plant plant; Adaptive a; a.enable = adaptive_on; a.fan_ff_gears = fan_ff;
+    a.fan_present = (fan_start >= 0);
     float room = target_f; int gear = 2; plant.c_now = plant.cooling(2);
     uint32_t time_in_gear = 999999; uint32_t now = 0;
     int ss_start = minutes * 2 / 3;          // steady-state = last third
     for (int m = 0; m < minutes; m++) {
         now = (uint32_t)m * 60000u;
+        bool fan = (m >= fan_start && m < fan_end);
+        if (fan != a.fan_on) { a.fan_on = fan; a.fan_changed_at = now; }  // record real edges
         float diff_c = f_to_c(room) - f_to_c(target_f);
         float eff = a.eff_diff(diff_c, gear, /*kickstart=*/false, now, time_in_gear);
         int ng = select_cool_gear(gear, diff_c, eff, time_in_gear);
@@ -289,8 +293,52 @@ void test_varying_load_tracks_setpoint() {
           "adaptive tracks setpoint tighter than static under a varying load");
 }
 
+// Mirror of the user_input/fresh-start recompute (the eff_diff-vs-real-diff split, Round 2).
+int user_recompute(int gear, float real_diff, float eff_diff, bool user_input) {
+    bool active_user = (user_input && gear >= 1);
+    float sel = active_user ? eff_diff : real_diff;
+    if (active_user && real_diff < C_IDLE) return -1;
+    if (sel > C_UP_45) return 5;
+    if (sel > C_UP_34) return 4;
+    if (sel > C_UP_23) return 3;
+    if (sel > C_UP_12) return 2;
+    if (sel > C_UP_01) return (gear == -1) ? 2 : 1;
+    if (gear == -1)    return -1;
+    return 0;
+}
+
+// Round-2 regression: a benign user event must not throw away a learned bias.
+void test_user_event_keeps_bias() {
+    printf("\n=== User event recompute keys upshifts on eff_diff, idles on real diff ===\n");
+    // gear 4, learned bias +0.85, real diff 0.50 → eff 1.35: a no-op tweak must move toward
+    // gear 5 (more cooling), NOT collapse to gear 3 on real diff (the Round-2 bug).
+    CHECK(user_recompute(4, 0.50f, 1.35f, true) == 5, "active user event at gear4 +bias -> gear 5 (no collapse)");
+    // Setpoint raise: room now 1C below the new setpoint, stale bias +2.0 (eff +1.0) — must
+    // idle on REAL diff regardless of the stale cooling bias.
+    CHECK(user_recompute(4, -1.0f, 1.0f, true) == -1, "setpoint raise idles despite a stale +bias");
+    // bias=0 regression: identical to the old real-diff recompute.
+    CHECK(user_recompute(4, 0.50f, 0.50f, true) == 3, "bias=0: active user event == real-diff recompute");
+    // Cold re-engage from -1 always uses real diff (gear-2 minimum), never the bias.
+    CHECK(user_recompute(-1, 0.30f, 1.50f, false) == 2, "cold re-engage from -1 uses real diff (gear 2)");
+}
+
+// Closed-loop: a sustained vent-fan burst raises the load; adaptive (bias + feedforward)
+// should ride it without losing setpoint or winding up wildly.
+void test_hot_plus_fan_closed_loop() {
+    printf("\n=== Hot + sustained vent fan (closed loop): holds setpoint, bias bounded ===\n");
+    // base hot load; fan ON minutes 200-360 adds load (dumps conditioned air).
+    auto load = [](int m){ return (m >= 200 && m < 360) ? 0.245f : 0.18f; };
+    SimResult ad = simulate(true, load, 480, 68.0f, /*fan_ff=*/1, /*fan_start=*/200, /*fan_end=*/360);
+    float ss_off = ad.ss_tsum/ad.ss_n - 68.0f;
+    printf("  steady off %+.2fF, swing %.2fF, bias_end %.2fC\n", ss_off, ad.ss_tmax-ad.ss_tmin, ad.bias_end);
+    CHECK(std::fabs(ss_off) < 0.6f, "hot+fan: holds setpoint within 0.6F after the burst");
+    CHECK(ad.bias_end <= ADAPT_BIAS_C_MAX + 1e-4f, "hot+fan: bias stays clamped (no runaway)");
+}
+
 int main() {
     test_disabled_is_identical();
+    test_user_event_keeps_bias();
+    test_hot_plus_fan_closed_loop();
     test_hot_day_centers_high();
     test_bias_clamped();
     test_idle_decay();

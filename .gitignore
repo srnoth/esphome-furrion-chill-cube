@@ -4,3 +4,5 @@ mode_switch_test
 tests/mild_test
 tests/sim_test
 tests/gear_test
+
+tests/adaptive_test

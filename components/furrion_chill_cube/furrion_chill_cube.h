@@ -5,6 +5,7 @@
 #include "esphome/components/remote_transmitter/remote_transmitter.h"
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/components/sensor/sensor.h"
+#include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/button/button.h"
 #include "esphome/core/preferences.h"
 
@@ -32,6 +33,11 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_keepalive_enable(bool enable) { keepalive_enable_ = enable; }
   void set_use_fahrenheit(bool enable) { use_fahrenheit_ = enable; }
 
+  // Phase 2 adaptive equilibrium-gear controller (cool mode)
+  void set_adaptive_enable(bool enable) { adaptive_enable_ = enable; }
+  void set_vent_fan_sensor(binary_sensor::BinarySensor *s) { vent_fan_sensor_ = s; }
+  void set_fan_feedforward_gears(int g) { fan_feedforward_gears_ = g; }
+
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
   void set_cool_gear_sensor(sensor::Sensor *s) { cool_gear_sensor_ = s; }
@@ -50,6 +56,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_debug_heater_locked_out_sensor(sensor::Sensor *s) { debug_heater_locked_out_sensor_ = s; }
   void set_debug_failsafe_active_sensor(sensor::Sensor *s) { debug_failsafe_active_sensor_ = s; }
   void set_debug_boot_ready_sensor(sensor::Sensor *s) { debug_boot_ready_sensor_ = s; }
+  void set_debug_adaptive_bias_c_sensor(sensor::Sensor *s) { debug_adaptive_bias_c_sensor_ = s; }
+  void set_debug_room_drift_sensor(sensor::Sensor *s) { debug_room_drift_sensor_ = s; }
+  void set_debug_fan_feedforward_sensor(sensor::Sensor *s) { debug_fan_feedforward_sensor_ = s; }
 
   // IR commands (public for button access)
   void send_display_toggle();
@@ -85,6 +94,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   int compute_gear_cs_(bool is_heat, int gear);
   bool gear_in_band_heat_(int gear, float diff);
   bool gear_in_band_cool_(int gear, float diff);
+
+  // Phase 2 adaptive (cool): advance the integral bias with anti-windup, then return
+  // the effective diff (real_diff + bias_c + fan feedforward) the cool ladder selects on.
+  // Returns real_diff unchanged when adaptive is disabled.
+  float adaptive_cool_eff_diff_(float real_diff, uint32_t now);
+  bool vent_fan_on_();
 
   // Kickstart system
   // Clamped kickstart: OFF→low gear, fan=LOW for 5:30, gear controller runs but CS overridden
@@ -150,6 +165,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *debug_heater_locked_out_sensor_{nullptr};
   sensor::Sensor *debug_failsafe_active_sensor_{nullptr};
   sensor::Sensor *debug_boot_ready_sensor_{nullptr};
+  sensor::Sensor *debug_adaptive_bias_c_sensor_{nullptr};
+  sensor::Sensor *debug_room_drift_sensor_{nullptr};
+  sensor::Sensor *debug_fan_feedforward_sensor_{nullptr};
+
+  // Phase 2 adaptive input
+  binary_sensor::BinarySensor *vent_fan_sensor_{nullptr};
 
   // Configuration
   float outside_lockout_temp_c_{1.67f};   // 35°F default
@@ -221,6 +242,16 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool user_changed_{false};
   bool temp_dirty_{false};
   bool heater_locked_out_{false};
+
+  // Phase 2 adaptive equilibrium-gear controller (cool mode) — see PHASE2_ADAPTIVE_DESIGN.md
+  bool adaptive_enable_{false};          // master switch (set true via YAML on the phase2 branch)
+  int fan_feedforward_gears_{1};         // gear-equivalents of feedforward while vent fan runs
+  float bias_c_{0.0f};                   // integral bias (°C) added to the diff the cool ladder sees
+  uint32_t adaptive_last_advance_{0};    // last integral advance (for dt)
+  uint32_t vent_fan_changed_at_{0};      // last vent-fan edge (for the integral freeze window)
+  float room_drift_cpm_{NAN};            // EMA of inside dT/dt (°C/min) — observability + future use
+  float prev_inside_temp_c_{NAN};        // previous inside temp for drift computation
+  uint32_t prev_inside_temp_at_{0};      // timestamp of prev_inside_temp_c_
 
   // Cached temperatures (Celsius)
   float inside_temp_c_{NAN};

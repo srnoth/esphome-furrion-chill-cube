@@ -1,5 +1,6 @@
 #include "furrion_chill_cube.h"
 #include "esphome/core/log.h"
+#include <cmath>  // expf, isnan (adaptive integral decay)
 
 #ifdef USE_API
 #include "esphome/components/api/api_server.h"
@@ -123,6 +124,20 @@ static const float C_DN_21 = -0.40f;
 // straight to a stop. Down-ladder stays monotonic: 0.45 / 0.40 / -0.05 / -0.40 / -0.55.
 static const float C_DN_10 = -0.55f;
 static const float C_IDLE  = -0.15f;
+
+// ── Phase 2 adaptive equilibrium-gear controller (cool mode) ────────────────────
+// A slow integral floats the cool ladder's operating point to the gear that sustains
+// the current load (which is NOT observable from outside temp — bodies, the CO2 vent
+// fan, solar gain). PI control: the static ladder is the proportional inner loop; this
+// integral removes its steady-state offset. See PHASE2_ADAPTIVE_DESIGN.md.
+static const float ADAPT_KI = 0.06f;          // bias_c (°C) per (°C-error · min). Primary tuning knob.
+static const float ADAPT_BIAS_C_MAX = 2.0f;   // authority clamp (~2-3 gears) + runaway backstop
+static const float ADAPT_DEADBAND_C = 0.15f;  // don't integrate noise / tiny offset
+static const float ADAPT_DECAY_TAU_MIN = 30.0f; // idle: forget a stale equilibrium with this time const
+static const float ADAPT_DT_CAP_MIN = 5.0f;   // clamp dt across stalls/reboots
+static const float GEAR_STEP_C = 0.85f;       // one cool gear ≈ this much eff_diff (≈ C_UP spacing)
+static const uint32_t FAN_EDGE_FREEZE_MS = 180000; // freeze integral 3 min after a vent-fan edge
+static const float ADAPT_DRIFT_ALPHA = 0.3f;  // EMA smoothing for room dT/dt
 
 // Mode-switching protection lives in the 0→-1 gate and -1→active gate
 // (see mode_switch_idle_ms_, mode_switch_event_ms_, mode_switch_temp_offset_c_, mode_switch_off_ms_)
@@ -463,15 +478,39 @@ void FurrionChillCube::setup() {
   // Register temperature sensor callbacks
   if (inside_temp_sensor_) {
     inside_temp_sensor_->add_on_state_callback([this](float value) {
+      uint32_t cb_now = millis();
       if (isnan(value)) {
         inside_temp_c_ = NAN;
       } else {
         inside_temp_c_ = inside_temp_fahrenheit_ ? (value - 32.0f) * (5.0f / 9.0f) : value;
+        // Room drift EMA (°C/min) — observability + future rate-gated upshift. Only when we
+        // have a valid prior sample at a sane interval (5s–5min); NaN gaps reset the history.
+        if (!isnan(prev_inside_temp_c_) && prev_inside_temp_at_ != 0) {
+          float dt_min = (cb_now - prev_inside_temp_at_) / 60000.0f;
+          if (dt_min >= (5.0f / 60.0f) && dt_min <= 5.0f) {
+            float inst = (inside_temp_c_ - prev_inside_temp_c_) / dt_min;
+            room_drift_cpm_ = isnan(room_drift_cpm_)
+                                  ? inst
+                                  : ADAPT_DRIFT_ALPHA * inst + (1.0f - ADAPT_DRIFT_ALPHA) * room_drift_cpm_;
+          }
+        }
+        prev_inside_temp_c_ = inside_temp_c_;
+        prev_inside_temp_at_ = cb_now;
       }
       this->current_temperature = inside_temp_c_;
-      this->last_temp_update_ = millis();
+      this->last_temp_update_ = cb_now;
       this->temp_dirty_ = true;
       this->publish_state();
+    });
+  }
+
+  // Vent-fan disturbance input: record each edge so the adaptive integral can freeze
+  // across it (the burst is handled by feedforward, not by re-learning the equilibrium).
+  if (vent_fan_sensor_) {
+    vent_fan_changed_at_ = millis();
+    vent_fan_sensor_->add_on_state_callback([this](bool state) {
+      this->vent_fan_changed_at_ = millis();
+      this->temp_dirty_ = true;  // re-run the controller promptly on a fan edge
     });
   }
   if (outside_temp_sensor_) {
@@ -755,6 +794,54 @@ bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
     case 5: return diff >= C_DN_54;                          // max cool, no upper bound
     default: return false;
   }
+}
+
+bool FurrionChillCube::vent_fan_on_() {
+  return vent_fan_sensor_ != nullptr && vent_fan_sensor_->state;
+}
+
+// Phase 2 adaptive (cool): advance the integral bias (bias_c_) with anti-windup, then return
+// the effective diff the cool ladder's ACTIVE-gear thresholds select on
+// (real_diff + bias_c_ + vent-fan feedforward). Returns real_diff unchanged when adaptive is
+// disabled. The caller uses this ONLY for switch cases 1-5 — re-engage/idle decisions stay on
+// real diff. Must be called once per cool pass (even at gear 0) so the integral advances/decays.
+// See PHASE2_ADAPTIVE_DESIGN.md §2-3.
+float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now) {
+  if (!adaptive_enable_) {
+    adaptive_last_advance_ = now;  // keep dt fresh so a later enable doesn't see a huge gap
+    return real_diff;
+  }
+
+  // dt since last advance, clamped (first pass, stalls, mode gaps, millis wrap-after-reboot)
+  float dt_min = 0.0f;
+  if (adaptive_last_advance_ != 0) {
+    dt_min = (now - adaptive_last_advance_) / 60000.0f;
+    if (dt_min < 0.0f) dt_min = 0.0f;
+    if (dt_min > ADAPT_DT_CAP_MIN) dt_min = ADAPT_DT_CAP_MIN;
+  }
+  adaptive_last_advance_ = now;
+
+  // Error with deadband (+ = room too warm = need more cooling). REAL diff drives the integral.
+  float e = real_diff;
+  if (e > -ADAPT_DEADBAND_C && e < ADAPT_DEADBAND_C) e = 0.0f;
+
+  bool fan_edge_freeze = (now - vent_fan_changed_at_) < FAN_EDGE_FREEZE_MS;
+  bool idle = (cool_gear_ <= 0);                 // compressor off/idle — error not controllable
+  bool sat_high = (cool_gear_ >= 5 && e > 0.0f); // already railed high, still warm
+  bool sat_low = (cool_gear_ <= 1 && e < 0.0f);  // already at lowest active gear, room cold
+  bool freeze = kickstart_active_() || fan_edge_freeze || sat_high || sat_low;
+
+  if (idle) {
+    // Idle: forget a stale equilibrium so a re-engage doesn't inherit a wrong load.
+    if (dt_min > 0.0f) bias_c_ *= expf(-dt_min / ADAPT_DECAY_TAU_MIN);
+  } else if (!freeze && dt_min > 0.0f) {
+    bias_c_ += ADAPT_KI * e * dt_min;
+    if (bias_c_ > ADAPT_BIAS_C_MAX) bias_c_ = ADAPT_BIAS_C_MAX;
+    if (bias_c_ < -ADAPT_BIAS_C_MAX) bias_c_ = -ADAPT_BIAS_C_MAX;
+  }
+
+  float ff_c = vent_fan_on_() ? (fan_feedforward_gears_ * GEAR_STEP_C) : 0.0f;
+  return real_diff + bias_c_ + ff_c;
 }
 
 int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
@@ -1144,6 +1231,12 @@ void FurrionChillCube::run_gear_controller_() {
     run_idle_mode_(now);
   }
 
+  // Phase 2: the adaptive bias only exists during active cooling. Clear it whenever cooling
+  // is not the active mode so a heat→cool switch (or a return from full-off) starts fresh
+  // rather than inheriting a stale equilibrium. (Within-cool gear-0 idle is handled by the
+  // decay in adaptive_cool_eff_diff_, which still runs because do_cool stays true at gear 0.)
+  if (!do_cool) bias_c_ = 0.0f;
+
   // Boot gate: first successful gear computation enables IR
   if (!boot_ready_) {
     boot_ready_ = true;
@@ -1154,11 +1247,11 @@ void FurrionChillCube::run_gear_controller_() {
   publish_debug_state_(gear_diff);
 
   // Periodic state log
-  ESP_LOGD(TAG, "state: heat=%d cool=%d room=%.2f cs=%d hold=%lus idle=%lum mode=%d",
+  ESP_LOGD(TAG, "state: heat=%d cool=%d room=%.2f cs=%d hold=%lus idle=%lum mode=%d bias=%.2f drift=%.3f",
            heat_gear_, cool_gear_, room, current_cs_,
            time_in_gear / 1000,
            idle_since_ > 0 ? (now - idle_since_) / 60000 : 0,
-           (int)last_active_mode_);
+           (int)last_active_mode_, bias_c_, room_drift_cpm_);
 }
 
 // Failsafe detection + NaN-room grace. Returns true if the caller should stop
@@ -1482,7 +1575,11 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     return true;
   }
   float diff = room - target;
-  gear_diff = diff;
+  gear_diff = diff;  // debug always reports REAL (unbiased) diff
+  // Phase 2 adaptive: advance the integral and get the effective diff used ONLY for the
+  // active-gear switch cases (1-5). Re-engage/idle/mode-switch decisions stay on real diff.
+  // Called every cool pass so the integral advances (or decays while idle) consistently.
+  float eff_diff = adaptive_cool_eff_diff_(diff, now);
   int gear = cool_gear_;
   int new_gear = gear;
 
@@ -1532,24 +1629,27 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
         break;
       }
+      // Active gears (1-5) select on eff_diff (= diff + adaptive bias + fan feedforward),
+      // floating the ladder's center to today's sustaining gear. eff_diff == diff when
+      // adaptive is disabled, so this is bit-identical to the static ladder in that case.
       case 1:
-        if (can_upshift_to(2) && diff > C_UP_12)  new_gear = 2;
-        else if (diff < C_DN_10)                   new_gear = 0;
+        if (can_upshift_to(2) && eff_diff > C_UP_12)  new_gear = 2;
+        else if (eff_diff < C_DN_10)                   new_gear = 0;
         break;
       case 2:
-        if (can_upshift_to(3) && diff > C_UP_23)  new_gear = 3;
-        else if (diff < C_DN_21)                   new_gear = 1;
+        if (can_upshift_to(3) && eff_diff > C_UP_23)  new_gear = 3;
+        else if (eff_diff < C_DN_21)                   new_gear = 1;
         break;
       case 3:
-        if (can_upshift_to(4) && diff > C_UP_34)  new_gear = 4;
-        else if (diff < C_DN_32)                   new_gear = 2;
+        if (can_upshift_to(4) && eff_diff > C_UP_34)  new_gear = 4;
+        else if (eff_diff < C_DN_32)                   new_gear = 2;
         break;
       case 4:
-        if (can_upshift_to(5) && diff > C_UP_45)  new_gear = 5;
-        else if (diff < C_DN_43)                   new_gear = 3;
+        if (can_upshift_to(5) && eff_diff > C_UP_45)  new_gear = 5;
+        else if (eff_diff < C_DN_43)                   new_gear = 3;
         break;
       case 5:
-        if (diff < C_DN_54)                        new_gear = 4;
+        if (eff_diff < C_DN_54)                        new_gear = 4;
         break;
     }
   }
@@ -1729,6 +1829,11 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   pub(debug_heater_locked_out_sensor_, heater_locked_out_ ? 1.0f : 0.0f);
   pub(debug_failsafe_active_sensor_, failsafe_active_ ? 1.0f : 0.0f);
   pub(debug_boot_ready_sensor_, boot_ready_ ? 1.0f : 0.0f);
+
+  // Phase 2 adaptive observability
+  pub(debug_adaptive_bias_c_sensor_, bias_c_);
+  pub(debug_room_drift_sensor_, room_drift_cpm_);
+  pub(debug_fan_feedforward_sensor_, vent_fan_on_() ? (float)fan_feedforward_gears_ : 0.0f);
 }
 
 // ============================================================

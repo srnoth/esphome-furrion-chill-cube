@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import climate, sensor, button, remote_transmitter
+from esphome.components import climate, sensor, binary_sensor, button, remote_transmitter
 from esphome.const import (
     CONF_ID,
     CONF_NAME,
@@ -12,7 +12,7 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["remote_transmitter"]
-AUTO_LOAD = ["sensor", "button"]
+AUTO_LOAD = ["sensor", "binary_sensor", "button"]
 CODEOWNERS = ["@srnoth"]
 
 fcc_ns = cg.esphome_ns.namespace("furrion_chill_cube")
@@ -38,6 +38,10 @@ CONF_MODE_SWITCH_TEMP_OFFSET = "mode_switch_temp_offset"
 CONF_MODE_SWITCH_OFF_MIN = "mode_switch_off_min"
 CONF_KEEPALIVE_ENABLE = "keepalive_enable"
 CONF_USE_FAHRENHEIT = "use_fahrenheit"
+# Phase 2 adaptive equilibrium-gear controller (cool mode)
+CONF_ADAPTIVE_ENABLE = "adaptive_enable"
+CONF_VENT_FAN = "vent_fan"
+CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
 
 
 def validate_mode_switch_temp_offset(value):
@@ -73,6 +77,9 @@ CONF_DEBUG_FAN_CLAMP_REMAINING = "debug_fan_clamp_remaining"
 CONF_DEBUG_HEATER_LOCKED_OUT = "debug_heater_locked_out"
 CONF_DEBUG_FAILSAFE_ACTIVE = "debug_failsafe_active"
 CONF_DEBUG_BOOT_READY = "debug_boot_ready"
+CONF_DEBUG_ADAPTIVE_BIAS_C = "debug_adaptive_bias_c"
+CONF_DEBUG_ROOM_DRIFT = "debug_room_drift"
+CONF_DEBUG_FAN_FEEDFORWARD = "debug_fan_feedforward"
 
 # (config_key, setter_name)
 DEBUG_SENSOR_MAP = [
@@ -87,6 +94,9 @@ DEBUG_SENSOR_MAP = [
     (CONF_DEBUG_HEATER_LOCKED_OUT, "set_debug_heater_locked_out_sensor"),
     (CONF_DEBUG_FAILSAFE_ACTIVE, "set_debug_failsafe_active_sensor"),
     (CONF_DEBUG_BOOT_READY, "set_debug_boot_ready_sensor"),
+    (CONF_DEBUG_ADAPTIVE_BIAS_C, "set_debug_adaptive_bias_c_sensor"),
+    (CONF_DEBUG_ROOM_DRIFT, "set_debug_room_drift_sensor"),
+    (CONF_DEBUG_FAN_FEEDFORWARD, "set_debug_fan_feedforward_sensor"),
 ]
 
 _DEBUG_SENSOR = sensor.sensor_schema(
@@ -103,6 +113,11 @@ _DEBUG_SENSOR_S = sensor.sensor_schema(
     unit_of_measurement=UNIT_SECOND,
     entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
 )
+_DEBUG_SENSOR_DRIFT = sensor.sensor_schema(
+    accuracy_decimals=3,
+    unit_of_measurement="°C/min",
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
 
 _DEBUG_SCHEMAS = {
     CONF_DEBUG_ACTIVE_IR_MODE: _DEBUG_SENSOR,
@@ -116,6 +131,9 @@ _DEBUG_SCHEMAS = {
     CONF_DEBUG_HEATER_LOCKED_OUT: _DEBUG_SENSOR,
     CONF_DEBUG_FAILSAFE_ACTIVE: _DEBUG_SENSOR,
     CONF_DEBUG_BOOT_READY: _DEBUG_SENSOR,
+    CONF_DEBUG_ADAPTIVE_BIAS_C: _DEBUG_SENSOR_C,
+    CONF_DEBUG_ROOM_DRIFT: _DEBUG_SENSOR_DRIFT,
+    CONF_DEBUG_FAN_FEEDFORWARD: _DEBUG_SENSOR,
 }
 
 
@@ -174,6 +192,17 @@ CONFIG_SCHEMA = cv.All(
             # tracks the unit's internal target regardless of the F/C protocol
             # used to transmit it.
             cv.Optional(CONF_USE_FAHRENHEIT, default=True): cv.boolean,
+            # Phase 2 adaptive equilibrium-gear controller (cool mode).
+            # When enabled, a slow integral floats the cool ladder's operating point to the
+            # gear that sustains the current (unobservable-from-outside) load, so the room
+            # holds setpoint with a gentle ±1-gear cycle on any day instead of swinging.
+            # false (default) = identical to the static ladder. See PHASE2_ADAPTIVE_DESIGN.md.
+            cv.Optional(CONF_ADAPTIVE_ENABLE, default=False): cv.boolean,
+            # Optional observed-disturbance input: the CO2/fresh-air vent fan. While ON, a
+            # fixed feedforward biases cooling up and the integral is frozen across the edge.
+            cv.Optional(CONF_VENT_FAN): cv.use_id(binary_sensor.BinarySensor),
+            # Gear-equivalents of feedforward applied while the vent fan runs (field-tuned).
+            cv.Optional(CONF_FAN_FEEDFORWARD_GEARS, default=1): cv.int_range(min=0, max=3),
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -206,6 +235,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_DEBUG_HEATER_LOCKED_OUT): _DEBUG_SENSOR,
             cv.Optional(CONF_DEBUG_FAILSAFE_ACTIVE): _DEBUG_SENSOR,
             cv.Optional(CONF_DEBUG_BOOT_READY): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_ADAPTIVE_BIAS_C): _DEBUG_SENSOR_C,
+            cv.Optional(CONF_DEBUG_ROOM_DRIFT): _DEBUG_SENSOR_DRIFT,
+            cv.Optional(CONF_DEBUG_FAN_FEEDFORWARD): _DEBUG_SENSOR,
             # Buttons (optional)
             cv.Optional(CONF_DISPLAY_TOGGLE): button.button_schema(
                 DisplayToggleButton,
@@ -263,6 +295,13 @@ async def to_code(config):
     cg.add(var.set_mode_switch_off_min(config[CONF_MODE_SWITCH_OFF_MIN]))
     cg.add(var.set_keepalive_enable(config[CONF_KEEPALIVE_ENABLE]))
     cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
+
+    # Phase 2 adaptive equilibrium-gear controller (cool mode)
+    cg.add(var.set_adaptive_enable(config[CONF_ADAPTIVE_ENABLE]))
+    cg.add(var.set_fan_feedforward_gears(config[CONF_FAN_FEEDFORWARD_GEARS]))
+    if CONF_VENT_FAN in config:
+        fan = await cg.get_variable(config[CONF_VENT_FAN])
+        cg.add(var.set_vent_fan_sensor(fan))
 
     # Diagnostic sensors
     for key, setter in [

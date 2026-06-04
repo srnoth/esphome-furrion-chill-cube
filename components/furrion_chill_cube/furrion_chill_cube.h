@@ -97,8 +97,10 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Phase 2 adaptive (cool): advance the integral bias with anti-windup, then return
   // the effective diff (real_diff + bias_c + fan feedforward) the cool ladder selects on.
-  // Returns real_diff unchanged when adaptive is disabled.
-  float adaptive_cool_eff_diff_(float real_diff, uint32_t now);
+  // Returns real_diff unchanged when adaptive is disabled. time_in_gear gates the
+  // conditional-integration anti-windup (freeze positive accumulation behind a hold-blocked
+  // upshift). Must be called once per cool pass so the integral advances/decays.
+  float adaptive_cool_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear);
   bool vent_fan_on_();
 
   // Kickstart system

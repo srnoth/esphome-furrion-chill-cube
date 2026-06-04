@@ -135,7 +135,8 @@ static const float ADAPT_BIAS_C_MAX = 2.0f;   // authority clamp (~2-3 gears) + 
 static const float ADAPT_DEADBAND_C = 0.15f;  // don't integrate noise / tiny offset
 static const float ADAPT_DECAY_TAU_MIN = 30.0f; // idle: forget a stale equilibrium with this time const
 static const float ADAPT_DT_CAP_MIN = 5.0f;   // clamp dt across stalls/reboots
-static const float GEAR_STEP_C = 0.85f;       // one cool gear ≈ this much eff_diff (≈ C_UP spacing)
+static const float GEAR_STEP_C = 0.85f;       // eff_diff per gear-equivalent of fan feedforward
+                                              // (= C_UP_34; a deliberately firm one-gear shove)
 static const uint32_t FAN_EDGE_FREEZE_MS = 180000; // freeze integral 3 min after a vent-fan edge
 static const float ADAPT_DRIFT_ALPHA = 0.3f;  // EMA smoothing for room dT/dt
 
@@ -481,6 +482,11 @@ void FurrionChillCube::setup() {
       uint32_t cb_now = millis();
       if (isnan(value)) {
         inside_temp_c_ = NAN;
+        // Reset drift history so the next valid sample starts a fresh interval rather than
+        // computing a rate across the NaN gap.
+        prev_inside_temp_c_ = NAN;
+        prev_inside_temp_at_ = 0;
+        room_drift_cpm_ = NAN;
       } else {
         inside_temp_c_ = inside_temp_fahrenheit_ ? (value - 32.0f) * (5.0f / 9.0f) : value;
         // Room drift EMA (°C/min) — observability + future rate-gated upshift. Only when we
@@ -507,7 +513,8 @@ void FurrionChillCube::setup() {
   // Vent-fan disturbance input: record each edge so the adaptive integral can freeze
   // across it (the burst is handled by feedforward, not by re-learning the equilibrium).
   if (vent_fan_sensor_) {
-    vent_fan_changed_at_ = millis();
+    // Leave vent_fan_changed_at_ at 0 until a REAL edge fires — the freeze window is gated on
+    // (!= 0) so boot doesn't look like a fan edge.
     vent_fan_sensor_->add_on_state_callback([this](bool state) {
       this->vent_fan_changed_at_ = millis();
       this->temp_dirty_ = true;  // re-run the controller promptly on a fan edge
@@ -806,7 +813,7 @@ bool FurrionChillCube::vent_fan_on_() {
 // disabled. The caller uses this ONLY for switch cases 1-5 — re-engage/idle decisions stay on
 // real diff. Must be called once per cool pass (even at gear 0) so the integral advances/decays.
 // See PHASE2_ADAPTIVE_DESIGN.md §2-3.
-float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now) {
+float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear) {
   if (!adaptive_enable_) {
     adaptive_last_advance_ = now;  // keep dt fresh so a later enable doesn't see a huge gap
     return real_diff;
@@ -825,11 +832,21 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now) {
   float e = real_diff;
   if (e > -ADAPT_DEADBAND_C && e < ADAPT_DEADBAND_C) e = 0.0f;
 
-  bool fan_edge_freeze = (now - vent_fan_changed_at_) < FAN_EDGE_FREEZE_MS;
-  bool idle = (cool_gear_ <= 0);                 // compressor off/idle — error not controllable
-  bool sat_high = (cool_gear_ >= 5 && e > 0.0f); // already railed high, still warm
-  bool sat_low = (cool_gear_ <= 1 && e < 0.0f);  // already at lowest active gear, room cold
-  bool freeze = kickstart_active_() || fan_edge_freeze || sat_high || sat_low;
+  // Freeze the 3-min window after a REAL vent-fan edge only (guard against the boot case where
+  // vent_fan_changed_at_ is still 0 / no fan sensor exists — else it would freeze for the first
+  // 3 min of every uptime).
+  bool fan_edge_freeze = (vent_fan_sensor_ != nullptr) && (vent_fan_changed_at_ != 0) &&
+                         ((now - vent_fan_changed_at_) < FAN_EDGE_FREEZE_MS);
+  bool idle = (cool_gear_ <= 0);  // compressor off/idle — error not controllable
+
+  // Conditional integration anti-windup: freeze POSITIVE accumulation only when the gear cannot
+  // rise right now — at gear 5, or while an upshift is hold-blocked (can_upshift_to). NEGATIVE
+  // accumulation is never rail-blocked because gear 0/idle is always reachable (downshifts are
+  // not hold-gated). This also lets a stale positive bias unwind at gear 1 (e<0 is not frozen),
+  // fixing the prior sat_low trap, and stops windup behind a held upshift from cascading gears.
+  bool upshift_held = (cool_gear_ < 5) && (time_in_gear < HOLD_MS[cool_gear_ + 1]);
+  bool block_up = (e > 0.0f) && (cool_gear_ >= 5 || upshift_held);
+  bool freeze = kickstart_active_() || fan_edge_freeze || block_up;
 
   if (idle) {
     // Idle: forget a stale equilibrium so a re-engage doesn't inherit a wrong load.
@@ -1400,6 +1417,11 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
 // HEATING mode pass. Returns true if it took an early (NaN-target) hold-return.
 bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
                                      float &gear_diff) {
+  // The cool-mode adaptive bias is meaningless in heat; clear it here (not just in the
+  // post-dispatch !do_cool clear) so it's cleared even if this pass early-returns on a NaN
+  // heat target — guaranteeing a later heat→cool switch always starts from bias_c_ = 0.
+  bias_c_ = 0.0f;
+
   uint32_t time_in_gear = time_in_gear_(now);
   auto can_upshift_to = [&](int target_gear) -> bool {
     return user_input || (time_in_gear >= HOLD_MS[target_gear]);
@@ -1579,7 +1601,7 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // Phase 2 adaptive: advance the integral and get the effective diff used ONLY for the
   // active-gear switch cases (1-5). Re-engage/idle/mode-switch decisions stay on real diff.
   // Called every cool pass so the integral advances (or decays while idle) consistently.
-  float eff_diff = adaptive_cool_eff_diff_(diff, now);
+  float eff_diff = adaptive_cool_eff_diff_(diff, now, time_in_gear);
   int gear = cool_gear_;
   int new_gear = gear;
 
@@ -1589,9 +1611,11 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
     if (gear == -1 && !off_long_enough) {
       new_gear = -1;  // still in 1-min wind-down period
-    } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, diff)) {
-      // User event (setpoint/fan tweak) but current gear is still valid for
-      // the current diff — preserve hunting state instead of recomputing.
+    } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, eff_diff)) {
+      // User event (setpoint/fan tweak) but current gear is still valid for the current
+      // (adaptive-biased) diff — preserve hunting state instead of recomputing. Checked on
+      // eff_diff (consistent with how the gear was selected) so a stale positive bias can't
+      // make an in-band gear look out-of-band and spuriously fall through to a shut-off.
       new_gear = gear;
     } else {
       // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),

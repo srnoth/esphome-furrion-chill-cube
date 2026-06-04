@@ -53,13 +53,16 @@ adaptive_last_advance_ = now
 ```
 
 ### Where `eff_diff` is used vs REAL `diff`
-- **`eff_diff`** → all active-cooling gear thresholds: the fresh-start/`-1` gear selection
-  and switch cases 1–5 (every up *and* down comparison, including 1→0). This is the only
-  behavioral change to gear selection.
-- **REAL `diff`** → (a) the case-0 `past_setpoint` mode-switch-eligibility gate
-  (`diff < -mode_switch_temp_offset_c_`), (b) the `gear_diff` debug value, (c) everything
-  outside cool gear selection. Rationale: the adaptive cool bias must never influence
-  heat/cool arbitration or the "room is genuinely satisfied" decision.
+- **`eff_diff`** → the active-cooling switch cases 1–5 only (every up *and* down comparison,
+  including 1→0), AND the `user_input` preserve-state check `gear_in_band_cool_(gear, eff_diff)`
+  (consistent with how the gear was selected). This is the only behavioral change to gear
+  selection.
+- **REAL `diff`** → (a) the fresh-start/`-1` and case-0 *re-engage* selection — a restart from
+  off/idle keys on genuine error, not a possibly-stale bias (which has decayed during idle
+  anyway), keeping cold-start conservative and the restart machinery's gear-2 minimum intact;
+  (b) the case-0 `past_setpoint` mode-switch-eligibility gate; (c) the `gear_diff` debug value;
+  (d) everything outside cool gear selection. Rationale: the adaptive cool bias must never
+  influence heat/cool arbitration, the "room is genuinely satisfied" decision, or a cold restart.
 
 ### Applying nothing else
 `bias_c` changes *only* which gear the ladder picks. The resulting `cool_gear_` flows through
@@ -69,18 +72,26 @@ concern); the restart/kickstart machinery already keys on the final `cool_gear_`
 
 ## 3. Anti-windup (the load-bearing safety logic)
 
-`allow_integrate` is **false** (freeze) when ANY of:
+**Conditional integration.** Accumulation is frozen when ANY of:
 1. `!adaptive_enable_` — master switch off (behaves exactly like current main).
 2. `kickstart_active_()` — CS is overridden; gear isn't reflecting steady control.
-3. `cool_gear_ <= 0` — compressor idle/off; error isn't controllable. (Also triggers
-   `idle_decay` instead — bias_c relaxes toward 0 so a long idle forgets a stale load.)
-4. **Output saturated in the direction of integration:** `cool_gear_ >= 5 && e > 0`, or
-   `cool_gear_ <= 1 && e < 0`. (Don't accumulate against a rail.)
-5. Within `FAN_EDGE_FREEZE_MS` of a vent-fan state change (the transient is handled by
-   feedforward, not the integral).
+3. `cool_gear_ <= 0` — compressor idle/off; error isn't controllable. (Takes the
+   `idle_decay` branch instead — bias_c relaxes toward 0 so a long idle forgets a stale load.)
+4. **`block_up`** — POSITIVE accumulation (`e > 0`) is frozen when the gear cannot rise right
+   now: at `cool_gear_ >= 5`, OR while an upshift is hold-blocked
+   (`time_in_gear < HOLD_MS[cool_gear_+1]`). NEGATIVE accumulation is *never* rail-blocked,
+   because gear 0/idle is always reachable (downshifts aren't hold-gated). This is the key
+   correctness property: it stops windup behind a held upshift from cascading gears, AND lets a
+   stale *positive* bias unwind at gear 1 (a prior naive `gear<=1 && e<0` freeze trapped it,
+   causing indefinite overcooling — fixed Round-1).
+5. Within `FAN_EDGE_FREEZE_MS` of a *real* vent-fan edge (`vent_fan_sensor_ != null &&
+   vent_fan_changed_at_ != 0`) — the transient is handled by feedforward, not the integral.
+   The `!= 0` guard prevents a spurious freeze in the first 3 min of every boot.
 
 Failsafe/NaN never reach this code (`run_gear_controller_` returns early). `bias_c` starts
-at 0 on boot (converges within ~20–40 min; not persisted in v1).
+at 0 on boot (converges within ~20–40 min; not persisted in v1) and is cleared whenever
+cooling isn't the active mode (including at the top of `run_heat_mode_`, so a NaN-target heat
+early-return can't leave a stale cool bias).
 
 ## 4. Vent-fan feedforward (optional, observed-disturbance only)
 
@@ -108,9 +119,9 @@ Fixed-anchor setpoints remain forbidden. See `project_failover_invariant`.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `adaptive_enable` | bool | **true** (this branch) | Master switch. False → identical to main. |
-| `vent_fan` | binary_sensor id | — | Optional observed-disturbance input. |
-| `fan_feedforward_gears` | int 0–3 | 1 | Gear-equivalents of feedforward while fan on. |
+| `adaptive_enable` | bool | **false** | Master switch (safe, explicit opt-in). False → identical to main. The camper test config sets it `true`. |
+| `vent_fan` | binary_sensor id | — | Optional observed-disturbance input (expected to be a *hysteretic* CO₂-threshold sensor — see §9). |
+| `fan_feedforward_gears` | int 0–3 | 1 | Gear-equivalents of feedforward while fan on (1 ≈ +0.85 °C, a firm shove). |
 
 Trip-safety / revert paths (defence in depth):
 - **Code:** camper YAML pins `source: github://srnoth/esphome-furrion-chill-cube` with no
@@ -141,6 +152,13 @@ Trip-safety / revert paths (defence in depth):
 | `GEAR_STEP_C` | 0.85 °C | one gear ≈ this much eff_diff (≈ cool C_UP spacing) |
 | `FAN_EDGE_FREEZE_MS` | 180000 | integral freeze window after a fan edge |
 | `ADAPT_DRIFT_ALPHA` | 0.3 | EMA smoothing for room drift |
+
+## 8b. Known limitations (v1)
+- **Vent-fan input must be hysteretic.** `ff_c` tracks the live fan state, and downshifts are
+  not hold-gated, so a fan that *chatters* on/off rapidly would ratchet the gear down with IR
+  churn (safe — downshift-while-running is CS-only, no compressor restart). A real CO₂-threshold
+  fan has natural on/off hysteresis and runs minutes at a time, so this is a non-issue in
+  practice; if a noisy relay is ever used, debounce the binary_sensor upstream.
 
 ## 9. Out of scope for v1 (future)
 - Heat-mode adaptive (heat hunts fine; root-cause-first).

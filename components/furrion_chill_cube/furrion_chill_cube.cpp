@@ -517,7 +517,9 @@ void FurrionChillCube::setup() {
     // (!= 0) so boot doesn't look like a fan edge.
     vent_fan_sensor_->add_on_state_callback([this](bool state) {
       this->vent_fan_changed_at_ = millis();
-      this->temp_dirty_ = true;  // re-run the controller promptly on a fan edge
+      // Re-run the controller promptly on a fan edge — but only when adaptive is enabled, so a
+      // disabled build is strictly identical to main (no extra prompted passes).
+      if (this->adaptive_enable_) this->temp_dirty_ = true;
     });
   }
   if (outside_temp_sensor_) {

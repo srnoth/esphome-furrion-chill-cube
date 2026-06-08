@@ -23,6 +23,16 @@ static const uint16_t IR_ONE_SPACE = 1620;
 static const uint16_t IR_GAP_SPACE = 5480;
 static const uint16_t IR_PACKET_SPACE = 10500;
 static const uint16_t IR_CARRIER_FREQ = 38000;
+// Inter-MESSAGE guard idle, prepended to each CS / mode frame. Distinct from
+// IR_GAP_SPACE (5480µs, the INTRA-message gap between a frame's repeats) and
+// larger than the 10500µs that already delimits the swing frame reliably. With
+// non_blocking:false, consecutive transmit.perform() calls leave no idle between
+// them, so a CS→MODE-ON→CS bracket (or the quick-kickstart's CS→MODE-ON) arrives
+// jammed at ~intra-message spacing and the unit can merge/misparse the mode-on.
+// That is invisible on a running unit (the mode frame is redundant there) but
+// makes a cold OFF→ON power-on intermittently fail — the mode-on is its only
+// shot. A leading idle on every frame guarantees a clean message boundary.
+static const uint32_t IR_INTER_MSG_GAP = 25000;  // 25ms
 
 // Temperature encoding: non-linear Gray code lookup
 // RAC-PT1411HWRU Celsius table (index 0=16°C, 14=30°C)
@@ -217,6 +227,9 @@ void FurrionChillCube::transmit_mode_command_() {
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
+  // Inter-message guard idle so this mode frame is never jammed against a
+  // preceding CS frame (CS→MODE-ON bracket / kickstart power-on). See IR_INTER_MSG_GAP.
+  data->space(IR_INTER_MSG_GAP);
 
   uint8_t message[12] = {0};
 
@@ -339,6 +352,9 @@ void FurrionChillCube::transmit_cs_update_() {
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
+  // Inter-message guard idle so this CS frame never jams the frame before/after
+  // it in a CS→MODE-ON→CS bracket. See IR_INTER_MSG_GAP.
+  data->space(IR_INTER_MSG_GAP);
 
   uint8_t message[6] = {0};
   message[0] = 0xBA;

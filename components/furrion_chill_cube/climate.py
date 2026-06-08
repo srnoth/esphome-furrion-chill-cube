@@ -160,7 +160,9 @@ def _auto_debug_sensors(config):
 
 
 def _validate_vent_pairs(config):
-    """A mode's timed vane positioning needs BOTH delay and interval, or neither."""
+    """A mode's timed vane positioning needs BOTH delay and interval, or neither;
+    and a configured value must be > 0 (the C++ treats 0 as 'unset', which would
+    silently disable the mode and surprise the user)."""
     for delay, interval, mode in [
         (CONF_HEAT_VENT_MOVE_DELAY, CONF_HEAT_VENT_INTERVAL, "heat"),
         (CONF_COOL_VENT_MOVE_DELAY, CONF_COOL_VENT_INTERVAL, "cool"),
@@ -170,6 +172,9 @@ def _validate_vent_pairs(config):
                 f"Timed vane positioning for {mode} needs BOTH '{delay}' and "
                 f"'{interval}' set (or neither)."
             )
+        for key in (delay, interval):
+            if key in config and config[key].total_milliseconds == 0:
+                raise cv.Invalid(f"'{key}' must be greater than 0.")
     return config
 
 

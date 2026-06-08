@@ -172,20 +172,30 @@ void FurrionChillCube::set_mode_switch_temp_offset(float offset_c) {
   // Value already converted to °C at config time (Python validator handles F/C suffix)
   mode_switch_temp_offset_c_ = offset_c;
 }
-void FurrionChillCube::set_mode_switch_off_min(int min) {
-  mode_switch_off_ms_ = (uint32_t)min * 60000;
-}
+// set_mode_switch_off_ms is inline in the header (time-typed via YAML).
 
 // ============================================================
 // Active IR Mode Persistence
 // ============================================================
 
 void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
-  if (active_ir_mode_ == mode) return;
+  climate::ClimateMode prev = active_ir_mode_;
+  if (prev == mode) return;
   active_ir_mode_ = mode;
   uint8_t m = (mode == climate::CLIMATE_MODE_HEAT) ? 1 :
               (mode == climate::CLIMATE_MODE_COOL) ? 2 : 0;
   mode_pref_.save(&m);
+
+  // Timed vane positioning hook. The ONLY known vane anchor is the unit's power-on
+  // re-home, so we trigger strictly on an OFF->active transition (Stephen's call).
+  // Leaving an active mode (-> OFF, or a mode change that routes through OFF) aborts
+  // any in-progress homing. Note: setup()'s boot-restore assigns active_ir_mode_
+  // DIRECTLY (not via this setter), so a reboot never spuriously re-homes the vane.
+  if (mode == climate::CLIMATE_MODE_OFF) {
+    abort_vent_positioning_();
+  } else if (prev == climate::CLIMATE_MODE_OFF) {
+    maybe_start_vent_positioning_(mode == climate::CLIMATE_MODE_HEAT);
+  }
 }
 
 // ============================================================
@@ -322,7 +332,10 @@ void FurrionChillCube::transmit_mode_command_() {
   transmit.perform();
 
   // === Transmission 2: Swing (B9) — separate transmit call for clean state ===
-  {
+  // Suppressed while the vane positioner is MOVING: it owns the physical swing during
+  // that window, and a swing frame here (SWING_OFF, since swing_mode stays OFF) would
+  // stop the vane early at the wrong position. The positioner sends its own stop frame.
+  if (vent_phase_ != VentPhase::MOVING) {
     auto swing_tx = this->transmitter_->transmit();
     auto *swing_data = swing_tx.get_data();
     swing_data->space(IR_PACKET_SPACE);
@@ -413,6 +426,9 @@ void FurrionChillCube::transmit_mode_with_cs_() {
 void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg) {
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
+  // Inter-message guard idle so a raw command (swing/turbo/display) is never jammed
+  // against an adjacent CS/mode frame. See IR_INTER_MSG_GAP.
+  data->space(IR_INTER_MSG_GAP);
   this->encode_(data, msg, 6, 1);
   transmit.perform();
 }
@@ -578,6 +594,13 @@ void FurrionChillCube::loop() {
   // 3. Advance kickstart (after gear controller so it can check gear thresholds)
   if (kickstart_active_()) {
     advance_kickstart_(now);
+  }
+
+  // 3b. Advance timed vane positioning (independent state machine; raw swing IR).
+  // Aborted via set_active_ir_mode_(OFF) / user swing toggle, so it only runs while
+  // the unit is on; the failsafe guard is belt-and-suspenders.
+  if (vent_positioning_active_() && !failsafe_active_) {
+    advance_vent_positioning_(now);
   }
 
   // 4. Keep-alive trigger for low-CS gears (cool 1-2, heat 1)
@@ -755,6 +778,10 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   // trigger gear recalculation, timer resets, or immediate-off logic.
   if (call.get_swing_mode().has_value()) {
     this->swing_mode = *call.get_swing_mode();
+    // User took manual vane control — exit any in-progress timed homing cleanly and
+    // immediately. abort is a pure state reset (no IR); send_swing_state_() below puts
+    // the vane in the user's requested state, so there is no competing frame.
+    abort_vent_positioning_();
     send_swing_state_();
     ESP_LOGI(TAG, "User swing change → %d", (int)*call.get_swing_mode());
   }
@@ -1222,6 +1249,84 @@ void FurrionChillCube::abort_keepalive_() {
 }
 
 // ============================================================
+// Timed Vane Positioning
+// ============================================================
+
+// Called on an OFF→active transition (from set_active_ir_mode_). Starts the timed
+// homing only when the mode's (delay, interval) are BOTH configured AND the user has
+// the vane switch OFF (swing_mode == OFF). When swing is ON the user wants oscillation,
+// so there is no fixed position to seek and we leave the vane alone.
+void FurrionChillCube::maybe_start_vent_positioning_(bool is_heat) {
+  uint32_t delay_ms = is_heat ? heat_vent_move_delay_ms_ : cool_vent_move_delay_ms_;
+  uint32_t interval_ms = is_heat ? heat_vent_interval_ms_ : cool_vent_interval_ms_;
+  if (delay_ms == 0 || interval_ms == 0) return;                     // feature unset for this mode
+  if (this->swing_mode != climate::CLIMATE_SWING_OFF) return;        // user wants oscillation
+  vent_active_delay_ms_ = delay_ms;
+  vent_active_interval_ms_ = interval_ms;
+  vent_phase_ = VentPhase::WAIT_DELAY;
+  vent_phase_start_ = millis();
+  ESP_LOGI(TAG, "Vane: %s positioning armed — wait %lus then move %lus",
+           is_heat ? "HEAT" : "COOL",
+           (unsigned long)(delay_ms / 1000), (unsigned long)(interval_ms / 1000));
+}
+
+// Non-blocking state machine. Sends ONLY raw swing IR and never touches this->swing_mode,
+// so the HA swing switch stays "off" the whole time (the homing is invisible to the user).
+void FurrionChillCube::advance_vent_positioning_(uint32_t now) {
+  uint32_t elapsed = now - vent_phase_start_;
+  switch (vent_phase_) {
+    case VentPhase::WAIT_DELAY:
+      if (elapsed >= vent_active_delay_ms_) {
+        send_swing_on();                       // raw SWING_ON — start the vane moving
+        vent_phase_ = VentPhase::MOVING;
+        vent_phase_start_ = now;
+        ESP_LOGI(TAG, "Vane: move ON (hold %lus)", (unsigned long)(vent_active_interval_ms_ / 1000));
+      }
+      break;
+    case VentPhase::MOVING:
+      if (elapsed >= vent_active_interval_ms_) {
+        send_swing_off();                      // raw SWING_OFF — stop at the target position
+        vent_phase_ = VentPhase::IDLE;
+        ESP_LOGI(TAG, "Vane: move OFF — positioned");
+      }
+      break;
+    default:
+      vent_phase_ = VentPhase::IDLE;
+      break;
+  }
+}
+
+// Pure state reset (no IR). Every abort trigger — unit OFF (the OFF command's own swing
+// frame stops the vane) or a user swing toggle (send_swing_state_() sets the requested
+// state) — already emits the correct swing frame, so emitting one here would only fight it.
+void FurrionChillCube::abort_vent_positioning_() {
+  if (vent_phase_ != VentPhase::IDLE) {
+    ESP_LOGI(TAG, "Vane: positioning aborted (phase=%d)", (int)vent_phase_);
+    vent_phase_ = VentPhase::IDLE;
+  }
+}
+
+// Force a real OFF + off-dwell on a heat↔cool transition. Turns the unit OFF, stamps
+// off_since_ so the fresh-start off_long_enough gate then holds the new mode off for
+// mode_switch_off_ms_, and tears down any kickstart/keepalive. The OFF→ON that follows
+// the dwell re-homes the vane. set_active_ir_mode_(OFF) also aborts any vane sequence.
+void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
+  set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+  transmit_mode_command_();   // OFF on the wire; its swing frame parks the vane
+  heat_gear_ = -1;
+  cool_gear_ = -1;
+  off_since_ = now;
+  bias_c_ = 0.0f;
+  clamp_phase_ = ClampPhase::IDLE;
+  quick_kick_active_ = false;
+  abort_keepalive_();
+  if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+  if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+  if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
+  update_action_();
+}
+
+// ============================================================
 // Gear Controller
 // ============================================================
 
@@ -1448,9 +1553,16 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     return user_input || (time_in_gear >= HOLD_MS[target_gear]);
   };
 
-  // No more direct cool→heat switch. If cool is active, the gear controller
-  // would have computed do_cool (not do_heat) because cool_gear_ >= 0 above.
-  // Reaching here with active_ir_mode_ == COOL would be an inconsistent state.
+  // Cool→Heat MUST route through a real OFF held for the off-dwell — same rationale as
+  // run_cool_mode_ (compressor safety + vane OFF→ON anchor). Catches a DIRECT switch while
+  // the unit is still actively COOLing; the natural HEAT_COOL handoff already turned it OFF.
+  if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
+    ESP_LOGI(TAG, "Cool→Heat: force OFF + %lus dwell before heating",
+             (unsigned long)(mode_switch_off_ms_ / 1000));
+    force_off_for_mode_switch_(now);
+    return true;  // hold; heat re-engages from -1 after the dwell (OFF→ON homes the vane)
+  }
+  // Defensive: clear a stale cool gear (unit already OFF via the natural path).
   if (cool_gear_ != -1) {
     cool_gear_ = -1;
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
@@ -1602,8 +1714,18 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     return user_input || (time_in_gear >= HOLD_MS[target_gear]);
   };
 
-  // No more direct heat→cool switch. Reaching here with active_ir_mode_ == HEAT
-  // would be an inconsistent state (heat_gear_ should have been -1 first).
+  // Heat→Cool MUST route through a real OFF held for the off-dwell: compressor safety
+  // AND the vane's known OFF→ON re-home anchor. This catches a DIRECT switch — the unit
+  // still actively HEATing when COOL is selected (user flip, or sync_mode handoff). The
+  // natural HEAT_COOL drift already turns the unit OFF via the heat 0→-1 path, so by the
+  // time it reaches here active_ir_mode_ is already OFF and this is skipped.
+  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
+    ESP_LOGI(TAG, "Heat→Cool: force OFF + %lus dwell before cooling",
+             (unsigned long)(mode_switch_off_ms_ / 1000));
+    force_off_for_mode_switch_(now);
+    return true;  // hold; cool re-engages from -1 after the dwell (OFF→ON homes the vane)
+  }
+  // Defensive: clear a stale heat gear (unit already OFF via the natural path).
   if (heat_gear_ != -1) {
     heat_gear_ = -1;
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
@@ -1903,6 +2025,17 @@ void FurrionChillCube::dump_config() {
                          (cool_gear_ == 0) ? "COOL (restored from prior session)" :
                          "none (fresh boot)";
   ESP_LOGCONFIG(TAG, "  Prior Mode: %s", mode_str);
+  ESP_LOGCONFIG(TAG, "  Mode-switch off-dwell: %lus", (unsigned long)(mode_switch_off_ms_ / 1000));
+  if (heat_vent_move_delay_ms_ && heat_vent_interval_ms_) {
+    ESP_LOGCONFIG(TAG, "  Vane HEAT positioning: wait %lus, move %lus",
+                  (unsigned long)(heat_vent_move_delay_ms_ / 1000),
+                  (unsigned long)(heat_vent_interval_ms_ / 1000));
+  }
+  if (cool_vent_move_delay_ms_ && cool_vent_interval_ms_) {
+    ESP_LOGCONFIG(TAG, "  Vane COOL positioning: wait %lus, move %lus",
+                  (unsigned long)(cool_vent_move_delay_ms_ / 1000),
+                  (unsigned long)(cool_vent_interval_ms_ / 1000));
+  }
 }
 
 }  // namespace furrion_chill_cube

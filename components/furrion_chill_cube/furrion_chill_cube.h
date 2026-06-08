@@ -29,9 +29,18 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_mode_switch_idle_min(int min);
   void set_mode_switch_event_min(int min);
   void set_mode_switch_temp_offset(float offset_c);
-  void set_mode_switch_off_min(int min);
+  // Off-dwell between active states (ms). Enforced on EVERY heat<->cool transition —
+  // direct user mode change AND natural HEAT_COOL handoff — and on any re-engage from -1.
+  void set_mode_switch_off_ms(uint32_t ms) { mode_switch_off_ms_ = ms; }
   void set_keepalive_enable(bool enable) { keepalive_enable_ = enable; }
   void set_use_fahrenheit(bool enable) { use_fahrenheit_ = enable; }
+
+  // Timed vane positioning (optional). Per-mode (delay, interval) in ms; 0 = unset.
+  // A mode's positioning runs only when BOTH its values are set. See project_vane_control.
+  void set_heat_vent_move_delay_ms(uint32_t ms) { heat_vent_move_delay_ms_ = ms; }
+  void set_heat_vent_interval_ms(uint32_t ms) { heat_vent_interval_ms_ = ms; }
+  void set_cool_vent_move_delay_ms(uint32_t ms) { cool_vent_move_delay_ms_ = ms; }
+  void set_cool_vent_interval_ms(uint32_t ms) { cool_vent_interval_ms_ = ms; }
 
   // Phase 2 adaptive equilibrium-gear controller (cool mode)
   void set_adaptive_enable(bool enable) { adaptive_enable_ = enable; }
@@ -130,6 +139,28 @@ class FurrionChillCube : public climate::Climate, public Component {
   void advance_keepalive_(uint32_t now);
   void abort_keepalive_();
 
+  // Timed vane positioning (open-loop IR homing off the power-on anchor).
+  // On an OFF->active start the unit re-homes the vane to a fixed default; we then
+  // wait <delay>, pulse the physical swing ON for <interval>, and stop it — landing
+  // the vane at a known mode-specific position (heat=down, cool=ceiling). Runtime-only:
+  // it sends RAW swing IR and NEVER touches this->swing_mode, so the HA swing switch
+  // stays "off" throughout (the homing is invisible to the user). Any user swing toggle,
+  // unit-off, or mode change exits it cleanly.
+  enum class VentPhase : uint8_t {
+    IDLE,
+    WAIT_DELAY,   // unit just started; waiting <delay> for the vane to reach its anchor
+    MOVING,       // swing pulsed ON; waiting <interval> before stopping at target
+  };
+  void maybe_start_vent_positioning_(bool is_heat);
+  void advance_vent_positioning_(uint32_t now);
+  void abort_vent_positioning_();
+  bool vent_positioning_active_() { return vent_phase_ != VentPhase::IDLE; }
+
+  // Force a real OFF + off-dwell on a heat<->cool transition (compressor safety +
+  // the vane's known OFF->ON anchor). Stamps off_since_ so the dwell gate then holds
+  // the new mode off until mode_switch_off_ms_ elapses.
+  void force_off_for_mode_switch_(uint32_t now);
+
   // Fan mode
   climate::ClimateFanMode get_effective_fan_mode_();
 
@@ -222,6 +253,17 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t quick_kick_hold_ms_{10000}; // hold window; set per-call by start_quick_kickstart_
   bool quick_kick_is_heat_{false};
   bool quick_kick_reinforced_{false}; // one-shot guard for 5s reinforce
+
+  // Timed vane positioning config (ms; 0 = unset → feature off for that mode)
+  uint32_t heat_vent_move_delay_ms_{0};
+  uint32_t heat_vent_interval_ms_{0};
+  uint32_t cool_vent_move_delay_ms_{0};
+  uint32_t cool_vent_interval_ms_{0};
+  // Timed vane positioning runtime state
+  VentPhase vent_phase_{VentPhase::IDLE};
+  uint32_t vent_phase_start_{0};         // when the current phase began
+  uint32_t vent_active_delay_ms_{0};     // delay for the in-progress run (heat or cool)
+  uint32_t vent_active_interval_ms_{0};  // interval for the in-progress run
 
   // Target encoding (F vs C) — configurable via YAML, default Fahrenheit.
   // Selects whether transmit_mode_command_() encodes the target temperature

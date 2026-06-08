@@ -35,8 +35,13 @@ CONF_OUTSIDE_LOCKOUT_TEMP = "outside_lockout_temp"
 CONF_MODE_SWITCH_IDLE_MIN = "mode_switch_idle_min"
 CONF_MODE_SWITCH_EVENT_MIN = "mode_switch_event_min"
 CONF_MODE_SWITCH_TEMP_OFFSET = "mode_switch_temp_offset"
-CONF_MODE_SWITCH_OFF_MIN = "mode_switch_off_min"
+CONF_MODE_SWITCH_OFF = "mode_switch_off_time"
 CONF_KEEPALIVE_ENABLE = "keepalive_enable"
+# Timed vane positioning (per-mode delay + interval; ESPHome time format, no defaults)
+CONF_HEAT_VENT_MOVE_DELAY = "heat_vent_move_delay"
+CONF_HEAT_VENT_INTERVAL = "heat_final_position_interval"
+CONF_COOL_VENT_MOVE_DELAY = "cool_vent_move_delay"
+CONF_COOL_VENT_INTERVAL = "cool_final_position_interval"
 CONF_USE_FAHRENHEIT = "use_fahrenheit"
 # Phase 2 adaptive equilibrium-gear controller (cool mode)
 CONF_ADAPTIVE_ENABLE = "adaptive_enable"
@@ -154,6 +159,20 @@ def _auto_debug_sensors(config):
     return config
 
 
+def _validate_vent_pairs(config):
+    """A mode's timed vane positioning needs BOTH delay and interval, or neither."""
+    for delay, interval, mode in [
+        (CONF_HEAT_VENT_MOVE_DELAY, CONF_HEAT_VENT_INTERVAL, "heat"),
+        (CONF_COOL_VENT_MOVE_DELAY, CONF_COOL_VENT_INTERVAL, "cool"),
+    ]:
+        if (delay in config) != (interval in config):
+            raise cv.Invalid(
+                f"Timed vane positioning for {mode} needs BOTH '{delay}' and "
+                f"'{interval}' set (or neither)."
+            )
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     climate.climate_schema(FurrionChillCube)
     .extend(
@@ -176,8 +195,17 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_MODE_SWITCH_EVENT_MIN, default=20): cv.int_range(min=1, max=120),
             # Room must be this far past the setpoint before 0→-1. Accepts "1F", "0.56C", or bare = °C
             cv.Optional(CONF_MODE_SWITCH_TEMP_OFFSET, default="1F"): validate_mode_switch_temp_offset,
-            # Minimum minutes at -1 before re-engagement (hardware wind-down, no bypass)
-            cv.Optional(CONF_MODE_SWITCH_OFF_MIN, default=1): cv.int_range(min=1, max=10),
+            # Off-dwell enforced on EVERY heat↔cool transition (direct user flip AND
+            # natural HEAT_COOL handoff) and any re-engage from -1. ESPHome time format
+            # (e.g. "60s", "90s", "1min"). Default 60s.
+            cv.Optional(CONF_MODE_SWITCH_OFF, default="60s"): cv.positive_time_period_milliseconds,
+            # Timed vane positioning (optional, no defaults → feature off if unset). On an
+            # OFF→active start, wait <move_delay> then run the vane <interval> and stop, landing
+            # it at a fixed mode-specific position. A mode runs only if BOTH its values are set.
+            cv.Optional(CONF_HEAT_VENT_MOVE_DELAY): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_HEAT_VENT_INTERVAL): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_COOL_VENT_MOVE_DELAY): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_COOL_VENT_INTERVAL): cv.positive_time_period_milliseconds,
             # Keep-alive pulse: periodic CS bump to sustain compressor at low gears.
             # Disable if the bump causes unwanted compressor spikes.
             cv.Optional(CONF_KEEPALIVE_ENABLE, default=True): cv.boolean,
@@ -263,6 +291,7 @@ CONFIG_SCHEMA = cv.All(
     )
     .extend(cv.COMPONENT_SCHEMA),
     _auto_debug_sensors,
+    _validate_vent_pairs,
 )
 
 
@@ -292,9 +321,19 @@ async def to_code(config):
     cg.add(var.set_mode_switch_idle_min(config[CONF_MODE_SWITCH_IDLE_MIN]))
     cg.add(var.set_mode_switch_event_min(config[CONF_MODE_SWITCH_EVENT_MIN]))
     cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
-    cg.add(var.set_mode_switch_off_min(config[CONF_MODE_SWITCH_OFF_MIN]))
+    cg.add(var.set_mode_switch_off_ms(config[CONF_MODE_SWITCH_OFF].total_milliseconds))
     cg.add(var.set_keepalive_enable(config[CONF_KEEPALIVE_ENABLE]))
     cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
+
+    # Timed vane positioning (optional; only plumbed when set)
+    for key, setter in [
+        (CONF_HEAT_VENT_MOVE_DELAY, "set_heat_vent_move_delay_ms"),
+        (CONF_HEAT_VENT_INTERVAL, "set_heat_vent_interval_ms"),
+        (CONF_COOL_VENT_MOVE_DELAY, "set_cool_vent_move_delay_ms"),
+        (CONF_COOL_VENT_INTERVAL, "set_cool_vent_interval_ms"),
+    ]:
+        if key in config:
+            cg.add(getattr(var, setter)(config[key].total_milliseconds))
 
     # Phase 2 adaptive equilibrium-gear controller (cool mode)
     cg.add(var.set_adaptive_enable(config[CONF_ADAPTIVE_ENABLE]))

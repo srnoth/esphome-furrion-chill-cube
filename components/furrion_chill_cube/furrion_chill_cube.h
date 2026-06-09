@@ -152,7 +152,12 @@ class FurrionChillCube : public climate::Climate, public Component {
     MOVING,       // swing pulsed ON; waiting <interval> before stopping at target
   };
   void maybe_start_vent_positioning_(bool is_heat);
-  void advance_vent_positioning_(uint32_t now);
+  // Self-clocks on millis() — NOT the loop's cached `now`. Unlike kickstart/keepalive
+  // (armed inside the gear pass where `now` is valid), the vane is armed from
+  // set_active_ir_mode_(), so vent_phase_start_ is a millis() value NEWER than the loop's
+  // cached `now`; comparing against the stale `now` underflows the unsigned elapsed and
+  // fires the move instantly. Keep it parameter-less so the wrong clock can't be passed.
+  void advance_vent_positioning_();
   void abort_vent_positioning_();
   bool vent_positioning_active_() { return vent_phase_ != VentPhase::IDLE; }
 

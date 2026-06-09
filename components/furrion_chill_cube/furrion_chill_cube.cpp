@@ -598,9 +598,10 @@ void FurrionChillCube::loop() {
 
   // 3b. Advance timed vane positioning (independent state machine; raw swing IR).
   // Aborted via set_active_ir_mode_(OFF) / user swing toggle, so it only runs while
-  // the unit is on; the failsafe guard is belt-and-suspenders.
+  // the unit is on; the failsafe guard is belt-and-suspenders. It self-clocks on
+  // millis() (does NOT take loop's cached `now`) — see advance_vent_positioning_.
   if (vent_positioning_active_() && !failsafe_active_) {
-    advance_vent_positioning_(now);
+    advance_vent_positioning_();
   }
 
   // 4. Keep-alive trigger for low-CS gears (cool 1-2, heat 1)
@@ -1272,7 +1273,11 @@ void FurrionChillCube::maybe_start_vent_positioning_(bool is_heat) {
 
 // Non-blocking state machine. Sends ONLY raw swing IR and never touches this->swing_mode,
 // so the HA swing switch stays "off" the whole time (the homing is invisible to the user).
-void FurrionChillCube::advance_vent_positioning_(uint32_t now) {
+void FurrionChillCube::advance_vent_positioning_() {
+  // Self-clock on millis(): vent_phase_start_ is set (in maybe_start_/below) to a millis()
+  // value that is newer than loop()'s cached `now`, so using the cached `now` here would
+  // underflow `elapsed` and fire the move instantly. See the header note.
+  uint32_t now = millis();
   uint32_t elapsed = now - vent_phase_start_;
   switch (vent_phase_) {
     case VentPhase::WAIT_DELAY:

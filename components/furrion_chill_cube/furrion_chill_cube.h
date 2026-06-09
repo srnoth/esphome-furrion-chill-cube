@@ -41,6 +41,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_heat_vent_interval_ms(uint32_t ms) { heat_vent_interval_ms_ = ms; }
   void set_cool_vent_move_delay_ms(uint32_t ms) { cool_vent_move_delay_ms_ = ms; }
   void set_cool_vent_interval_ms(uint32_t ms) { cool_vent_interval_ms_ = ms; }
+  void set_vane_step_duration_ms(uint32_t ms) { vane_step_duration_ms_ = ms; }
 
   // Phase 2 adaptive equilibrium-gear controller (cool mode)
   void set_adaptive_enable(bool enable) { adaptive_enable_ = enable; }
@@ -75,6 +76,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   void send_turbo_off();
   void send_swing_on();
   void send_swing_off();
+  // Manual uniform vane nudge: pulse the physical swing ON, then OFF after
+  // vane_step_duration_ms_ (non-blocking). Each press = one fixed-size step.
+  void send_vane_step();
 
  protected:
   // Climate interface
@@ -270,6 +274,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t vent_active_delay_ms_{0};     // delay for the in-progress run (heat or cool)
   uint32_t vent_active_interval_ms_{0};  // interval for the in-progress run
 
+  // Manual vane step (uniform nudge). Self-clocks on millis() (started from a button
+  // press, outside the loop-now context — see reference_furrion_millis_now_footgun).
+  uint32_t vane_step_duration_ms_{500};  // swing-ON hold per press (YAML, default 0.5s)
+  bool vane_step_active_{false};
+  uint32_t vane_step_start_{0};
+
   // Target encoding (F vs C) — configurable via YAML, default Fahrenheit.
   // Selects whether transmit_mode_command_() encodes the target temperature
   // byte using the Toshiba RAC-PT1411HWRU F-protocol (60–86 °F) or
@@ -334,6 +344,11 @@ class SwingOnButton : public button::Button, public Parented<FurrionChillCube> {
 class SwingOffButton : public button::Button, public Parented<FurrionChillCube> {
  protected:
   void press_action() override { this->parent_->send_swing_off(); }
+};
+
+class VaneStepButton : public button::Button, public Parented<FurrionChillCube> {
+ protected:
+  void press_action() override { this->parent_->send_vane_step(); }
 };
 
 }  // namespace furrion_chill_cube

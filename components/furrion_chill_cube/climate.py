@@ -24,6 +24,7 @@ TurboOnButton = fcc_ns.class_("TurboOnButton", button.Button)
 TurboOffButton = fcc_ns.class_("TurboOffButton", button.Button)
 SwingOnButton = fcc_ns.class_("SwingOnButton", button.Button)
 SwingOffButton = fcc_ns.class_("SwingOffButton", button.Button)
+VaneStepButton = fcc_ns.class_("VaneStepButton", button.Button)
 
 # Config keys
 CONF_TRANSMITTER_ID = "transmitter_id"
@@ -70,6 +71,8 @@ CONF_TURBO_ON = "turbo_on"
 CONF_TURBO_OFF = "turbo_off"
 CONF_SWING_ON = "swing_on"
 CONF_SWING_OFF = "swing_off"
+CONF_VANE_STEP = "vane_step"
+CONF_VANE_STEP_DURATION = "vane_step_duration"
 CONF_DEBUG = "debug"
 CONF_DEBUG_ACTIVE_IR_MODE = "debug_active_ir_mode"
 CONF_DEBUG_LAST_ACTIVE_MODE = "debug_last_active_mode"
@@ -211,6 +214,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_HEAT_VENT_INTERVAL): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_COOL_VENT_MOVE_DELAY): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_COOL_VENT_INTERVAL): cv.positive_time_period_milliseconds,
+            # Manual vane-step nudge: each press of the vane_step button pulses the swing
+            # ON then OFF after this duration, for a uniform incremental move. Default 0.5s.
+            cv.Optional(CONF_VANE_STEP_DURATION, default="0.5s"): cv.positive_time_period_milliseconds,
             # Keep-alive pulse: periodic CS bump to sustain compressor at low gears.
             # Disable if the bump causes unwanted compressor spikes.
             cv.Optional(CONF_KEEPALIVE_ENABLE, default=True): cv.boolean,
@@ -292,6 +298,10 @@ CONFIG_SCHEMA = cv.All(
                 SwingOffButton,
                 entity_category=ENTITY_CATEGORY_CONFIG,
             ),
+            cv.Optional(CONF_VANE_STEP): button.button_schema(
+                VaneStepButton,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+            ),
         }
     )
     .extend(cv.COMPONENT_SCHEMA),
@@ -339,6 +349,7 @@ async def to_code(config):
     ]:
         if key in config:
             cg.add(getattr(var, setter)(config[key].total_milliseconds))
+    cg.add(var.set_vane_step_duration_ms(config[CONF_VANE_STEP_DURATION].total_milliseconds))
 
     # Phase 2 adaptive equilibrium-gear controller (cool mode)
     cg.add(var.set_adaptive_enable(config[CONF_ADAPTIVE_ENABLE]))
@@ -365,6 +376,7 @@ async def to_code(config):
         CONF_TURBO_OFF,
         CONF_SWING_ON,
         CONF_SWING_OFF,
+        CONF_VANE_STEP,
     ]:
         if key in config:
             btn = await button.new_button(config[key])

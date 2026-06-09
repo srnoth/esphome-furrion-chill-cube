@@ -332,10 +332,10 @@ void FurrionChillCube::transmit_mode_command_() {
   transmit.perform();
 
   // === Transmission 2: Swing (B9) — separate transmit call for clean state ===
-  // Suppressed while the vane positioner is MOVING: it owns the physical swing during
-  // that window, and a swing frame here (SWING_OFF, since swing_mode stays OFF) would
-  // stop the vane early at the wrong position. The positioner sends its own stop frame.
-  if (vent_phase_ != VentPhase::MOVING) {
+  // Suppressed while the vane positioner is MOVING or a manual step is in flight: those
+  // own the physical swing during their window, and a swing frame here (SWING_OFF, since
+  // swing_mode stays OFF) would stop the vane early. Each sends its own stop frame.
+  if (vent_phase_ != VentPhase::MOVING && !vane_step_active_) {
     auto swing_tx = this->transmitter_->transmit();
     auto *swing_data = swing_tx.get_data();
     swing_data->space(IR_PACKET_SPACE);
@@ -456,6 +456,17 @@ void FurrionChillCube::send_swing_on() {
 void FurrionChillCube::send_swing_off() {
   static const uint8_t CMD[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
   this->transmit_raw_6byte_(CMD);
+}
+
+void FurrionChillCube::send_vane_step() {
+  // One uniform manual nudge: SWING_ON now, SWING_OFF after vane_step_duration_ms_
+  // (completed non-blocking in loop()). Abort any in-progress auto-positioning so a
+  // manual step takes over and the positioner's later SWING_OFF can't clip this pulse.
+  abort_vent_positioning_();
+  send_swing_on();
+  vane_step_active_ = true;
+  vane_step_start_ = millis();  // self-clock on millis() — pressed outside the loop-now context
+  ESP_LOGI(TAG, "Vane: step ON (%lums)", (unsigned long) vane_step_duration_ms_);
 }
 
 // ============================================================
@@ -602,6 +613,15 @@ void FurrionChillCube::loop() {
   // millis() (does NOT take loop's cached `now`) — see advance_vent_positioning_.
   if (vent_positioning_active_() && !failsafe_active_) {
     advance_vent_positioning_();
+  }
+
+  // 3c. Complete a manual vane-step pulse: SWING_OFF after vane_step_duration_ms_.
+  // Self-clocked on millis() (vane_step_start_ was set on the button press); runs to
+  // completion even across a failsafe so the swing is never left stuck ON.
+  if (vane_step_active_ && (millis() - vane_step_start_) >= vane_step_duration_ms_) {
+    send_swing_off();
+    vane_step_active_ = false;
+    ESP_LOGI(TAG, "Vane: step OFF");
   }
 
   // 4. Keep-alive trigger for low-CS gears (cool 1-2, heat 1)

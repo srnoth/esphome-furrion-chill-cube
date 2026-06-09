@@ -1929,7 +1929,14 @@ void FurrionChillCube::run_idle_mode_(uint32_t now) {
     quick_kick_active_ = false;
     abort_keepalive_();
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
-    ESP_LOGI(TAG, "NEITHER ACTIVE — HVAC OFF");
+    // Start the absolute 60s off-lockout. This is the user-OFF (or both-off) path that
+    // turns the unit off WITHOUT going through run_heat/cool_mode_'s -1 transition, so it
+    // is the one active→OFF route that didn't stamp off_since_. Without this, heat→OFF→cool
+    // (or any mode→OFF→mode) re-engaged immediately. The off_long_enough gate in the
+    // fresh-start paths then holds ANY re-engage for mode_switch_off_ms_. Reboot is exempt:
+    // setup() restores to gear 0 in the saved mode and never reaches here.
+    off_since_ = now;
+    ESP_LOGI(TAG, "NEITHER ACTIVE — HVAC OFF (60s lockout armed)");
   }
 
   // Enforce neutral CS (at setpoint — unit is OFF so doesn't matter much)

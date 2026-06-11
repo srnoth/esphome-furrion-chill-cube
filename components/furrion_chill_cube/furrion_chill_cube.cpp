@@ -514,6 +514,7 @@ void FurrionChillCube::setup() {
       // transmit a spurious MODE_ON / CS frame to a physically-off Furrion.
       furrion_setpoint_c_ = compute_setpoint_c_(true);
       current_cs_ = compute_gear_cs_(true, 0);
+      seed_last_tx_target_f_();   // F-protocol: avoid a bogus f_changed on first pass
       last_active_mode_ = MODE_HEAT;
       boot_ready_ = true;          // restored state is valid — skip imm_off
       idle_since_ = millis();       // 10-min lockout before mode switch allowed
@@ -524,6 +525,7 @@ void FurrionChillCube::setup() {
       active_ir_mode_ = climate::CLIMATE_MODE_COOL;
       furrion_setpoint_c_ = compute_setpoint_c_(false);
       current_cs_ = compute_gear_cs_(false, 0);
+      seed_last_tx_target_f_();   // F-protocol: avoid a bogus f_changed on first pass
       last_active_mode_ = MODE_COOL;
       boot_ready_ = true;          // restored state is valid — skip imm_off
       idle_since_ = millis();       // 10-min lockout before mode switch allowed
@@ -614,6 +616,16 @@ void FurrionChillCube::loop() {
     run_gear_controller_();
     last_gear_run_ = now;
   }
+
+  // Re-sample the clock after the gear pass. run_gear_controller_() reads its OWN
+  // millis() and may spend hundreds of ms in blocking IR transmits; the timers it
+  // arms (kickstart/keepalive) and last_cs_heartbeat_ (stamped at the END of a mode
+  // bracket, after those transmits) are therefore NEWER than the `now` captured at
+  // loop entry. Comparing steps 3-5 below against that stale `now` underflows:
+  // a redundant CS fires after every bracket, and a kickstart armed this pass can
+  // collapse instantly. Re-reading keeps the comparator >= any gear-pass stamp.
+  // See reference_furrion_millis_now_footgun.
+  now = millis();
 
   // 3. Advance kickstart (after gear controller so it can check gear thresholds)
   if (kickstart_active_()) {
@@ -856,6 +868,21 @@ float FurrionChillCube::get_active_ir_target_() {
   if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) return get_heat_target_();
   if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) return get_cool_target_();
   return NAN;
+}
+
+// Seed last_tx_target_f_ to the °F byte a real transmit would put on the wire for
+// the currently active target — same math as transmit_mode_command_()'s F path.
+// Called from setup()'s restore branches: without it last_tx_target_f_ stays 0, and
+// update_furrion_setpoint_()'s f_changed check (target_f != 0, always true in the
+// default use_fahrenheit_ build) fires a spurious MODE-ON+CS bracket on the first
+// gear pass after every reboot — the exact un-commanded wake the restore setpoint/CS
+// sync exists to prevent. NaN target (no restored climate state) → leave 0; the
+// isnan gates downstream already suppress the transmit in that case.
+void FurrionChillCube::seed_last_tx_target_f_() {
+  float t = get_active_ir_target_();
+  if (isnan(t)) return;
+  int tf = (int) roundf(t * 1.8f + 32.0f);
+  last_tx_target_f_ = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, tf));
 }
 
 // Returns true iff the given heat gear's hysteresis band covers `diff`.

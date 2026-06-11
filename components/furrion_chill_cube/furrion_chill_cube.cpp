@@ -459,6 +459,19 @@ void FurrionChillCube::send_swing_off() {
 }
 
 void FurrionChillCube::send_vane_step() {
+  // Step is a manual-positioning tool: meaningless while the unit is off (the vane
+  // re-homes on power-on anyway, wiping any step) and while swing oscillation owns
+  // the vane — a pulse there is a no-op SWING_ON followed by a SWING_OFF that stops
+  // the user's oscillation while swing_mode (and the HA switch) still shows ON.
+  // Same active-mode convention as send_swing_state_().
+  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
+    ESP_LOGI(TAG, "Vane: step ignored (unit off)");
+    return;
+  }
+  if (this->swing_mode != climate::CLIMATE_SWING_OFF) {
+    ESP_LOGI(TAG, "Vane: step ignored (swing active)");
+    return;
+  }
   // One uniform manual nudge: SWING_ON now, SWING_OFF after vane_step_duration_ms_
   // (completed non-blocking in loop()). Abort any in-progress auto-positioning so a
   // manual step takes over and the positioner's later SWING_OFF can't clip this pulse.
@@ -803,6 +816,10 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     // immediately. abort is a pure state reset (no IR); send_swing_state_() below puts
     // the vane in the user's requested state, so there is no competing frame.
     abort_vent_positioning_();
+    // Also cancel an in-flight manual step pulse: the user's swing frame supersedes
+    // it, and the pulse's deferred SWING_OFF (loop 3c) would otherwise stop a
+    // just-enabled oscillation ~vane_step_duration later while HA shows it ON.
+    vane_step_active_ = false;
     send_swing_state_();
     ESP_LOGI(TAG, "User swing change → %d", (int)*call.get_swing_mode());
   }

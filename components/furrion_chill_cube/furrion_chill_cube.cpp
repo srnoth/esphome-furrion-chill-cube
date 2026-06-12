@@ -163,6 +163,27 @@ static const float ADAPT_DRIFT_ALPHA = 0.3f;  // EMA smoothing for room dT/dt
 // Mode-switching protection lives in the 0→-1 gate and -1→active gate
 // (see mode_switch_idle_ms_, mode_switch_event_ms_, mode_switch_temp_offset_c_, mode_switch_off_ms_)
 
+// Diagnostic compressor-output percentage for a gear. Single source for the
+// gear-pass publishes AND setup()'s boot-restore publish, so a restored gear
+// can't show a mismatched percentage.
+static float gear_output_pct(bool is_heat, int gear) {
+  if (gear <= 0) return 0.0f;
+  if (is_heat) {
+    switch (gear) {
+      case 3:  return 100.0f;
+      case 2:  return 66.6f;
+      default: return 33.3f;
+    }
+  }
+  switch (gear) {
+    case 5:  return 100.0f;
+    case 4:  return 80.0f;
+    case 3:  return 60.0f;
+    case 2:  return 40.0f;
+    default: return 20.0f;
+  }
+}
+
 // ============================================================
 // Configuration Setters
 // ============================================================
@@ -582,7 +603,11 @@ void FurrionChillCube::setup() {
       int max_gear = is_heat ? 3 : 5;
       if (saved_gear.gear >= 0 && saved_gear.gear <= max_gear) {
         g = saved_gear.gear;
-        if (!is_heat && !isnan(saved_gear.bias_c)) {
+        // Bias only when the adaptive controller is actually running: with adaptive
+        // disabled the bias never integrates OR decays, so a restored value would sit
+        // frozen across reboots and spring back stale (≤±2.0°C) whenever adaptive is
+        // re-enabled — possibly a season later, against a different equilibrium.
+        if (!is_heat && adaptive_enable_ && !isnan(saved_gear.bias_c)) {
           bias_c_ = std::max(-ADAPT_BIAS_C_MAX, std::min(ADAPT_BIAS_C_MAX, saved_gear.bias_c));
         }
       }
@@ -605,6 +630,9 @@ void FurrionChillCube::setup() {
     }
     furrion_setpoint_c_ = compute_setpoint_c_(is_heat);
     current_cs_ = compute_gear_cs_(is_heat, g);
+    // Publish the restored CS so the diagnostic doesn't sit "unknown" until the
+    // next CS change (no IR goes out — this is state-tracking only).
+    if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
     seed_last_tx_target_f_();   // F-protocol: avoid a bogus f_changed on first pass
     boot_ready_ = true;          // restored state is valid — skip imm_off
     if (g == 0) {
@@ -678,11 +706,18 @@ void FurrionChillCube::setup() {
     });
   }
 
-  // Initialize boot time and diagnostic sensors
+  // Initialize boot time and diagnostic sensors. Compressor output reflects the
+  // restored gear (a warm reset can resume at gear N — 0% there would contradict
+  // the gear sensor until the next gear change).
   boot_time_ = millis();
   if (heat_gear_sensor_) heat_gear_sensor_->publish_state(heat_gear_);
   if (cool_gear_sensor_) cool_gear_sensor_->publish_state(cool_gear_);
-  if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
+  if (compressor_output_sensor_) {
+    float pct = (heat_gear_ > 0) ? gear_output_pct(true, heat_gear_)
+              : (cool_gear_ > 0) ? gear_output_pct(false, cool_gear_)
+                                 : 0.0f;
+    compressor_output_sensor_->publish_state(pct);
+  }
 }
 
 void FurrionChillCube::loop() {
@@ -1814,14 +1849,8 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     last_gear_change_ = now;
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(new_gear);
     if (new_gear >= 1) last_active_mode_ = MODE_HEAT;
-    float pct;
-    switch (new_gear) {
-      case 3:  pct = 100.0f; break;
-      case 2:  pct = 66.6f;  break;
-      case 1:  pct = 33.3f;  break;
-      default: pct = 0.0f;   break;
-    }
-    if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
+    if (compressor_output_sensor_)
+      compressor_output_sensor_->publish_state(gear_output_pct(true, new_gear));
     ESP_LOGI(TAG, "HEAT %d -> %d (room=%.2f target=%.2f diff=%.2f)",
              gear, new_gear, room, target, diff);
 
@@ -2004,16 +2033,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     last_gear_change_ = now;
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(new_gear);
     if (new_gear >= 1) last_active_mode_ = MODE_COOL;
-    float pct;
-    switch (new_gear) {
-      case 5:  pct = 100.0f; break;
-      case 4:  pct = 80.0f;  break;
-      case 3:  pct = 60.0f;  break;
-      case 2:  pct = 40.0f;  break;
-      case 1:  pct = 20.0f;  break;
-      default: pct = 0.0f;   break;
-    }
-    if (compressor_output_sensor_) compressor_output_sensor_->publish_state(pct);
+    if (compressor_output_sensor_)
+      compressor_output_sensor_->publish_state(gear_output_pct(false, new_gear));
     ESP_LOGI(TAG, "COOL %d -> %d (room=%.2f target=%.2f diff=%.2f)",
              gear, new_gear, room, target, diff);
 

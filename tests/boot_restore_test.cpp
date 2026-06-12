@@ -63,13 +63,17 @@ struct RestoreResult {
     float bias_c;  // restored adaptive bias (cool only)
 };
 static RestoreResult decide_restore(bool is_heat, ResetReason reason,
-                                    bool have_gear_pref, int8_t saved_gear, float saved_bias) {
+                                    bool have_gear_pref, int8_t saved_gear, float saved_bias,
+                                    bool adaptive_enabled = true) {
     RestoreResult r{0, 0.0f};
     if (is_warm_reset(reason) && have_gear_pref) {
         int max_gear = is_heat ? 3 : 5;
         if (saved_gear >= 0 && saved_gear <= max_gear) {
             r.gear = saved_gear;
-            if (!is_heat && !std::isnan(saved_bias)) {
+            // Bias only when adaptive is running: disabled means it neither
+            // integrates nor decays, so a restored value would sit frozen and
+            // spring back stale whenever adaptive is re-enabled.
+            if (!is_heat && adaptive_enabled && !std::isnan(saved_bias)) {
                 r.bias_c = std::fmax(-ADAPT_BIAS_C_MAX, std::fmin(ADAPT_BIAS_C_MAX, saved_bias));
             }
         }
@@ -241,6 +245,12 @@ TEST(restore_decision_table) {
     EXPECT_NEAR(-ADAPT_BIAS_C_MAX, r.bias_c, 1e-6f, "Oversized bias clamped to -2.0");
     r = decide_restore(true, RST_PANIC, true, 2, 1.5f);
     EXPECT_NEAR(0.0f, r.bias_c, 1e-6f, "Heat restore ignores saved bias");
+
+    // Adaptive disabled: gear still resumes, but the bias stays 0 — a frozen
+    // bias must not survive a disabled period and re-arm later.
+    r = decide_restore(false, RST_SW, true, 3, 0.7f, /*adaptive_enabled=*/false);
+    EXPECT_EQ(3, r.gear, "Adaptive disabled: gear still restored");
+    EXPECT_NEAR(0.0f, r.bias_c, 1e-6f, "Adaptive disabled: bias NOT restored");
 }
 
 TEST(first_pass_holds_restored_gear) {

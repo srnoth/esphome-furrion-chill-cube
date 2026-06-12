@@ -184,6 +184,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void send_swing_state_();
   void set_active_ir_mode_(climate::ClimateMode mode);
   void publish_debug_state_(float diff);
+  void save_gear_pref_();
 
   // Hardware
   remote_transmitter::RemoteTransmitterComponent *transmitter_{nullptr};
@@ -319,6 +320,18 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Persisted mode (survives reboot)
   ESPPreferenceObject mode_pref_;
+
+  // Persisted gear + adaptive bias (restored only on a WARM reset — ESP-only reboot
+  // such as OTA/crash, where the Furrion kept power and is still running the last
+  // commanded gear CS. A cold boot means the unit power-cycled too and resumed at
+  // the user target, so the pre-outage gear is NOT the unit's state — gear 0 is.)
+  struct GearPrefData {
+    int8_t gear;    // gear of the active IR mode at save time (-1..5)
+    float bias_c;   // adaptive integral bias (cool only; quantized before save)
+  };
+  ESPPreferenceObject gear_pref_;
+  int8_t last_saved_gear_{-128};   // -128 = nothing saved this boot (forces first save)
+  float last_saved_bias_c_{0.0f};
 };
 
 // Button sub-entities

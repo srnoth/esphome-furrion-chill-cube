@@ -6,6 +6,10 @@
 #include "esphome/components/api/api_server.h"
 #endif
 
+#ifdef USE_ESP32
+#include <esp_system.h>  // esp_reset_reason() — gates the gear restore on warm vs cold boot
+#endif
+
 namespace esphome {
 namespace furrion_chill_cube {
 
@@ -148,6 +152,12 @@ static const float ADAPT_DT_CAP_MIN = 5.0f;   // clamp dt across stalls/reboots
 static const float GEAR_STEP_C = 0.85f;       // eff_diff per gear-equivalent of fan feedforward
                                               // (= C_UP_34; a deliberately firm one-gear shove)
 static const uint32_t FAN_EDGE_FREEZE_MS = 180000; // freeze integral 3 min after a vent-fan edge
+// Quantum for persisting bias_c_ to flash: the integral drifts a tiny amount every
+// pass, so saving it raw would queue an NVS write per pass. Quantized to 0.1°C a
+// write happens only every few minutes even while the bias is actively ramping
+// (ADAPT_KI=0.06 → ≥~28 min per step at typical sub-deadband-adjacent errors),
+// and a restore lands within half a quantum of the true equilibrium.
+static const float GEAR_PREF_BIAS_QUANTUM_C = 0.1f;
 static const float ADAPT_DRIFT_ALPHA = 0.3f;  // EMA smoothing for room dT/dt
 
 // Mode-switching protection lives in the 0→-1 gate and -1→active gate
@@ -178,6 +188,29 @@ void FurrionChillCube::set_mode_switch_temp_offset(float offset_c) {
 // Active IR Mode Persistence
 // ============================================================
 
+// A "warm" reset is one where only the ESP rebooted (OTA, esp_restart, crash/WDT):
+// the Furrion kept power and is still running the last IR-commanded mode/gear/CS,
+// so the saved gear IS the unit's true state. A cold boot (power-on, brownout)
+// means the camper likely lost power too — the unit's internal board resumed at
+// the user's real target (the failover anchor, see project_failover_invariant),
+// so gear 0 — not the saved gear — matches the hardware. Default cold when unsure.
+static bool is_warm_reset_() {
+#ifdef USE_ESP32
+  switch (esp_reset_reason()) {
+    case ESP_RST_SW:
+    case ESP_RST_PANIC:
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:
+      return true;
+    default:
+      return false;
+  }
+#else
+  return false;
+#endif
+}
+
 void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
   climate::ClimateMode prev = active_ir_mode_;
   if (prev == mode) return;
@@ -196,6 +229,31 @@ void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
   } else if (prev == climate::CLIMATE_MODE_OFF) {
     maybe_start_vent_positioning_(mode == climate::CLIMATE_MODE_HEAT);
   }
+}
+
+// Persist the active mode's gear + the adaptive bias for the warm-reboot restore.
+// Called at the end of every gear pass: every gear mutation inside the pass funnels
+// through here, and the paths that zero the gear OUTSIDE a pass (failsafe, forced
+// OFF, user OFF, kickstart abort) all save mode OFF via set_active_ir_mode_() —
+// which makes the gear pref irrelevant on restore — so one call site suffices.
+// No-op when neither field moved, so steady state costs zero flash writes; on the
+// ESP32's wear-leveled NVS even the worst case (a gear change every HOLD_MS plus a
+// bias quantum step every few minutes) is decades below the flash endurance budget.
+void FurrionChillCube::save_gear_pref_() {
+  int8_t g = -1;
+  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
+    g = (int8_t) heat_gear_;
+  } else if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
+    g = (int8_t) cool_gear_;
+  }
+  float bias_q = isnan(bias_c_)
+                     ? 0.0f
+                     : roundf(bias_c_ / GEAR_PREF_BIAS_QUANTUM_C) * GEAR_PREF_BIAS_QUANTUM_C;
+  if (g == last_saved_gear_ && bias_q == last_saved_bias_c_) return;
+  GearPrefData d{g, bias_q};
+  gear_pref_.save(&d);
+  last_saved_gear_ = g;
+  last_saved_bias_c_ = bias_q;
 }
 
 // ============================================================
@@ -500,38 +558,62 @@ void FurrionChillCube::setup() {
 
   // Restore active IR mode from flash (survives reboot)
   mode_pref_ = global_preferences->make_preference<uint8_t>(this->get_object_id_hash() ^ 0x4D4F4445);
+  // Gear + adaptive bias, saved by save_gear_pref_() at the end of every gear pass.
+  gear_pref_ = global_preferences->make_preference<GearPrefData>(this->get_object_id_hash() ^ 0x47454152);
   uint8_t saved_mode = 0;
-  if (mode_pref_.load(&saved_mode)) {
-    if (saved_mode == 1) {
-      heat_gear_ = 0;
-      // Also restore active_ir_mode_ to match the gear state — otherwise
-      // first controller run sees gear≥0 with active_ir_mode_=OFF and sends
-      // a spurious MODE_ON IR command, waking the Furrion from idle.
-      active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
-      // Also sync furrion_setpoint_c_ and current_cs_ to the restored target +
-      // gear 0 CS, so update_furrion_setpoint_() and the gear-0 CS check on
-      // first run don't detect a bogus mismatch (default 22 vs. actual) and
-      // transmit a spurious MODE_ON / CS frame to a physically-off Furrion.
-      furrion_setpoint_c_ = compute_setpoint_c_(true);
-      current_cs_ = compute_gear_cs_(true, 0);
-      seed_last_tx_target_f_();   // F-protocol: avoid a bogus f_changed on first pass
-      last_active_mode_ = MODE_HEAT;
-      boot_ready_ = true;          // restored state is valid — skip imm_off
-      idle_since_ = millis();       // 10-min lockout before mode switch allowed
-      ESP_LOGI(TAG, "Restored prior mode: HEAT (gear → idle, skip kickstart, sp=%d°C cs=%d)",
-               furrion_setpoint_c_, current_cs_);
-    } else if (saved_mode == 2) {
-      cool_gear_ = 0;
-      active_ir_mode_ = climate::CLIMATE_MODE_COOL;
-      furrion_setpoint_c_ = compute_setpoint_c_(false);
-      current_cs_ = compute_gear_cs_(false, 0);
-      seed_last_tx_target_f_();   // F-protocol: avoid a bogus f_changed on first pass
-      last_active_mode_ = MODE_COOL;
-      boot_ready_ = true;          // restored state is valid — skip imm_off
-      idle_since_ = millis();       // 10-min lockout before mode switch allowed
-      ESP_LOGI(TAG, "Restored prior mode: COOL (gear → idle, skip kickstart, sp=%d°C cs=%d)",
-               furrion_setpoint_c_, current_cs_);
+  if (mode_pref_.load(&saved_mode) && (saved_mode == 1 || saved_mode == 2)) {
+    bool is_heat = (saved_mode == 1);
+    // The saved gear is the unit's true state only on a WARM reset (ESP-only reboot:
+    // the Furrion kept power and is still at the last commanded gear CS) — resume
+    // there directly instead of re-climbing from idle, and resume the adaptive bias
+    // so the cool ladder doesn't immediately collapse the restored gear (bias 0 at
+    // equilibrium diff≈0 reads as "no demand"). On a cold boot, with no saved gear,
+    // or an inconsistent pair (gear -1 under an active saved mode — crash between
+    // the two pref saves), fall back to gear 0: the pre-change behavior.
+    int g = 0;
+    GearPrefData saved_gear{};
+    if (is_warm_reset_() && gear_pref_.load(&saved_gear)) {
+      int max_gear = is_heat ? 3 : 5;
+      if (saved_gear.gear >= 0 && saved_gear.gear <= max_gear) {
+        g = saved_gear.gear;
+        if (!is_heat && !isnan(saved_gear.bias_c)) {
+          bias_c_ = std::max(-ADAPT_BIAS_C_MAX, std::min(ADAPT_BIAS_C_MAX, saved_gear.bias_c));
+        }
+      }
     }
+    // Restore active_ir_mode_ to match the gear state — otherwise the first
+    // controller run sees gear≥0 with active_ir_mode_=OFF and sends a spurious
+    // MODE_ON IR command, waking the Furrion from idle.
+    // Also sync furrion_setpoint_c_ and current_cs_ to the restored target +
+    // gear CS, so update_furrion_setpoint_() and the CS check on first run
+    // don't detect a bogus mismatch (default 22 vs. actual) and transmit a
+    // spurious MODE_ON / CS frame the unit didn't ask for.
+    if (is_heat) {
+      heat_gear_ = g;
+      active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
+      last_active_mode_ = MODE_HEAT;
+    } else {
+      cool_gear_ = g;
+      active_ir_mode_ = climate::CLIMATE_MODE_COOL;
+      last_active_mode_ = MODE_COOL;
+    }
+    furrion_setpoint_c_ = compute_setpoint_c_(is_heat);
+    current_cs_ = compute_gear_cs_(is_heat, g);
+    seed_last_tx_target_f_();   // F-protocol: avoid a bogus f_changed on first pass
+    boot_ready_ = true;          // restored state is valid — skip imm_off
+    if (g == 0) {
+      idle_since_ = millis();    // 10-min lockout before mode switch allowed
+    } else {
+      // Active gear restored — not idle. Stamp a fresh keep-alive window (mirrors
+      // the on-gear-change stamp): without it, a restored sustaining gear leaves
+      // keepalive_last_ AND last_gear_change_ at 0, so the low-gear pulse clock
+      // would stay unarmed until the next gear change.
+      keepalive_last_ = millis();
+    }
+    ESP_LOGI(TAG, "Restored prior mode: %s (gear=%d%s, skip kickstart, sp=%d°C cs=%d bias=%.2f)",
+             is_heat ? "HEAT" : "COOL", g,
+             g == 0 ? " → idle" : " (warm reset — resume gear)",
+             furrion_setpoint_c_, current_cs_, bias_c_);
   }
 
   // Register temperature sensor callbacks
@@ -1454,6 +1536,9 @@ void FurrionChillCube::run_gear_controller_() {
     ESP_LOGI(TAG, "Boot ready — first gear computation complete, IR enabled");
   }
 
+  // Persist gear + bias for the warm-reboot restore (no-op unless one changed)
+  save_gear_pref_();
+
   // Debug sensor publishing
   publish_debug_state_(gear_diff);
 
@@ -2097,8 +2182,8 @@ void FurrionChillCube::dump_config() {
   if (outside_temp_sensor_) {
     ESP_LOGCONFIG(TAG, "  Outside Temp Unit: %s", outside_temp_fahrenheit_ ? "°F" : "°C");
   }
-  const char *mode_str = (heat_gear_ == 0) ? "HEAT (restored from prior session)" :
-                         (cool_gear_ == 0) ? "COOL (restored from prior session)" :
+  const char *mode_str = (heat_gear_ >= 0) ? "HEAT (restored from prior session)" :
+                         (cool_gear_ >= 0) ? "COOL (restored from prior session)" :
                          "none (fresh boot)";
   ESP_LOGCONFIG(TAG, "  Prior Mode: %s", mode_str);
   ESP_LOGCONFIG(TAG, "  Mode-switch off-dwell: %lus", (unsigned long)(mode_switch_off_ms_ / 1000));

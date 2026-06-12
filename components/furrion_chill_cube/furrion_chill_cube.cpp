@@ -239,7 +239,12 @@ void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
 // No-op when neither field moved, so steady state costs zero flash writes; on the
 // ESP32's wear-leveled NVS even the worst case (a gear change every HOLD_MS plus a
 // bias quantum step every few minutes) is decades below the flash endurance budget.
+// ESP32-only, matching is_warm_reset_(): on other platforms (ESP8266) preferences
+// live in a single fixed flash sector with NO wear leveling — these writes would be
+// real sector wear — and is_warm_reset_() always reports cold there, so the saved
+// gear would never be read back anyway. Skip the writes; behavior = pre-persistence.
 void FurrionChillCube::save_gear_pref_() {
+#ifdef USE_ESP32
   int8_t g = -1;
   if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
     g = (int8_t) heat_gear_;
@@ -254,6 +259,7 @@ void FurrionChillCube::save_gear_pref_() {
   gear_pref_.save(&d);
   last_saved_gear_ = g;
   last_saved_bias_c_ = bias_q;
+#endif
 }
 
 // ============================================================

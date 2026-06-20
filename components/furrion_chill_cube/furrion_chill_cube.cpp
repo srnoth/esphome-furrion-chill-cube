@@ -378,6 +378,11 @@ void FurrionChillCube::transmit_mode_command_() {
     int temp_c = std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, furrion_setpoint_c_));
     temp_code = TEMP_C_TABLE[temp_c - FURRION_MIN_TEMP_C];
   }
+  // Record the °C anchor actually put on the wire (both protocols ride furrion_setpoint_c_ as
+  // the anchor). This is the baseline update_furrion_setpoint_() diffs against for sp_changed.
+  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    last_tx_setpoint_c_ = furrion_setpoint_c_;
+  }
 
   // Fan speed
   auto fan = get_effective_fan_mode_();
@@ -654,6 +659,7 @@ void FurrionChillCube::setup() {
       last_active_mode_ = MODE_COOL;
     }
     furrion_setpoint_c_ = compute_setpoint_c_(is_heat);
+    last_tx_setpoint_c_ = furrion_setpoint_c_;  // seed sp_changed baseline (avoid spurious 1st-pass tx)
     current_cs_ = compute_gear_cs_(is_heat, g);
     // Publish the restored CS so the diagnostic doesn't sit "unknown" until the
     // next CS change (no IR goes out — this is state-tracking only).
@@ -1151,12 +1157,6 @@ int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
 }
 
 void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
-  // Debounce hold: a setpoint change is still settling. Return before consuming it —
-  // updating furrion_setpoint_c_ / last_tx_target_f_ here would make the eventual commit
-  // pass see "no change" and never transmit. loop() clears setpoint_pending_ and sets
-  // user_changed_ when the settle window elapses; this then runs for real on that pass.
-  if (setpoint_pending_) return;
-
   // NaN target → hold the last good setpoint. A NaN target can briefly arrive
   // from an unavailable HA sensor; never let compute_setpoint_c_()'s safe
   // default silently clobber furrion_setpoint_c_.
@@ -1164,26 +1164,36 @@ void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
   if (isnan(target_c)) return;
 
   int new_sp = compute_setpoint_c_(is_heat);
-  bool sp_changed = (new_sp != furrion_setpoint_c_);
   int gear = is_heat ? heat_gear_ : cool_gear_;
-  if (sp_changed) {
+
+  // Update the °C anchor IMMEDIATELY — even mid-debounce. furrion_setpoint_c_ is the anchor
+  // compute_gear_cs_() reads; deferring it would let a gear pass during the settle window emit
+  // a CS frame whose gear was chosen for the new target but whose CS value is still anchored to
+  // the OLD setpoint (a transient new-gear/old-anchor inconsistency). Updating it here is cheap
+  // and IR-free — only the setpoint-display TRANSMIT is debounced (below). Because the anchor
+  // now tracks the live target, change detection diffs against last_tx_setpoint_c_ (the last °C
+  // actually put on the wire), NOT furrion_setpoint_c_.
+  if (new_sp != furrion_setpoint_c_) {
     ESP_LOGI(TAG, "Furrion setpoint %d°C → %d°C (%s)",
              furrion_setpoint_c_, new_sp, is_heat ? "heat" : "cool");
     furrion_setpoint_c_ = new_sp;
-    // CS is setpoint-anchored — re-anchor current_cs_ to the new setpoint for
-    // the current gear so the CS frames bracketing the mode command carry a
-    // value consistent with it. Skip during a kickstart: current_cs_ is then the
-    // kickstart CS and the kickstart state machine must keep owning it. The gear
-    // controller corrects current_cs_ below if the gear then changes.
+    // Re-anchor current_cs_ to the new setpoint for the current gear so CS frames stay
+    // consistent with it. Skip during a kickstart: current_cs_ is then the kickstart CS and the
+    // kickstart state machine must keep owning it (end_kickstart_ re-derives the gear CS).
     if (gear >= 0 && !kickstart_active_()) {
       current_cs_ = compute_gear_cs_(is_heat, gear);
       if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
     }
   }
-  // F-protocol carries 1°F resolution: the whole-°C setpoint above can be
-  // unchanged while the user's target moved (e.g. 73°F→74°F both round to
-  // 23°C). Detect a change in the °F byte transmit_mode_command_() would emit
-  // so the unit's panel display stays in sync with the HA target.
+
+  // Debounce: defer ONLY the IR transmit while a setpoint change is still settling. The anchor
+  // above already tracks the live target; loop() clears setpoint_pending_ + sets user_changed_
+  // when the settle window elapses, and this runs again to fire the single coalesced transmit.
+  if (setpoint_pending_) return;
+
+  // sp_changed = whole-°C change vs the last transmitted setpoint. f_changed = sub-°C (1°F)
+  // change (e.g. 73→74°F both round to 23°C) so the F-protocol panel display stays in sync.
+  bool sp_changed = (furrion_setpoint_c_ != last_tx_setpoint_c_);
   bool f_changed = false;
   if (use_fahrenheit_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     int target_f = (int) roundf(target_c * 1.8f + 32.0f);

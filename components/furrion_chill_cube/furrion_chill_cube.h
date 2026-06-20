@@ -227,7 +227,11 @@ class FurrionChillCube : public climate::Climate, public Component {
   int cool_gear_{-1};
   ActiveMode last_active_mode_{MODE_NONE};
   int current_cs_{22};
-  int furrion_setpoint_c_{22}; // Dynamic Furrion setpoint in °C (16-30)
+  int furrion_setpoint_c_{22}; // Dynamic Furrion setpoint in °C anchor (16-30). Updated
+                               // IMMEDIATELY on a target change (even mid-debounce) so
+                               // compute_gear_cs_() always anchors to the live target.
+  int last_tx_setpoint_c_{22}; // Last °C setpoint actually transmitted. Baseline for sp_changed
+                               // detection (furrion_setpoint_c_ tracks live, so can't be it).
   int last_tx_target_f_{0};   // Last °F target byte actually transmitted (F-protocol);
                               // lets update_furrion_setpoint_() catch sub-°C changes
   climate::ClimateMode active_ir_mode_{climate::CLIMATE_MODE_OFF};

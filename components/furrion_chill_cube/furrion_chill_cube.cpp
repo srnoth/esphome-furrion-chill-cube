@@ -36,7 +36,17 @@ static const uint16_t IR_CARRIER_FREQ = 38000;
 // That is invisible on a running unit (the mode frame is redundant there) but
 // makes a cold OFF→ON power-on intermittently fail — the mode-on is its only
 // shot. A leading idle on every frame guarantees a clean message boundary.
-static const uint32_t IR_INTER_MSG_GAP = 25000;  // 25ms
+//
+// 2026-06-20: raised 25ms → 100ms. 25ms reliably fixed the OFF→ON case but a
+// running setpoint change (CS→MODE→CS bracket, where the new setpoint rides the
+// middle MODE frame sandwiched between two CS frames) still intermittently failed
+// to register — confirmed from the camper's recorder DB by repeated up/down
+// jiggling on climate.camper_ac. 100ms is closer to the idle a physical remote
+// leaves between distinct commands; the unit parses each frame cleanly. With
+// non_blocking:false this busy-blocks ~100ms per frame (~300ms per full bracket),
+// which is fine at this cadence (a bracket only fires on a settled setpoint/mode
+// change; the 30s heartbeat is a single frame).
+static const uint32_t IR_INTER_MSG_GAP = 100000;  // 100ms
 
 // Temperature encoding: non-linear Gray code lookup
 // RAC-PT1411HWRU Celsius table (index 0=16°C, 14=30°C)
@@ -82,6 +92,16 @@ static const uint32_t QUICK_KICK_HOLD_MS = 10000;  // OFF→gear-3
 static const uint32_t IDLE_KICK_HOLD_MS = 90000;   // idle→gear-1/2
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
+// Setpoint debounce: a temperature change is held this long (steady state, no further
+// change) before it is committed to IR. Coalesces a rapid multi-step adjustment (user
+// holding temp-down: 68→67→66→65→64→63 as 5 separate control() calls) into ONE transmit
+// of the final value, instead of a burst of overlapping CS→MODE→CS brackets that collide
+// on the wire and cause steps to be missed. Only the final setpoint matters to the
+// open-loop unit. Tune here: long enough to swallow a button-mash, short enough that a
+// single deliberate change still acts promptly. Does NOT delay HA's display (the climate
+// state updates immediately in control()); only the IR is deferred. Mode/fan changes are
+// NOT debounced — they flush immediately.
+static const uint32_t SETPOINT_SETTLE_MS = 2500;  // 2.5s
 static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
 static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
 // Mode switch lockouts are now configurable member variables (mode_switch_*_ms_, mode_switch_temp_offset_c_)
@@ -728,6 +748,17 @@ void FurrionChillCube::loop() {
     advance_keepalive_(now);
   }
 
+  // 1b. Commit a settled setpoint change (debounce). A temp change arms setpoint_pending_
+  // in control() but does NOT transmit; once the user stops stepping (SETPOINT_SETTLE_MS of
+  // no further change) we commit here by setting user_changed_, so the gear controller runs
+  // once on the FINAL value and emits a single clean transmit. abort_keepalive_ so the gear
+  // pass actually runs this iteration (step 2 is gated on keepalive_phase_ == IDLE).
+  if (setpoint_pending_ && (now - setpoint_pending_since_) >= SETPOINT_SETTLE_MS) {
+    setpoint_pending_ = false;
+    user_changed_ = true;
+    if (keepalive_phase_ != KeepAlivePhase::IDLE) abort_keepalive_();
+  }
+
   // 2. Run gear controller if triggered (not blocked by kickstart — kickstart suppresses CS writes)
   bool should_run = false;
   if (temp_dirty_) should_run = true;
@@ -959,15 +990,23 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     ESP_LOGI(TAG, "User swing change → %d", (int)*call.get_swing_mode());
   }
 
-  // Only flag gear recalculation for real, gear-relevant changes.
-  // Swing is cosmetic. Same-value re-syncs from HA are filtered above.
-  bool gear_relevant = mode_changed || temp_changed || fan_changed;
-  if (gear_relevant) {
+  // Flag gear recalculation for real, gear-relevant changes. Swing is cosmetic;
+  // same-value re-syncs from HA are filtered above.
+  //
+  // Mode/fan changes are discrete, single-shot actions → act immediately, and flush any
+  // pending setpoint (the immediate gear run commits the latest target too). A pure temp
+  // change is DEBOUNCED instead: arm setpoint_pending_ and let loop() commit it after the
+  // user stops stepping (SETPOINT_SETTLE_MS). target_temperature is already updated above,
+  // so HA's card shows the new value instantly — only the IR transmit is deferred.
+  if (mode_changed || fan_changed) {
     this->user_changed_ = true;
-    // Abort keepalive on any gear-relevant change so gear controller responds immediately
+    this->setpoint_pending_ = false;  // flush: the immediate run handles the current target
     if (keepalive_phase_ != KeepAlivePhase::IDLE) {
       abort_keepalive_();
     }
+  } else if (temp_changed) {
+    this->setpoint_pending_ = true;
+    this->setpoint_pending_since_ = millis();
   }
   this->publish_state();
 }
@@ -1104,6 +1143,12 @@ int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
 }
 
 void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
+  // Debounce hold: a setpoint change is still settling. Return before consuming it —
+  // updating furrion_setpoint_c_ / last_tx_target_f_ here would make the eventual commit
+  // pass see "no change" and never transmit. loop() clears setpoint_pending_ and sets
+  // user_changed_ when the settle window elapses; this then runs for real on that pass.
+  if (setpoint_pending_) return;
+
   // NaN target → hold the last good setpoint. A NaN target can briefly arrive
   // from an unavailable HA sensor; never let compute_setpoint_c_()'s safe
   // default silently clobber furrion_setpoint_c_.
@@ -1143,7 +1188,25 @@ void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
   // cs_() brackets the mode command with real CS frames so the new setpoint never
   // lands against a stale CS, and a CS always follows a mode change.
   if ((sp_changed || f_changed) && gear >= 0 &&
-      active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
+      active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+    if (kickstart_active_()) {
+      // A kickstart must NOT swallow a setpoint change (the old guard here silently
+      // dropped it for the whole 90s/5:30 wake window — a confirmed cause of "the
+      // setpoint won't take"). Re-anchor the kickstart CS to the NEW setpoint and push
+      // the change out NOW, without disturbing the kickstart's compressor-wake TIMING
+      // (its start/timeout stamps are untouched). The bracket keeps the updated kickstart
+      // CS asserted around the mode-on. furrion_setpoint_c_ was already updated above, so
+      // compute_gear_cs_ uses the new anchor. Kickstart CS formula mirrors the starters:
+      // clamped = gear-2 (heat) / gear-4 (cool); quick = gear-4.
+      if (clamp_phase_ != ClampPhase::IDLE) {
+        clamp_kickstart_cs_ = compute_gear_cs_(clamp_is_heat_, clamp_is_heat_ ? 2 : 4);
+        current_cs_ = clamp_kickstart_cs_;
+      } else {  // quick kickstart
+        quick_kick_cs_ = compute_gear_cs_(quick_kick_is_heat_, 4);
+        current_cs_ = quick_kick_cs_;
+      }
+      if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
+    }
     transmit_mode_with_cs_();
   }
 }

@@ -303,6 +303,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool user_changed_{false};
   bool temp_dirty_{false};
   bool heater_locked_out_{false};
+  // Setpoint debounce (see SETPOINT_SETTLE_MS): a temp change arms this; loop() commits it
+  // (sets user_changed_) once SETPOINT_SETTLE_MS of steady state has elapsed.
+  bool setpoint_pending_{false};
+  uint32_t setpoint_pending_since_{0};
 
   // Phase 2 adaptive equilibrium-gear controller (cool mode) — see PHASE2_ADAPTIVE_DESIGN.md
   bool adaptive_enable_{false};          // master switch (set true via YAML on the phase2 branch)

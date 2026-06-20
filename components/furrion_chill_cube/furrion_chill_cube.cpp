@@ -43,9 +43,14 @@ static const uint16_t IR_CARRIER_FREQ = 38000;
 // to register — confirmed from the camper's recorder DB by repeated up/down
 // jiggling on climate.camper_ac. 100ms is closer to the idle a physical remote
 // leaves between distinct commands; the unit parses each frame cleanly. With
-// non_blocking:false this busy-blocks ~100ms per frame (~300ms per full bracket),
-// which is fine at this cadence (a bracket only fires on a settled setpoint/mode
-// change; the 30s heartbeat is a single frame).
+// non_blocking:false the CPU idle-waits while the RMT peripheral clocks each frame
+// out in hardware (so IR timing is unaffected — only CPU responsiveness): a full
+// CS→MODE→CS bracket is ~430ms (CS + MODE + the MODE's swing sub-frame + CS, each
+// with a 100ms lead), and a fresh-start pass that also hits the HVAC-on path can
+// stack two brackets (~0.8s) in one loop iteration. Acceptable on this ESP32-C3
+// (RMT-driven IR, no hard real-time work; ESPHome feeds the task WDT) but worth a
+// hardware check that a worst-case pass doesn't hiccup the API. A bracket only fires
+// on a settled setpoint/mode change; the 30s heartbeat is a single frame.
 static const uint32_t IR_INTER_MSG_GAP = 100000;  // 100ms
 
 // Temperature encoding: non-linear Gray code lookup
@@ -753,7 +758,10 @@ void FurrionChillCube::loop() {
   // no further change) we commit here by setting user_changed_, so the gear controller runs
   // once on the FINAL value and emits a single clean transmit. abort_keepalive_ so the gear
   // pass actually runs this iteration (step 2 is gated on keepalive_phase_ == IDLE).
-  if (setpoint_pending_ && (now - setpoint_pending_since_) >= SETPOINT_SETTLE_MS) {
+  // Self-clock on millis() (NOT loop's cached `now`): setpoint_pending_since_ is armed in
+  // control(), outside the loop-`now` context, so per reference_furrion_millis_now_footgun a
+  // timer armed from a callback must compare against its own clock to avoid any underflow.
+  if (setpoint_pending_ && (millis() - setpoint_pending_since_) >= SETPOINT_SETTLE_MS) {
     setpoint_pending_ = false;
     user_changed_ = true;
     if (keepalive_phase_ != KeepAlivePhase::IDLE) abort_keepalive_();
@@ -1189,24 +1197,16 @@ void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
   // lands against a stale CS, and a CS always follows a mode change.
   if ((sp_changed || f_changed) && gear >= 0 &&
       active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    if (kickstart_active_()) {
-      // A kickstart must NOT swallow a setpoint change (the old guard here silently
-      // dropped it for the whole 90s/5:30 wake window — a confirmed cause of "the
-      // setpoint won't take"). Re-anchor the kickstart CS to the NEW setpoint and push
-      // the change out NOW, without disturbing the kickstart's compressor-wake TIMING
-      // (its start/timeout stamps are untouched). The bracket keeps the updated kickstart
-      // CS asserted around the mode-on. furrion_setpoint_c_ was already updated above, so
-      // compute_gear_cs_ uses the new anchor. Kickstart CS formula mirrors the starters:
-      // clamped = gear-2 (heat) / gear-4 (cool); quick = gear-4.
-      if (clamp_phase_ != ClampPhase::IDLE) {
-        clamp_kickstart_cs_ = compute_gear_cs_(clamp_is_heat_, clamp_is_heat_ ? 2 : 4);
-        current_cs_ = clamp_kickstart_cs_;
-      } else {  // quick kickstart
-        quick_kick_cs_ = compute_gear_cs_(quick_kick_is_heat_, 4);
-        current_cs_ = quick_kick_cs_;
-      }
-      if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
-    }
+    // Transmit even during a kickstart. The old `!kickstart_active_()` guard here silently
+    // dropped setpoint changes for the whole 90s/5:30 wake window — a confirmed cause of
+    // "the setpoint won't take". We do NOT re-anchor current_cs_: it is already the kickstart
+    // CS, and transmit_mode_with_cs_() brackets the new MODE/setpoint frame with that SAME
+    // kickstart CS — so the new setpoint reaches the panel while the compressor-wake stimulus
+    // is preserved exactly. (Re-deriving the kickstart CS from the new setpoint could WEAKEN
+    // it below the compressor's restart threshold and stall the wake — the failure the
+    // kickstart exists to prevent. end_kickstart_ recomputes the correct gear CS for the new
+    // setpoint at release.) furrion_setpoint_c_ was already updated above, so the C-mode temp
+    // byte and the post-kickstart CS both pick up the new anchor.
     transmit_mode_with_cs_();
   }
 }
@@ -1700,6 +1700,7 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     last_mode_event_at_ = 0;
     off_since_ = 0;
     heater_locked_out_ = false;
+    setpoint_pending_ = false;  // drop any in-flight debounce — no deferred commit after failsafe
     clamp_phase_ = ClampPhase::IDLE;
     quick_kick_active_ = false;
     abort_keepalive_();

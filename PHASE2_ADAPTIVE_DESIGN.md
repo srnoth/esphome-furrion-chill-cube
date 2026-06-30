@@ -166,8 +166,8 @@ Trip-safety / revert paths (defence in depth):
 ## 9. Out of scope for v1 (future)
 - Heat-mode adaptive (heat hunts fine; root-cause-first).
 - `bias_c` persistence across reboot (warm-start).
-- Rate-gated top-gear upshift (block 3→4 unless still warming) — `debug_room_drift` is the
-  groundwork; revisit if recovery overshoot persists.
+- ~~Rate-gated top-gear upshift (block 3→4 unless still warming) — `debug_room_drift` is the
+  groundwork; revisit if recovery overshoot persists.~~ **DONE 2026-06-30 — see §11.**
 - Live compressor-CT feedback (needs the dedicated 6-channel channel; would give fast
   restart-loaf detection). Designed to slot in as an *enhancement that degrades to
   temperature-only*, never a dependency.
@@ -181,3 +181,48 @@ Trip-safety / revert paths (defence in depth):
   setpoint (smaller offset than static), and reduces swing/changes vs the static ladder —
   without winding up during idle or behind the restart lockout.
 - **Regression:** with `adaptive_enable=false`, behavior is bit-identical to main.
+
+---
+
+## 11. Rate-gated upshift (added 2026-06-30) — derivative action on the integral
+
+**Symptom (3-day hot-spell data review, outside highs ~91°F, setpoint 76°F).** The room held
+±0.75°F but *hunted across 3+ gears* instead of settling on a pair. Root cause: on a hot day the
+equilibrium load sits between two gears, and a wound-up integral (`bias_c_ ≈ 0.6°C`) would leap to
+the 13 A **top gear while the room was already flat or cooling** at gear 4 — overshoot ~1°F below
+setpoint, then collapse back down through gears 3→2 (a 4-gear excursion). The integral was correct
+about the steady-state offset but had no *derivative* term, so it chased the offset straight into an
+overshoot. Stephen's goal is an explicit 2-gear hunt; the 3+-gear traversal is the defect.
+
+**Fix.** Add derivative action *to the upshift only*: the learned bias may DRIVE an upshift solely
+while the room is strictly **warming** (`room_drift_cpm_ > ADAPT_UPSHIFT_DRIFT_MIN_CPM`, threshold
+**0.0**). When the current gear is already holding or cooling the room, the upshift comparison falls
+back to the unbiased real diff (`cool_eff_up_diff_`), so a wound-up integral can't grab a stronger
+gear into an overshoot. Mechanics:
+- `eff = real_diff + bias_c_ + ff_c` (unchanged) drives **downshifts** and the integral.
+- `cool_eff_up_diff_ = warming ? eff : fminf(eff, real_diff + ff_c)` drives **upshifts** (cases 1-4).
+  `fminf` guarantees the gate can only ever *suppress* an upshift, never enable one (a stale negative
+  bias keeps `eff`). The fast vent-fan feedforward (`ff_c`) is retained even when not warming — it is
+  anticipatory by design.
+- Anti-windup: `block_up` also freezes **positive** bias accumulation while `!warming`, so the integral
+  can't wind up behind the gate and then over-leap the instant the room ticks warm. Negative-bias
+  unwinding (`e<0`) is never frozen. The `warming` flag is computed once and shared by both sites.
+
+**Why threshold exactly 0 (not positive).** Closed-loop sim sweep (`tests/adaptive_test.cpp`):
+- load **< gear-4 capacity** → collapses the wasteful "gear-3 + gear-5 pulses" pattern into a clean
+  **3↔4 pair** (fewer transitions, tighter swing, **same** steady offset);
+- load **> gear-4 capacity** → **inert**: the room keeps warming at gear 4 (drift > 0), the gate stays
+  open, and the genuinely-needed gear-5 / 4↔5 hunt is untouched;
+- a **positive** threshold (e.g. +0.01) locks gear 4 and rides a large steady offset (+1.45°F in sim)
+  at the gear-4-capacity knife-edge — it suppresses the *corrective* top-gear pulses too. 0 stays
+  permeable there. Negative thresholds are inert (equilibrium warming is ≥ 0).
+
+**Invariants preserved.** Adaptive-disabled is still bit-identical to the static ladder
+(`cool_eff_up_diff_ = real_diff`). Heat mode untouched. No new persistence (`cool_eff_up_diff_` is
+transient, recomputed each pass from the persisted `bias_c_` + live drift). Failover unchanged (no new
+IR path; gate is internal arithmetic). `ADAPT_UPSHIFT_DRIFT_MIN_CPM` is the tuning knob.
+
+**Tests.** `test_rate_gated_upshift` (unit: bias gated out + frozen when cooling, retained when
+warming, isolated via a gate-off arm), `test_gate_cuts_topgear_excursions` (A/B at load 0.205: gear-5
+pulses 20→0, changes 6→2, swing 1.30→0.82°F, offset unchanged), `test_gate_inert_when_top_gear_needed`
+(A/B at load 0.245: gear-5 usage unchanged). Full suite 36/36; all sibling suites unaffected.

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <utility>
 
 // ── Current cool ladder constants (post-2026-06-03) ─────────────────────────────
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
@@ -25,23 +26,30 @@ static const float C_IDLE  = -0.15f;
 static const float ADAPT_KI = 0.06f, ADAPT_BIAS_C_MAX = 2.0f, ADAPT_DEADBAND_C = 0.15f;
 static const float ADAPT_DECAY_TAU_MIN = 30.0f, ADAPT_DT_CAP_MIN = 5.0f, GEAR_STEP_C = 0.85f;
 static const uint32_t FAN_EDGE_FREEZE_MS = 180000;
+static const float ADAPT_DRIFT_ALPHA = 0.3f;             // EMA smoothing for room dT/dt
+static const float ADAPT_UPSHIFT_DRIFT_MIN_CPM = 0.0f;   // rate-gated upshift threshold (°C/min)
 
 float f_to_c(float f) { return (f - 32.0f) * (5.0f / 9.0f); }
 
 // ── Adaptive state (mirrors the member vars) ────────────────────────────────────
 struct Adaptive {
     bool enable = false;
+    bool gate = true;                // rate-gated upshift active (false = legacy ungated, for A/B)
     float bias_c = 0.0f;
     uint32_t last_advance = 0;
     uint32_t fan_changed_at = 0;     // 0 = no real edge seen yet (mirrors the cpp guard)
     bool fan_present = false;        // a vent_fan sensor is configured
     bool fan_on = false;
     int fan_ff_gears = 1;
+    float up_drift_min = ADAPT_UPSHIFT_DRIFT_MIN_CPM;  // per-instance threshold (sweepable)
+    float eff_up_diff = 0.0f;        // eff_diff for UPSHIFT decisions (bias gated out while not warming)
 
     // mirror of adaptive_cool_eff_diff_ — cool_gear is the CURRENT gear (pre-selection),
-    // time_in_gear gates the conditional-integration anti-windup.
-    float eff_diff(float real_diff, int cool_gear, bool kickstart, uint32_t now, uint32_t time_in_gear) {
-        if (!enable) { last_advance = now; return real_diff; }
+    // time_in_gear gates the conditional-integration anti-windup, room_drift_cpm (°C/min) gates
+    // the bias's authority to drive an upshift (NaN → unknown → treated as warming = legacy).
+    float eff_diff(float real_diff, int cool_gear, bool kickstart, uint32_t now, uint32_t time_in_gear,
+                   float room_drift_cpm) {
+        if (!enable) { last_advance = now; eff_up_diff = real_diff; return real_diff; }
         float dt_min = 0.0f;
         if (last_advance != 0) {
             dt_min = (now - last_advance) / 60000.0f;
@@ -54,7 +62,8 @@ struct Adaptive {
         bool fan_edge_freeze = fan_present && fan_changed_at != 0 && (now - fan_changed_at) < FAN_EDGE_FREEZE_MS;
         bool idle = (cool_gear <= 0);
         bool upshift_held = (cool_gear < 5) && (time_in_gear < HOLD_MS[cool_gear + 1]);
-        bool block_up = (e > 0.0f) && (cool_gear >= 5 || upshift_held);
+        bool warming = !gate || std::isnan(room_drift_cpm) || room_drift_cpm > up_drift_min;
+        bool block_up = (e > 0.0f) && (cool_gear >= 5 || upshift_held || !warming);
         bool freeze = kickstart || fan_edge_freeze || block_up;
         if (idle) {
             if (dt_min > 0) bias_c *= std::exp(-dt_min / ADAPT_DECAY_TAU_MIN);
@@ -63,13 +72,15 @@ struct Adaptive {
             bias_c = std::clamp(bias_c, -ADAPT_BIAS_C_MAX, ADAPT_BIAS_C_MAX);
         }
         float ff_c = fan_on ? (fan_ff_gears * GEAR_STEP_C) : 0.0f;
-        return real_diff + bias_c + ff_c;
+        float eff = real_diff + bias_c + ff_c;
+        eff_up_diff = warming ? eff : std::min(eff, real_diff + ff_c);
+        return eff;
     }
 };
 
 // Cool gear selection mirroring run_cool_mode_: eff_diff for active cases 1-5, real diff
 // for fresh-start/idle. Steady-state path only (gear>=0, no user_input) — what the sim drives.
-int select_cool_gear(int gear, float real_diff, float eff_diff, uint32_t time_in_gear) {
+int select_cool_gear(int gear, float real_diff, float eff_diff, float up_diff, uint32_t time_in_gear) {
     int new_gear = gear;
     auto can_up = [&](int tg) { return time_in_gear >= HOLD_MS[tg]; };
     switch (gear) {
@@ -78,19 +89,19 @@ int select_cool_gear(int gear, float real_diff, float eff_diff, uint32_t time_in
             else if (real_diff < C_IDLE)          new_gear = -1;
             break;
         case 1:
-            if (can_up(2) && eff_diff > C_UP_12)  new_gear = 2;
+            if (can_up(2) && up_diff > C_UP_12)   new_gear = 2;   // upshift on rate-gated diff
             else if (eff_diff < C_DN_10)          new_gear = 0;
             break;
         case 2:
-            if (can_up(3) && eff_diff > C_UP_23)  new_gear = 3;
+            if (can_up(3) && up_diff > C_UP_23)   new_gear = 3;
             else if (eff_diff < C_DN_21)          new_gear = 1;
             break;
         case 3:
-            if (can_up(4) && eff_diff > C_UP_34)  new_gear = 4;
+            if (can_up(4) && up_diff > C_UP_34)   new_gear = 4;
             else if (eff_diff < C_DN_32)          new_gear = 2;
             break;
         case 4:
-            if (can_up(5) && eff_diff > C_UP_45)  new_gear = 5;
+            if (can_up(5) && up_diff > C_UP_45)   new_gear = 5;
             else if (eff_diff < C_DN_43)          new_gear = 3;
             break;
         case 5:
@@ -125,25 +136,34 @@ struct SimResult { int changes=0; float tmin=1e9f, tmax=-1e9f, tsum=0; int n=0;
 // Run a closed-loop cool sim. load_at(minute) returns the warming load.
 template <typename LoadFn>
 SimResult simulate(bool adaptive_on, LoadFn load_at, int minutes, float target_f,
-                   int fan_ff=0, int fan_start=-1, int fan_end=-1) {
-    SimResult r; Plant plant; Adaptive a; a.enable = adaptive_on; a.fan_ff_gears = fan_ff;
+                   int fan_ff=0, int fan_start=-1, int fan_end=-1, bool gate=true,
+                   float up_drift_min=ADAPT_UPSHIFT_DRIFT_MIN_CPM) {
+    SimResult r; Plant plant; Adaptive a; a.enable = adaptive_on; a.gate = gate; a.fan_ff_gears = fan_ff;
+    a.up_drift_min = up_drift_min;
     a.fan_present = (fan_start >= 0);
     float room = target_f; int gear = 2; plant.c_now = plant.cooling(2);
     uint32_t time_in_gear = 999999; uint32_t now = 0;
+    float drift_ema = NAN;                    // EMA of inside dT/dt (°C/min), as the device computes it
     int ss_start = minutes * 2 / 3;          // steady-state = last third
     for (int m = 0; m < minutes; m++) {
         now = (uint32_t)m * 60000u;
         bool fan = (m >= fan_start && m < fan_end);
         if (fan != a.fan_on) { a.fan_on = fan; a.fan_changed_at = now; }  // record real edges
         float diff_c = f_to_c(room) - f_to_c(target_f);
-        float eff = a.eff_diff(diff_c, gear, /*kickstart=*/false, now, time_in_gear);
-        int ng = select_cool_gear(gear, diff_c, eff, time_in_gear);
+        float eff = a.eff_diff(diff_c, gear, /*kickstart=*/false, now, time_in_gear, drift_ema);
+        int ng = select_cool_gear(gear, diff_c, eff, a.eff_up_diff, time_in_gear);
         bool changed = (ng != gear);
         if (changed) { r.changes++; gear = ng; time_in_gear = 0; }
         else time_in_gear += 60000;
         if (gear < 0) gear = 0;            // sim never fully shuts the unit off
         plant.step(gear);
+        float prev_room = room;
         room += plant.drift(load_at(m));
+        // Update the drift EMA from this minute's actual room change (°F/min → °C/min), as the
+        // firmware does from successive inside-temp samples. Used by next minute's upshift gate.
+        float inst_cpm = (room - prev_room) * (5.0f / 9.0f);
+        drift_ema = std::isnan(drift_ema) ? inst_cpm
+                                          : ADAPT_DRIFT_ALPHA * inst_cpm + (1.0f - ADAPT_DRIFT_ALPHA) * drift_ema;
         if (m > 20) { r.tmin=std::min(r.tmin,room); r.tmax=std::max(r.tmax,room);
                       r.tsum+=room; r.n++; r.gear_hist.push_back(gear); }
         if (m >= ss_start) { r.ss_tmin=std::min(r.ss_tmin,room); r.ss_tmax=std::max(r.ss_tmax,room);
@@ -171,7 +191,7 @@ void test_disabled_is_identical() {
     bool identical = true;
     for (int i = 0; i < 50; i++) {
         float d = -2.0f + i * 0.08f;
-        float eff = off.eff_diff(d, 3, false, (uint32_t)i * 60000u, 999999);
+        float eff = off.eff_diff(d, 3, false, (uint32_t)i * 60000u, 999999, NAN);
         if (eff != d) identical = false;
     }
     CHECK(identical, "disabled: eff_diff == real_diff for every input (static ladder unchanged)");
@@ -220,9 +240,9 @@ void test_idle_decay() {
     Adaptive a; a.enable = true; a.bias_c = 1.5f;
     uint32_t now = 0;
     a.last_advance = 0;
-    a.eff_diff(0.0f, 2, false, now, 999999);          // prime last_advance
+    a.eff_diff(0.0f, 2, false, now, 999999, NAN);     // prime last_advance
     // 30 min idle (gear 0), 1-min steps
-    for (int m = 1; m <= 30; m++) { now = (uint32_t)m*60000u; a.eff_diff(0.0f, /*gear=*/0, false, now, 999999); }
+    for (int m = 1; m <= 30; m++) { now = (uint32_t)m*60000u; a.eff_diff(0.0f, /*gear=*/0, false, now, 999999, NAN); }
     printf("  bias after 30min idle: %.3fC (started 1.5)\n", a.bias_c);
     CHECK(a.bias_c < 1.5f * 0.5f, "bias decayed by >half over one tau (30min)");
     CHECK(a.bias_c > 0.0f, "bias decays toward 0, doesn't overshoot negative");
@@ -231,16 +251,16 @@ void test_idle_decay() {
 void test_fan_edge_freeze_and_ff() {
     printf("\n=== Fan: feedforward raises eff_diff; integral frozen across the edge ===\n");
     Adaptive a; a.enable = true; a.fan_ff_gears = 1; a.fan_present = true; a.last_advance = 0;
-    a.eff_diff(0.0f, 3, false, 0, 999999);
+    a.eff_diff(0.0f, 3, false, 0, 999999, NAN);
     // fan turns on at t=60s
     a.fan_on = true; a.fan_changed_at = 60000;
-    float eff = a.eff_diff(0.0f, 3, false, 120000, 999999);   // 1 min after edge, room at setpoint
+    float eff = a.eff_diff(0.0f, 3, false, 120000, 999999, NAN);   // 1 min after edge, room at setpoint
     CHECK(std::fabs(eff - GEAR_STEP_C) < 1e-4f, "fan on: eff_diff = +1 gear of feedforward at zero error");
     float bias_during_freeze = a.bias_c;
-    a.eff_diff(0.5f, 3, false, 150000, 999999);              // warm error, but within freeze window
+    a.eff_diff(0.5f, 3, false, 150000, 999999, NAN);         // warm error, but within freeze window
     CHECK(a.bias_c == bias_during_freeze, "integral frozen within FAN_EDGE_FREEZE_MS of the edge");
     // past the freeze window, integration resumes (gear settled so no upshift-hold block)
-    a.eff_diff(0.5f, 3, false, 60000 + FAN_EDGE_FREEZE_MS + 60000, 999999);
+    a.eff_diff(0.5f, 3, false, 60000 + FAN_EDGE_FREEZE_MS + 60000, 999999, NAN);
     CHECK(a.bias_c > bias_during_freeze, "integral resumes after the freeze window");
 }
 
@@ -259,8 +279,8 @@ void test_mild_day_low_bias() {
 void test_positive_bias_unwinds_at_gear1() {
     printf("\n=== Anti-windup: stale +bias at gear 1 + cold room unwinds (not trapped) ===\n");
     Adaptive a; a.enable = true; a.bias_c = 1.0f; a.last_advance = 0;
-    a.eff_diff(-0.5f, 1, false, 0, 999999);   // prime
-    for (int m = 1; m <= 20; m++) a.eff_diff(-0.5f, /*gear=*/1, false, (uint32_t)m*60000u, 999999);
+    a.eff_diff(-0.5f, 1, false, 0, 999999, NAN);   // prime
+    for (int m = 1; m <= 20; m++) a.eff_diff(-0.5f, /*gear=*/1, false, (uint32_t)m*60000u, 999999, NAN);
     printf("  bias after 20min at gear1, room cold: %.3fC (started 1.0)\n", a.bias_c);
     CHECK(a.bias_c < 1.0f, "positive bias unwinds at gear 1 with e<0 (no sat_low trap)");
 }
@@ -270,13 +290,13 @@ void test_no_windup_behind_held_upshift() {
     printf("\n=== Anti-windup: no accumulation behind a hold-blocked upshift ===\n");
     Adaptive a; a.enable = true; a.last_advance = 0;
     // gear 2, warm (e=+0.8), but time_in_gear small → upshift 2->3 is hold-blocked (HOLD_MS[3]=300s)
-    a.eff_diff(0.8f, 2, false, 0, 0);
+    a.eff_diff(0.8f, 2, false, 0, 0, NAN);
     float b0 = a.bias_c;
-    for (int m = 1; m <= 4; m++) a.eff_diff(0.8f, /*gear=*/2, false, (uint32_t)m*60000u, /*time_in_gear=*/0);
+    for (int m = 1; m <= 4; m++) a.eff_diff(0.8f, /*gear=*/2, false, (uint32_t)m*60000u, /*time_in_gear=*/0, NAN);
     printf("  bias after 4min warm w/ held upshift: %.3fC\n", a.bias_c);
     CHECK(a.bias_c == b0, "integral frozen while warm + upshift hold-blocked");
     // once the hold clears (time_in_gear past HOLD_MS[3]=300s), it resumes
-    a.eff_diff(0.8f, 2, false, 360000, 360000);
+    a.eff_diff(0.8f, 2, false, 360000, 360000, NAN);
     CHECK(a.bias_c > b0, "integral resumes once the upshift hold clears");
 }
 
@@ -335,8 +355,73 @@ void test_hot_plus_fan_closed_loop() {
     CHECK(ad.bias_end <= ADAPT_BIAS_C_MAX + 1e-4f, "hot+fan: bias stays clamped (no runaway)");
 }
 
+int count_gear(const SimResult&r, int g){ int n=0; for(int x:r.ss_gear_hist) if(x==g) n++; return n; }
+
+// Unit-level: a wound-up integral may NOT drive an upshift into a non-warming room, and the
+// integral itself freezes behind the gate (no windup that would over-leap once it ticks warm).
+void test_rate_gated_upshift() {
+    printf("\n=== Rate-gated upshift: wound-up bias can't upshift into a non-warming room ===\n");
+    // Returns {eff_up_diff, bias delta over the measured step}. Bias pre-wound to 0.7C, gear 4,
+    // room +0.4C over setpoint → eff_diff = 1.1 clears the 4->5 threshold (C_UP_45 = 1.0).
+    auto probe = [](float drift, bool gate)->std::pair<float,float>{
+        Adaptive a; a.enable=true; a.gate=gate; a.bias_c=0.7f; a.last_advance=0;
+        a.eff_diff(0.4f, 4, false, 0,      999999, drift);   // prime (dt=0 on first call)
+        a.eff_diff(0.4f, 4, false, 60000,  999999, drift);   // last_advance now armed
+        float b0=a.bias_c;
+        a.eff_diff(0.4f, 4, false, 120000, 999999, drift);   // measured step (dt=1min)
+        return { a.eff_up_diff, a.bias_c - b0 };
+    };
+    auto cool = probe(-0.10f, true);   // room cooling — current gear already winning
+    CHECK(cool.first < C_UP_45,        "cooling room: eff_up_diff drops below 4->5 threshold (upshift suppressed)");
+    CHECK(std::fabs(cool.second) < 1e-6f, "cooling room: positive bias frozen behind the gate (no windup)");
+    auto warm = probe(+0.10f, true);   // room warming — current gear insufficient
+    CHECK(warm.first > C_UP_45,        "warming room: bias retains upshift authority (4->5 permitted)");
+    CHECK(warm.second > 0.0f,          "warming room: integral still advances");
+    auto legacy = probe(-0.10f, false);// gate off = old behavior → cooling room still upshifts
+    CHECK(legacy.first > C_UP_45,      "gate off: cooling room upshifts as before (isolates the gate's effect)");
+}
+
+// Closed-loop A/B: a load sitting right at gear-4 capacity makes a wound-up bias pulse the 13A
+// top gear and overshoot (the observed hot-day pathology). The gate should cut top-gear excursions
+// and total transitions while keeping the room bounded.
+void test_gate_cuts_topgear_excursions() {
+    printf("\n=== Gate A/B: collapses the gear-3+top-pulse pattern into a clean 3<->4 pair ===\n");
+    // Load just under gear-4 capacity: gear 4 can carry it, so ungated wastes top-gear pulses
+    // (a wound-up bias keeps stabbing gear 5) → a 3-gear pattern. Gated should hold a 3<->4 pair.
+    auto load = [](int){ return 0.205f; };
+    SimResult ungated = simulate(true, load, 480, 68.0f, 0,-1,-1, /*gate=*/false);
+    SimResult gated   = simulate(true, load, 480, 68.0f, 0,-1,-1, /*gate=*/true);
+    float u_off = ungated.ss_tsum/ungated.ss_n - 68.0f, g_off = gated.ss_tsum/gated.ss_n - 68.0f;
+    printf("  ungated: g5min %d g4 %d g3 %d | chg %d | swing %.2fF | off %+.2fF | bias %.2f\n",
+           count_gear(ungated,5), count_gear(ungated,4), count_gear(ungated,3),
+           ungated.ss_changes, ungated.ss_tmax-ungated.ss_tmin, u_off, ungated.bias_end);
+    printf("  gated  : g5min %d g4 %d g3 %d | chg %d | swing %.2fF | off %+.2fF | bias %.2f\n",
+           count_gear(gated,5), count_gear(gated,4), count_gear(gated,3),
+           gated.ss_changes, gated.ss_tmax-gated.ss_tmin, g_off, gated.bias_end);
+    CHECK(count_gear(gated,5) == 0,                    "gated: no top-gear (gear-5) pulses when gear 4 can carry the load");
+    CHECK(gated.ss_changes < ungated.ss_changes,       "gated: fewer steady-state transitions (less hunting)");
+    CHECK(gated.ss_tmax-gated.ss_tmin < ungated.ss_tmax-ungated.ss_tmin, "gated: tighter room swing");
+    CHECK(std::fabs(g_off) <= std::fabs(u_off) + 0.05f, "gated: steady offset no worse than ungated (no offset penalty)");
+}
+
+// The gate must NOT interfere when gear 5 is genuinely required (load above gear-4 capacity):
+// the room keeps warming at gear 4 (drift > 0) so the gate stays open and the 4<->5 hunt survives.
+void test_gate_inert_when_top_gear_needed() {
+    printf("\n=== Gate stays open when the load genuinely needs gear 5 (4<->5 hunt preserved) ===\n");
+    auto load = [](int){ return 0.245f; };   // between gear-4 (0.213) and gear-5 (0.30) capacity
+    SimResult ungated = simulate(true, load, 480, 68.0f, 0,-1,-1, /*gate=*/false);
+    SimResult gated   = simulate(true, load, 480, 68.0f, 0,-1,-1, /*gate=*/true);
+    printf("  ungated g5 %d chg %d | gated g5 %d chg %d\n",
+           count_gear(ungated,5), ungated.ss_changes, count_gear(gated,5), gated.ss_changes);
+    CHECK(count_gear(gated,5) > 0, "gated: gear 5 still used when the load demands it");
+    CHECK(std::abs(count_gear(gated,5) - count_gear(ungated,5)) <= 3, "gated: top-gear usage ~unchanged vs ungated at high load");
+}
+
 int main() {
     test_disabled_is_identical();
+    test_rate_gated_upshift();
+    test_gate_cuts_topgear_excursions();
+    test_gate_inert_when_top_gear_needed();
     test_user_event_conservative();
     test_hot_plus_fan_closed_loop();
     test_hot_day_centers_high();

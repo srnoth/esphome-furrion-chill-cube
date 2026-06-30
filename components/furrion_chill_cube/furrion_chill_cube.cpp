@@ -184,6 +184,22 @@ static const uint32_t FAN_EDGE_FREEZE_MS = 180000; // freeze integral 3 min afte
 // and a restore lands within half a quantum of the true equilibrium.
 static const float GEAR_PREF_BIAS_QUANTUM_C = 0.1f;
 static const float ADAPT_DRIFT_ALPHA = 0.3f;  // EMA smoothing for room dT/dt
+// Rate-gated upshift (derivative action). The learned integral bias may DRIVE an upshift only while
+// the room is strictly WARMING (drift > this). When the current gear is already holding or cooling
+// the room, a stronger gear isn't needed, so upshift decisions fall back to the unbiased real diff —
+// a wound-up integral can't grab a higher gear straight into an overshoot. This is the fix for the
+// hot-day "gear-5 windup": the integral would wind to ~0.6°C and leap to the 13 A top gear while
+// gear 4 was already holding/cooling the room, overshoot ~1°F, then collapse back down through 3+
+// gears (analysis 2026-06-30). Effect, by closed-loop sim sweep (tests/adaptive_test.cpp):
+//   • load < gear-4 capacity → collapses the "gear-3 + gear-5 pulses" pattern into a clean 3↔4 pair
+//     (fewer transitions, tighter swing, SAME steady offset);
+//   • load > gear-4 capacity → no effect: the room keeps warming at gear 4 (drift > 0) so the gate
+//     stays open and the genuinely-needed gear 5 / 4↔5 hunt is untouched.
+// Threshold is exactly 0, NOT positive: a positive value locks gear 4 and rides a large steady
+// offset at the gear-4-capacity knife-edge (it suppresses the corrective top-gear pulses too — the
+// sweep showed +0.01 → +1.45°F offset). 0 stays permeable there. Negative values are inert
+// (equilibrium warming is ≥ 0). Downshifts and the integral's own error term are NOT gated.
+static const float ADAPT_UPSHIFT_DRIFT_MIN_CPM = 0.0f;
 
 // Mode-switching protection lives in the 0→-1 gate and -1→active gate
 // (see mode_switch_idle_ms_, mode_switch_event_ms_, mode_switch_temp_offset_c_, mode_switch_off_ms_)
@@ -1102,6 +1118,7 @@ bool FurrionChillCube::vent_fan_on_() {
 float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear) {
   if (!adaptive_enable_) {
     adaptive_last_advance_ = now;  // keep dt fresh so a later enable doesn't see a huge gap
+    cool_eff_up_diff_ = real_diff; // no bias → upshift path is the static ladder (bit-identical)
     return real_diff;
   }
 
@@ -1133,7 +1150,14 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // not hold-gated). This also lets a stale positive bias unwind at gear 1 (e<0 is not frozen),
   // fixing the prior sat_low trap, and stops windup behind a held upshift from cascading gears.
   bool upshift_held = (cool_gear_ < 5) && (time_in_gear < HOLD_MS[cool_gear_ + 1]);
-  bool block_up = (e > 0.0f) && (cool_gear_ >= 5 || upshift_held);
+  // Rate gate: the room is "warming" (gear-raising allowed) only when dT/dt clears the threshold.
+  // Unknown drift (NaN, e.g. just after boot / a sensor gap) is treated as warming → legacy behavior.
+  bool warming = isnan(room_drift_cpm_) || room_drift_cpm_ > ADAPT_UPSHIFT_DRIFT_MIN_CPM;
+  // Freeze positive accumulation whenever the gear can't rise right now — at gear 5, while an
+  // upshift is hold-blocked, OR while the rate gate is suppressing the upshift (!warming). The
+  // last clause is load-bearing: without it the integral would keep winding behind a drift-gated
+  // upshift and then over-leap the moment the room ticked warm again (re-introducing the windup).
+  bool block_up = (e > 0.0f) && (cool_gear_ >= 5 || upshift_held || !warming);
   bool freeze = kickstart_active_() || fan_edge_freeze || block_up;
 
   if (idle) {
@@ -1146,7 +1170,13 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   }
 
   float ff_c = vent_fan_on_() ? (fan_feedforward_gears_ * GEAR_STEP_C) : 0.0f;
-  return real_diff + bias_c_ + ff_c;
+  float eff = real_diff + bias_c_ + ff_c;
+  // Upshift decisions see the learned bias only while warming. When not warming, fall back to the
+  // unbiased diff (+ the fast fan feedforward, which is anticipatory and must still act). fminf
+  // guarantees the gate can only ever SUPPRESS an upshift, never enable one: a stale NEGATIVE bias
+  // (eff < real_diff) keeps eff, so the gate never makes an upshift easier than the static ladder.
+  cool_eff_up_diff_ = warming ? eff : fminf(eff, real_diff + ff_c);
+  return eff;
 }
 
 int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
@@ -2008,6 +2038,9 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // active-gear switch cases (1-5). Re-engage/idle/mode-switch decisions stay on real diff.
   // Called every cool pass so the integral advances (or decays while idle) consistently.
   float eff_diff = adaptive_cool_eff_diff_(diff, now, time_in_gear);
+  // Upshift comparisons use the rate-gated diff (bias removed while the room isn't warming);
+  // downshifts and re-engage/idle decisions keep using eff_diff / real diff respectively.
+  float up_diff = cool_eff_up_diff_;
   int gear = cool_gear_;
   int new_gear = gear;
 
@@ -2068,19 +2101,19 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       // floating the ladder's center to today's sustaining gear. eff_diff == diff when
       // adaptive is disabled, so this is bit-identical to the static ladder in that case.
       case 1:
-        if (can_upshift_to(2) && eff_diff > C_UP_12)  new_gear = 2;
+        if (can_upshift_to(2) && up_diff > C_UP_12)   new_gear = 2;
         else if (eff_diff < C_DN_10)                   new_gear = 0;
         break;
       case 2:
-        if (can_upshift_to(3) && eff_diff > C_UP_23)  new_gear = 3;
+        if (can_upshift_to(3) && up_diff > C_UP_23)   new_gear = 3;
         else if (eff_diff < C_DN_21)                   new_gear = 1;
         break;
       case 3:
-        if (can_upshift_to(4) && eff_diff > C_UP_34)  new_gear = 4;
+        if (can_upshift_to(4) && up_diff > C_UP_34)   new_gear = 4;
         else if (eff_diff < C_DN_32)                   new_gear = 2;
         break;
       case 4:
-        if (can_upshift_to(5) && eff_diff > C_UP_45)  new_gear = 5;
+        if (can_upshift_to(5) && up_diff > C_UP_45)   new_gear = 5;
         else if (eff_diff < C_DN_43)                   new_gear = 3;
         break;
       case 5:

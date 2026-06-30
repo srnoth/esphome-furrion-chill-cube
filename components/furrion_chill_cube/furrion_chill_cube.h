@@ -318,7 +318,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   float bias_c_{0.0f};                   // integral bias (°C) added to the diff the cool ladder sees
   uint32_t adaptive_last_advance_{0};    // last integral advance (for dt)
   uint32_t vent_fan_changed_at_{0};      // last vent-fan edge (for the integral freeze window)
-  float room_drift_cpm_{NAN};            // EMA of inside dT/dt (°C/min) — observability + future use
+  float room_drift_cpm_{NAN};            // EMA of inside dT/dt (°C/min) — observability + upshift gate
+  float cool_eff_up_diff_{NAN};          // eff_diff for UPSHIFT decisions (bias gated out while not warming)
   float prev_inside_temp_c_{NAN};        // previous inside temp for drift computation
   uint32_t prev_inside_temp_at_{0};      // timestamp of prev_inside_temp_c_
 

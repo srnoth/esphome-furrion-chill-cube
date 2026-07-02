@@ -183,7 +183,24 @@ static const uint32_t FAN_EDGE_FREEZE_MS = 180000; // freeze integral 3 min afte
 // (ADAPT_KI=0.06 → ≥~28 min per step at typical sub-deadband-adjacent errors),
 // and a restore lands within half a quantum of the true equilibrium.
 static const float GEAR_PREF_BIAS_QUANTUM_C = 0.1f;
-static const float ADAPT_DRIFT_ALPHA = 0.3f;  // EMA smoothing for room dT/dt
+// Room-drift estimator: 3-minute trailing-window slope of inside temp (°C/min), consumed by the
+// rate-gated upshift below. Replaces an EMA of per-sample instantaneous rates that (a) froze at a
+// stale positive value when a plateau went quiet (a flat room stops emitting samples exactly when
+// we need drift≈0) and (b) lagged the thermal turnaround — both let a wound-up bias grab gear 5
+// into an overshoot (2026-07-02 incident). The windowed slope is less noisy (a large ΔT washes out
+// the 0.06 °F sensor quantization) and reads ≤0 within ~1 min of a turnaround. The baseline is the
+// buffered sample nearest DRIFT_WINDOW_MS old, accepted anywhere in [MIN, MAX]; the wide MAX makes
+// the slope robust to reporting gaps instead of freezing.
+static const uint32_t DRIFT_WINDOW_MS       = 180000;  // target baseline age (3 min)
+static const uint32_t DRIFT_BASELINE_MIN_MS =  90000;  // reject baselines younger than this (dt too small/noisy)
+static const uint32_t DRIFT_BASELINE_MAX_MS = 360000;  // ignore baselines older than this; also the gap tolerance (6 min)
+// The windowed slope is refreshed ONLY when a sample arrives. A room that plateaus can then go
+// quiet (a flat room emits no state change) exactly when we need drift≈0, leaving room_drift_cpm_
+// frozen at its last climbing value. So the gate trusts a POSITIVE (warming) reading only while a
+// sample no older than this backs it; a stale positive is treated as not-warming. Chosen well above
+// the ~2-min normal inter-sample gap (a genuinely warming room updates fast) and below the 5.5-min
+// gap that fooled the old EMA on 2026-07-02.
+static const uint32_t DRIFT_STALE_MS        = 240000;  // 4 min
 // Rate-gated upshift (derivative action). The learned integral bias may DRIVE an upshift only while
 // the room is strictly WARMING (drift > this). When the current gear is already holding or cooling
 // the room, a stronger gear isn't needed, so upshift decisions fall back to the unbiased real diff —
@@ -703,26 +720,13 @@ void FurrionChillCube::setup() {
       uint32_t cb_now = millis();
       if (isnan(value)) {
         inside_temp_c_ = NAN;
-        // Reset drift history so the next valid sample starts a fresh interval rather than
-        // computing a rate across the NaN gap.
-        prev_inside_temp_c_ = NAN;
-        prev_inside_temp_at_ = 0;
+        // Sensor unavailable → drop the drift history so we never compute a slope across the gap.
+        drift_buf_head_ = 0;
+        drift_buf_count_ = 0;
         room_drift_cpm_ = NAN;
       } else {
         inside_temp_c_ = inside_temp_fahrenheit_ ? (value - 32.0f) * (5.0f / 9.0f) : value;
-        // Room drift EMA (°C/min) — observability + future rate-gated upshift. Only when we
-        // have a valid prior sample at a sane interval (5s–5min); NaN gaps reset the history.
-        if (!isnan(prev_inside_temp_c_) && prev_inside_temp_at_ != 0) {
-          float dt_min = (cb_now - prev_inside_temp_at_) / 60000.0f;
-          if (dt_min >= (5.0f / 60.0f) && dt_min <= 5.0f) {
-            float inst = (inside_temp_c_ - prev_inside_temp_c_) / dt_min;
-            room_drift_cpm_ = isnan(room_drift_cpm_)
-                                  ? inst
-                                  : ADAPT_DRIFT_ALPHA * inst + (1.0f - ADAPT_DRIFT_ALPHA) * room_drift_cpm_;
-          }
-        }
-        prev_inside_temp_c_ = inside_temp_c_;
-        prev_inside_temp_at_ = cb_now;
+        room_drift_cpm_ = update_room_drift_(cb_now);  // 3-min windowed slope (°C/min)
       }
       this->current_temperature = inside_temp_c_;
       this->last_temp_update_ = cb_now;
@@ -1109,6 +1113,35 @@ bool FurrionChillCube::vent_fan_on_() {
   return vent_fan_sensor_ != nullptr && vent_fan_sensor_->state;
 }
 
+// Push the current inside temp into the drift ring and return the 3-min trailing-window slope
+// (°C/min), or NAN when no baseline sample yet sits in the [MIN, MAX] age band (warmup / just after
+// a sensor-unavailable reset). The gate treats NAN as warming (legacy-permissive). Baseline = the
+// buffered sample whose age is nearest DRIFT_WINDOW_MS, chosen from the [MIN, MAX] band; the wide
+// MAX (6 min) means a quiet plateau or a reporting gap still yields a correct ~0 slope instead of a
+// frozen stale value. See DRIFT_WINDOW_MS above.
+float FurrionChillCube::update_room_drift_(uint32_t now) {
+  // Record this sample into the ring.
+  drift_buf_at_[drift_buf_head_] = now;
+  drift_buf_temp_[drift_buf_head_] = inside_temp_c_;
+  drift_buf_head_ = (uint8_t)((drift_buf_head_ + 1) % DRIFT_BUF_N);
+  if (drift_buf_count_ < DRIFT_BUF_N) drift_buf_count_++;
+
+  // Pick the baseline: valid entries occupy indices [0, count_) whether or not the ring has wrapped
+  // (pre-wrap they were written there in order; once full, count_ == N covers every slot).
+  float base_temp = NAN;
+  uint32_t base_at = 0;
+  uint32_t best_err = 0xFFFFFFFFu;
+  for (uint8_t i = 0; i < drift_buf_count_; i++) {
+    uint32_t age = now - drift_buf_at_[i];           // monotonic within a boot; just-pushed = 0 → skipped
+    if (age < DRIFT_BASELINE_MIN_MS || age > DRIFT_BASELINE_MAX_MS) continue;
+    uint32_t err = (age > DRIFT_WINDOW_MS) ? (age - DRIFT_WINDOW_MS) : (DRIFT_WINDOW_MS - age);
+    if (err < best_err) { best_err = err; base_temp = drift_buf_temp_[i]; base_at = drift_buf_at_[i]; }
+  }
+  if (isnan(base_temp)) return NAN;                  // no baseline in band yet
+  float dt_min = (now - base_at) / 60000.0f;
+  return (inside_temp_c_ - base_temp) / dt_min;
+}
+
 // Phase 2 adaptive (cool): advance the integral bias (bias_c_) with anti-windup, then return
 // the effective diff the cool ladder's ACTIVE-gear thresholds select on
 // (real_diff + bias_c_ + vent-fan feedforward). Returns real_diff unchanged when adaptive is
@@ -1150,9 +1183,14 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // not hold-gated). This also lets a stale positive bias unwind at gear 1 (e<0 is not frozen),
   // fixing the prior sat_low trap, and stops windup behind a held upshift from cascading gears.
   bool upshift_held = (cool_gear_ < 5) && (time_in_gear < HOLD_MS[cool_gear_ + 1]);
-  // Rate gate: the room is "warming" (gear-raising allowed) only when dT/dt clears the threshold.
-  // Unknown drift (NaN, e.g. just after boot / a sensor gap) is treated as warming → legacy behavior.
-  bool warming = isnan(room_drift_cpm_) || room_drift_cpm_ > ADAPT_UPSHIFT_DRIFT_MIN_CPM;
+  // Rate gate: the room is "warming" (gear-raising allowed) only when dT/dt clears the threshold AND
+  // a recent sample backs the reading. room_drift_cpm_ is recomputed only on a sample, so a plateau
+  // that goes quiet freezes it at its last climbing value; trusting a POSITIVE reading only while
+  // fresh stops a wound-up bias from grabbing a top gear off frozen climb data (2026-07-02). Unknown
+  // drift (NaN — warmup / a buffer rebuilding after a gap) stays legacy-permissive.
+  bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
+  bool warming = isnan(room_drift_cpm_) ||
+                 (room_drift_cpm_ > ADAPT_UPSHIFT_DRIFT_MIN_CPM && drift_fresh);
   // Freeze positive accumulation whenever the gear can't rise right now — at gear 5, while an
   // upshift is hold-blocked, OR while the rate gate is suppressing the upshift (!warming). The
   // last clause is load-bearing: without it the integral would keep winding behind a drift-gated

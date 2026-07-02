@@ -6,3 +6,4 @@ tests/sim_test
 tests/gear_test
 
 tests/adaptive_test
+tests/drift_window_test

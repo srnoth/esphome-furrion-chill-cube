@@ -115,6 +115,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   // conditional-integration anti-windup (freeze positive accumulation behind a hold-blocked
   // upshift). Must be called once per cool pass so the integral advances/decays.
   float adaptive_cool_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear);
+  float update_room_drift_(uint32_t now);  // push sample + return 3-min windowed slope (°C/min)
   bool vent_fan_on_();
 
   // Kickstart system
@@ -318,10 +319,15 @@ class FurrionChillCube : public climate::Climate, public Component {
   float bias_c_{0.0f};                   // integral bias (°C) added to the diff the cool ladder sees
   uint32_t adaptive_last_advance_{0};    // last integral advance (for dt)
   uint32_t vent_fan_changed_at_{0};      // last vent-fan edge (for the integral freeze window)
-  float room_drift_cpm_{NAN};            // EMA of inside dT/dt (°C/min) — observability + upshift gate
+  float room_drift_cpm_{NAN};            // inside dT/dt (°C/min): 3-min windowed slope — observability + upshift gate
   float cool_eff_up_diff_{NAN};          // eff_diff for UPSHIFT decisions (bias gated out while not warming)
-  float prev_inside_temp_c_{NAN};        // previous inside temp for drift computation
-  uint32_t prev_inside_temp_at_{0};      // timestamp of prev_inside_temp_c_
+  // Room-drift estimator: ring buffer of recent (timestamp ms, inside °C) samples for the
+  // trailing-window slope (see DRIFT_WINDOW_MS in the .cpp). Sized to hold ~6 min at normal cadence.
+  static constexpr uint8_t DRIFT_BUF_N = 48;
+  uint32_t drift_buf_at_[DRIFT_BUF_N] = {0};
+  float    drift_buf_temp_[DRIFT_BUF_N] = {0};
+  uint8_t  drift_buf_head_{0};           // next write slot
+  uint8_t  drift_buf_count_{0};          // valid samples currently in the ring
 
   // Cached temperatures (Celsius)
   float inside_temp_c_{NAN};

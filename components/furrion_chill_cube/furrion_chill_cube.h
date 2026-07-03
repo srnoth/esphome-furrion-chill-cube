@@ -115,6 +115,11 @@ class FurrionChillCube : public climate::Climate, public Component {
   // conditional-integration anti-windup (freeze positive accumulation behind a hold-blocked
   // upshift). Must be called once per cool pass so the integral advances/decays.
   float adaptive_cool_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear);
+  // Phase 2 adaptive (heat): mirror of the cool integral with inverted sign (heat demand = -diff).
+  // Advances bias_h_ with anti-windup and returns eff_diff (real_diff - bias_h_); more-negative
+  // eff selects a higher heat gear. Returns real_diff unchanged when adaptive is disabled. Must be
+  // called once per heat pass so the integral advances/decays.
+  float adaptive_heat_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear);
   float update_room_drift_(uint32_t now);  // push sample + return 3-min windowed slope (°C/min)
   bool vent_fan_on_();
 
@@ -321,6 +326,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t vent_fan_changed_at_{0};      // last vent-fan edge (for the integral freeze window)
   float room_drift_cpm_{NAN};            // inside dT/dt (°C/min): 3-min windowed slope — observability + upshift gate
   float cool_eff_up_diff_{NAN};          // eff_diff for UPSHIFT decisions (bias gated out while not warming)
+  // Phase 2 adaptive (heat mode) — mirror of the cool state above. bias_h_ is a SIGNED heat-demand
+  // integral (+ = persistently cold = push toward a higher heat gear). Only one of bias_c_/bias_h_ is
+  // ever live at a time (the inactive mode's bias is zeroed each pass), so they never interfere.
+  float bias_h_{0.0f};                   // integral bias (°C): eff_diff = real_diff - bias_h_ for heat
+  uint32_t heat_adaptive_last_advance_{0}; // last heat integral advance (for dt) — separate from cool's
+  float heat_eff_up_diff_{NAN};          // eff_diff for heat UPSHIFT decisions (bias gated out while not cooling)
   // Room-drift estimator: ring buffer of recent (timestamp ms, inside °C) samples for the
   // trailing-window slope (see DRIFT_WINDOW_MS in the .cpp). Sized to hold ~6 min at normal cadence.
   static constexpr uint8_t DRIFT_BUF_N = 48;
@@ -342,11 +353,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   // the user target, so the pre-outage gear is NOT the unit's state — gear 0 is.)
   struct GearPrefData {
     int8_t gear;    // gear of the active IR mode at save time (-1..5)
-    float bias_c;   // adaptive integral bias (cool only; quantized before save)
+    float bias;     // adaptive integral bias of the ACTIVE mode (bias_c_ if cool, bias_h_ if heat;
+                    // quantized before save). One field: only one mode is active at reboot. Field
+                    // order/type unchanged from the old `bias_c` → NVS layout stable, no re-init.
   };
   ESPPreferenceObject gear_pref_;
   int8_t last_saved_gear_{-128};   // -128 = nothing saved this boot (forces first save)
-  float last_saved_bias_c_{0.0f};
+  float last_saved_bias_c_{0.0f};  // last saved bias value (any mode), for the no-op write guard
 };
 
 // Button sub-entities

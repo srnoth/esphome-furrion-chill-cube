@@ -111,57 +111,81 @@ static const uint32_t KEEPALIVE_INTERVAL_MS = 300000;  // 5 min
 static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
 // Mode switch lockouts are now configurable member variables (mode_switch_*_ms_, mode_switch_temp_offset_c_)
 
-// Heating deadbands (diff = room - target, negative = cold)
-static const float H_UP_01 = -0.3f;   // 0->1: room 0.5F below target
-static const float H_UP_12 = -0.8f;   // 1->2
-static const float H_UP_23 = -1.5f;   // 2->3
-static const float H_DN_32 = -0.8f;   // 3->2
-static const float H_DN_21 = -0.3f;   // 2->1
-// H_DN_10 triggers gear 1 → 0 before reaching setpoint, compensating for
-// the Furrion's post-drop thermal carry (~0.85°F observed on 2026-04-13).
-// Old value (+0.3°C / room 0.54°F above target) let peak reach +1.44°F
-// above setpoint — exceeds mode_switch_temp_offset_c_, triggered heat→cool
-// pong. New value drops gear at 0.27°F *below* setpoint; thermal carry
-// brings peak to ~+0.58°F, well inside mode-switch-offset safety margin.
-static const float H_DN_10 = -0.15f;  // 1->0: room 0.27F below target
-static const float H_IDLE  =  0.3f;   // 0->-1 threshold
+// Heating deadbands (diff = room - target, negative = cold; more negative = higher heat gear)
+//
+// ── 2026-07-03 UNIFORM-LADDER REDESIGN (PROVISIONAL — heat side, WINTER-VALIDATED not field-tested) ──
+// The MIRROR of the cool redesign below. Enabled by the new heat integral (bias_h_,
+// adaptive_heat_eff_diff_) added the same day — WITHOUT it, widening these rungs would just deepen
+// a fixed COLD offset (heat used to select on raw `diff`). With the integral floating the ladder,
+// the rungs can be widened + regularized and the slow loop centers the cycle on the heat setpoint.
+//   • Modulation boundaries 1/2, 2/3: uniform spacing S=0.25°C, uniform hysteresis h=0.20°C (matches
+//     cool). Down-rail spaced 0.25 >> ~0.07 coast overshoot → cascade-safe. Per-gear hold bands 0.45°C.
+//   • 0/1 boundary: NOT mirrored to cool's wide 0.70°C anti-short-cycle band. Heat's stop point is
+//     PINNED near setpoint by a thermal-carry / heat→cool-pong constraint (2026-04-13 incident:
+//     stopping heat above setpoint let post-drop carry overshoot past mode_switch_temp_offset_c_ and
+//     pong to cool). Mirroring cool's -0.55 would put stop-heat at +0.55°C (1°F ABOVE setpoint) →
+//     re-trigger the pong. So H_DN_10 stays -0.15 (stop 0.27°F BELOW setpoint; carry lands ~setpoint),
+//     and — belt-and-suspenders — run_heat_mode_ keeps the 1→0 STOP decision on REAL diff, not
+//     eff_diff, so the integral can never shift the pong-critical boundary (see case 1 there).
+// Up-rail (start/upshift): -0.35 / -0.60 / -0.85 ; Down-rail (stop/downshift): -0.15 / -0.40 / -0.65.
+// Both monotonic (more negative = higher gear). SAME retune constraints as cool (cascade/chatter/
+// loop-separation). ⚠️ UNTESTABLE until heating season — validate the pong margin + centering on the
+// first real heat cycle before trusting; the heat-integral risk note is on adaptive_heat_eff_diff_.
+static const float H_UP_01 = -0.35f;  // 0→1 start heat  ┐
+static const float H_UP_12 = -0.60f;  // 1→2            │ uniform up-rail, S=0.25
+static const float H_UP_23 = -0.85f;  // 2→3            ┘
+static const float H_DN_32 = -0.65f;  // 3→2            ┐ uniform down-rail = up-rail + h (h=0.20)
+static const float H_DN_21 = -0.40f;  // 2→1            ┘
+// H_DN_10 PINNED (not part of the uniform grid): gear 1 → 0 stops heat BEFORE reaching setpoint to
+// absorb the Furrion's ~0.85°F post-drop thermal carry (2026-04-13). Stopping above setpoint let peak
+// reach +1.44°F > mode_switch_temp_offset_c_ → heat→cool pong. -0.15 drops gear 0.27°F below setpoint;
+// carry brings peak to ~+0.58°F, inside the mode-switch margin. run_heat_mode_ evaluates 1→0 on REAL
+// diff so bias_h_ can't move this boundary.
+static const float H_DN_10 = -0.15f;  // 1→0: room 0.27F below target (PINNED)
+static const float H_IDLE  =  0.3f;   // 0→-1 threshold
 
 // Cooling deadbands (diff = room - target, positive = hot)
-static const float C_UP_01 =  0.15f;
-static const float C_UP_12 =  0.25f;
-static const float C_UP_23 =  0.4f;
-// C_UP_34 / C_DN_32 / C_DN_43 widened on 2026-05-18 to break a 2↔4 hunt
-// observed on the production unit. Old (0.60/0.10/0.25) let gear 3 act only
-// as a transient: HOLD_MS[4]=5min forced 3→4 once diff cleared 0.60, and
-// post-step-down thermal carry from gear 4 dragged diff straight through
-// gear 3's 0.15°C window into gear 2. New values give gear 3 a 0.90°C
-// hysteresis window and step gear 4 down ~0.15°C earlier so residual cool
-// lands inside gear 3's range instead of below it. Power swings ~3A↔11A
-// → expected to settle near gear 3 (~7A) with brief 2/4 excursions only.
-static const float C_UP_34 =  0.85f;
-static const float C_UP_45 =  1.0f;   // bumped from 0.80 to preserve up-ladder monotonicity
-static const float C_DN_54 =  0.45f;
-static const float C_DN_43 =  0.40f;
-static const float C_DN_32 = -0.05f;
-// C_DN_21 is the gear-2 sustain floor — deliberately deep (room ~0.7°F below setpoint).
-// Gear 2 (not gear 1) is the sustain gear on mild days. 2026-06-03 drift analysis of a
-// full mild cool cycle (target 68°F, outside 72-78°F) measured the equilibrium load
-// sitting BETWEEN gear 2 (+0.047°F/min, gently under-cools) and gear 3 (-0.061°F/min,
-// gently over-cools) — the natural steady state is a quiet 2↔3 duty cycle. The old -0.10
-// (3→2 at -0.05 and 2→1 at -0.10 only 0.09°F apart) let gear 3's downward momentum coast
-// the room ~0.27°F past the 3→2 point and trip 2→1 immediately, so gear 2 never held (a
-// 6-min waypoint, 18 visits). Dropping to gear 1 buys nothing physically — g1 drift
-// (+0.065°F/min) ≈ g2's — but it deepens the bottom of the swing, and the long under-cooled
-// climb back overshoots (HOLD_MS-gated) all the way to a gear-4 spike on a mild day. -0.40
-// keeps gear 2 holding through a normal undershoot (deepest observed coast-down was only
-// -0.20°C), collapsing the 1↔2↔3↔4 churn into a clean 2↔3 toggle and removing the gear-4
-// trigger. Hot-day operation is untouched (2→1 rarely triggers when the room stays warm).
-static const float C_DN_21 = -0.40f;
-// C_DN_10 is the gear-1→idle floor. With gear 2 now the sustain floor (C_DN_21=-0.40),
-// gear 1 is a thin deep-undershoot-only sliver: it is entered only when the room is already
-// >0.7°F cold, and -0.55 gives it a small (0.15°C) band before idle rather than collapsing
-// straight to a stop. Down-ladder stays monotonic: 0.45 / 0.40 / -0.05 / -0.40 / -0.55.
-static const float C_DN_10 = -0.55f;
+//
+// ── 2026-07-03 UNIFORM-LADDER REDESIGN (PROVISIONAL — pending full-range hot-day gear test) ──
+// Supersedes the accreted empirical tunings below (2026-05-18 2↔4-hunt fix; 2026-06-03 gear-2
+// sustain floor; 2026-07-03 C_DN_54 spot fix). Those all patched a Phase-1 pathology: with NO
+// integral, the ONLY way to hold the room near setpoint was to pack the rungs tight so the
+// closest-fitting gear sat at a small fixed offset. Accuracy came FROM the tightness — but the
+// tightness also (a) crammed the top of the down-rail (C_DN_54=0.45 sat 0.05°C above C_DN_43=0.40)
+// so a gear-5 pull cascaded 5→4→3 through gear 4's 0.05°C sliver in <1 min (the 3→4→5→3 hot-day
+// cycle), and (b) forced multi-gear oscillation across a wide thermal spread (g3 too weak → warm
+// drift; g5 too strong → cold shots).
+//
+// Phase 2 added the adaptive integral (bias_c_), which now removes steady-state offset on its own.
+// So the ladder no longer has to be accurate — only stable + responsive. That frees us to WIDEN
+// and REGULARIZE the rungs and let the slow loop center the resulting cycle on setpoint. Design:
+//   • Modulation boundaries 1/2, 2/3, 3/4, 4/5: UNIFORM spacing S=0.25°C (~0.45°F, ≈2 gears per
+//     1°F) and UNIFORM hysteresis h=0.20°C. Every gear now gets a ~0.45°C (0.8°F) hold band
+//     (was 0.05°C on gear-4's down side). Down-rail spaced 0.25°C apart >> ~0.07°C thermal-coast
+//     overshoot → NO cascade at ANY boundary (generalizes the C_DN_54 spot fix to the whole ladder).
+//   • 0/1 boundary (compressor START/STOP, not modulation): KEEP the large anti-short-cycle
+//     hysteresis (C_UP_01=0.15, C_DN_10=-0.55, span 0.70°C). Uniform-h here would short-cycle
+//     the compressor.
+//   • Anchored to keep C_UP_01=0.15 (start point) and C_UP_45=1.00 (top-gear spike response).
+// Steady state: on a load between gears N/N+1 the integral winds bias so the N↔N+1 cycle centers
+// on setpoint; amplitude ≈ h + overshoot ≈ 0.3–0.4°F, and once centered the whole swing sits
+// inside ADAPT_DEADBAND_C so the integral goes quiet. Non-adjacent gears (e.g. g3 on a g4/g5 load)
+// never engage. Up-stroke on the near-equilibrium gear ~20–30 min — kept under the integral's
+// ~30-min timescale so the loops still separate (this is the CEILING on how wide h can go; if the
+// full test wants a bigger amplitude, raise ADAPT_KI in step). CONSTRAINTS TO PRESERVE ON RETUNE:
+// down-rail spacing > coast overshoot (cascade safety); h > overshoot (chatter safety); h small
+// enough that the up-stroke << integral timescale (loop separation). Up=0.15/0.25/0.50/0.75/1.00,
+// Down=-0.55/0.05/0.30/0.55/0.80 — both monotonic.
+static const float C_UP_01 =  0.15f;  // 0→1 compressor start (wide anti-short-cycle boundary)
+static const float C_UP_12 =  0.25f;  // 1→2  ┐
+static const float C_UP_23 =  0.50f;  // 2→3  │ uniform modulation up-rail, S=0.25
+static const float C_UP_34 =  0.75f;  // 3→4  │
+static const float C_UP_45 =  1.00f;  // 4→5  ┘ (kept at 1.00 for top-gear spike response)
+static const float C_DN_54 =  0.80f;  // 5→4  ┐
+static const float C_DN_43 =  0.55f;  // 4→3  │ uniform modulation down-rail = up-rail − h (h=0.20)
+static const float C_DN_32 =  0.30f;  // 3→2  │
+static const float C_DN_21 =  0.05f;  // 2→1  ┘
+static const float C_DN_10 = -0.55f;  // 1→0 compressor stop (wide anti-short-cycle boundary)
 static const float C_IDLE  = -0.15f;
 
 // ── Phase 2 adaptive equilibrium-gear controller (cool mode) ────────────────────
@@ -174,8 +198,13 @@ static const float ADAPT_BIAS_C_MAX = 2.0f;   // authority clamp (~2-3 gears) + 
 static const float ADAPT_DEADBAND_C = 0.15f;  // don't integrate noise / tiny offset
 static const float ADAPT_DECAY_TAU_MIN = 30.0f; // idle: forget a stale equilibrium with this time const
 static const float ADAPT_DT_CAP_MIN = 5.0f;   // clamp dt across stalls/reboots
-static const float GEAR_STEP_C = 0.85f;       // eff_diff per gear-equivalent of fan feedforward
-                                              // (= C_UP_34; a deliberately firm one-gear shove)
+static const float GEAR_STEP_C = 0.25f;       // eff_diff per gear-equivalent of fan feedforward
+                                              // (= modulation gear spacing S; ff_c = fan_feedforward_gears_
+                                              // × this). Rescaled 0.85→0.25 with the 2026-07-03 uniform
+                                              // ladder: "one gear" is now 0.25°C, not the old top-of-ladder
+                                              // 0.85 — leaving it at 0.85 would shove ~3.4 gears per fan gear.
+                                              // PROVISIONAL: fan thermal load was never measured independently
+                                              // (old value was geometry-derived); validate in the full test.
 static const uint32_t FAN_EDGE_FREEZE_MS = 180000; // freeze integral 3 min after a vent-fan edge
 // Quantum for persisting bias_c_ to flash: the integral drifts a tiny amount every
 // pass, so saving it raw would queue an NVS write per pass. Quantized to 0.1°C a
@@ -325,14 +354,16 @@ void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
 void FurrionChillCube::save_gear_pref_() {
 #ifdef USE_ESP32
   int8_t g = -1;
+  float bias_active = bias_c_;  // default cool; overridden for heat below
   if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
     g = (int8_t) heat_gear_;
+    bias_active = bias_h_;
   } else if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
     g = (int8_t) cool_gear_;
   }
-  float bias_q = isnan(bias_c_)
+  float bias_q = isnan(bias_active)
                      ? 0.0f
-                     : roundf(bias_c_ / GEAR_PREF_BIAS_QUANTUM_C) * GEAR_PREF_BIAS_QUANTUM_C;
+                     : roundf(bias_active / GEAR_PREF_BIAS_QUANTUM_C) * GEAR_PREF_BIAS_QUANTUM_C;
   if (g == last_saved_gear_ && bias_q == last_saved_bias_c_) return;
   GearPrefData d{g, bias_q};
   gear_pref_.save(&d);
@@ -670,8 +701,11 @@ void FurrionChillCube::setup() {
         // disabled the bias never integrates OR decays, so a restored value would sit
         // frozen across reboots and spring back stale (≤±2.0°C) whenever adaptive is
         // re-enabled — possibly a season later, against a different equilibrium.
-        if (!is_heat && adaptive_enable_ && !isnan(saved_gear.bias_c)) {
-          bias_c_ = std::max(-ADAPT_BIAS_C_MAX, std::min(ADAPT_BIAS_C_MAX, saved_gear.bias_c));
+        // The saved bias belongs to the ACTIVE mode at save time → restore it to that
+        // mode's member (bias_h_ for heat, bias_c_ for cool).
+        if (adaptive_enable_ && !isnan(saved_gear.bias)) {
+          float b = std::max(-ADAPT_BIAS_C_MAX, std::min(ADAPT_BIAS_C_MAX, saved_gear.bias));
+          if (is_heat) bias_h_ = b; else bias_c_ = b;
         }
       }
     }
@@ -1088,9 +1122,9 @@ bool FurrionChillCube::gear_in_band_heat_(int gear, float diff) {
   // Gear N stays in (H_UP_N(N+1), H_DN_N(N-1)) — its own transition thresholds.
   // (For heat, diff is negative when cold, so H_UP_* are the lower bounds.)
   switch (gear) {
-    case 0: return diff >= H_UP_01 && diff <= H_IDLE;       // (-0.3, 0.3)
-    case 1: return diff >= H_UP_12 && diff <= H_DN_10;      // (-0.8, -0.15)
-    case 2: return diff >= H_UP_23 && diff <= H_DN_21;      // (-1.5, -0.3)
+    case 0: return diff >= H_UP_01 && diff <= H_IDLE;       // (-0.35, 0.30)
+    case 1: return diff >= H_UP_12 && diff <= H_DN_10;      // (-0.60, -0.15)
+    case 2: return diff >= H_UP_23 && diff <= H_DN_21;      // (-0.85, -0.40)
     case 3: return diff <= H_DN_32;                          // max heat, no lower bound
     default: return false;
   }
@@ -1101,9 +1135,9 @@ bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
   switch (gear) {
     case 0: return diff >= C_IDLE  && diff <= C_UP_01;      // (-0.15, 0.15)
     case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // (-0.55, 0.25)
-    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // (-0.40, 0.40)
-    case 3: return diff >= C_DN_32 && diff <= C_UP_34;      // (-0.05, 0.85)
-    case 4: return diff >= C_DN_43 && diff <= C_UP_45;      // (0.40, 1.00)
+    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // ( 0.05, 0.50)
+    case 3: return diff >= C_DN_32 && diff <= C_UP_34;      // ( 0.30, 0.75)
+    case 4: return diff >= C_DN_43 && diff <= C_UP_45;      // ( 0.55, 1.00)
     case 5: return diff >= C_DN_54;                          // max cool, no upper bound
     default: return false;
   }
@@ -1214,6 +1248,67 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // guarantees the gate can only ever SUPPRESS an upshift, never enable one: a stale NEGATIVE bias
   // (eff < real_diff) keeps eff, so the gate never makes an upshift easier than the static ladder.
   cool_eff_up_diff_ = warming ? eff : fminf(eff, real_diff + ff_c);
+  return eff;
+}
+
+// Phase 2 adaptive (heat): the SIGN-MIRROR of adaptive_cool_eff_diff_. Heat "demand" is -real_diff
+// (room below target = need heat), so the integral bias_h_ winds POSITIVE when persistently cold and
+// eff = real_diff - bias_h_ (more negative → higher heat gear). Anti-windup freezes POSITIVE demand
+// accumulation when the gear can't rise (gear 3 = max heat, an upshift is hold-blocked, OR the room
+// isn't cooling per the rate gate). The rate gate's "raise allowed" condition is the room getting
+// COLDER (drift < -threshold) — the mirror of cool's "warming". No fan feedforward on the heat side
+// (the vent-fan FF is a cooling-load model; heat FF is a separate unmeasured question — omitted).
+// ⚠️ WINTER-VALIDATE: this loop shifts the heat downshift thresholds via bias_h_. The pong-critical
+// 1→0 STOP is deliberately evaluated on REAL diff in run_heat_mode_ so bias can't move it, but the
+// centering + overshoot behavior is UNTESTED until a real heat cycle — verify before trusting.
+float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear) {
+  if (!adaptive_enable_) {
+    heat_adaptive_last_advance_ = now;  // keep dt fresh so a later enable doesn't see a huge gap
+    heat_eff_up_diff_ = real_diff;      // no bias → upshift path is the static ladder (bit-identical)
+    return real_diff;
+  }
+
+  // dt since last advance, clamped (first pass, stalls, mode gaps, millis wrap-after-reboot)
+  float dt_min = 0.0f;
+  if (heat_adaptive_last_advance_ != 0) {
+    dt_min = (now - heat_adaptive_last_advance_) / 60000.0f;
+    if (dt_min < 0.0f) dt_min = 0.0f;
+    if (dt_min > ADAPT_DT_CAP_MIN) dt_min = ADAPT_DT_CAP_MIN;
+  }
+  heat_adaptive_last_advance_ = now;
+
+  // Heat-demand error (+ = room too COLD = need more heat). Mirror of cool's e = real_diff.
+  float e = -real_diff;
+  if (e > -ADAPT_DEADBAND_C && e < ADAPT_DEADBAND_C) e = 0.0f;
+
+  bool idle = (heat_gear_ <= 0);  // heat off/idle — error not controllable
+  // Conditional-integration anti-windup: freeze POSITIVE (more-heat) accumulation when the gear
+  // cannot rise — at gear 3 (max heat), while an upshift is hold-blocked, or while the rate gate
+  // suppresses the upshift. NEGATIVE (less-heat) accumulation is never rail-blocked (gear 0/idle is
+  // always reachable), so a stale positive bias can always unwind. Mirror of the cool anti-windup.
+  bool upshift_held = (heat_gear_ < 3) && (time_in_gear < HOLD_MS[heat_gear_ + 1]);
+  bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
+  // "cooling" = room getting colder = raising the heat gear is warranted (mirror of cool's "warming").
+  // A POSITIVE-magnitude drift reading is trusted only while fresh; NaN stays legacy-permissive.
+  bool cooling = isnan(room_drift_cpm_) ||
+                 (room_drift_cpm_ < -ADAPT_UPSHIFT_DRIFT_MIN_CPM && drift_fresh);
+  bool block_up = (e > 0.0f) && (heat_gear_ >= 3 || upshift_held || !cooling);
+  bool freeze = kickstart_active_() || block_up;  // no fan-edge freeze (no heat fan feedforward)
+
+  if (idle) {
+    // Idle: forget a stale equilibrium so a re-engage doesn't inherit a wrong load.
+    if (dt_min > 0.0f) bias_h_ *= expf(-dt_min / ADAPT_DECAY_TAU_MIN);
+  } else if (!freeze && dt_min > 0.0f) {
+    bias_h_ += ADAPT_KI * e * dt_min;
+    if (bias_h_ > ADAPT_BIAS_C_MAX) bias_h_ = ADAPT_BIAS_C_MAX;
+    if (bias_h_ < -ADAPT_BIAS_C_MAX) bias_h_ = -ADAPT_BIAS_C_MAX;
+  }
+
+  float eff = real_diff - bias_h_;  // bias_h_ > 0 (cold demand) → more negative → higher heat gear
+  // Upshift decisions see the learned bias only while cooling. When not cooling, fall back to the
+  // unbiased diff. fmaxf (mirror of cool's fminf) guarantees the gate can only SUPPRESS an upshift,
+  // never enable one: a stale POSITIVE bias (eff < real_diff) is clamped up to real_diff.
+  heat_eff_up_diff_ = cooling ? eff : fmaxf(eff, real_diff);
   return eff;
 }
 
@@ -1650,6 +1745,7 @@ void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
   cool_gear_ = -1;
   off_since_ = now;
   bias_c_ = 0.0f;
+  bias_h_ = 0.0f;
   clamp_phase_ = ClampPhase::IDLE;
   quick_kick_active_ = false;
   abort_keepalive_();
@@ -1706,11 +1802,12 @@ void FurrionChillCube::run_gear_controller_() {
     run_idle_mode_(now);
   }
 
-  // Phase 2: the adaptive bias only exists during active cooling. Clear it whenever cooling
-  // is not the active mode so a heat→cool switch (or a return from full-off) starts fresh
-  // rather than inheriting a stale equilibrium. (Within-cool gear-0 idle is handled by the
-  // decay in adaptive_cool_eff_diff_, which still runs because do_cool stays true at gear 0.)
+  // Phase 2: each mode's adaptive bias only exists while that mode is active. Clear the inactive
+  // mode's bias every pass so a mode switch (or a return from full-off) starts fresh rather than
+  // inheriting a stale equilibrium. (Within-mode gear-0 idle is handled by the decay in
+  // adaptive_*_eff_diff_, which still runs because do_cool/do_heat stays true at gear 0.)
   if (!do_cool) bias_c_ = 0.0f;
+  if (!do_heat) bias_h_ = 0.0f;
 
   // Boot gate: first successful gear computation enables IR
   if (!boot_ready_) {
@@ -1725,11 +1822,11 @@ void FurrionChillCube::run_gear_controller_() {
   publish_debug_state_(gear_diff);
 
   // Periodic state log
-  ESP_LOGD(TAG, "state: heat=%d cool=%d room=%.2f cs=%d hold=%lus idle=%lum mode=%d bias=%.2f drift=%.3f",
+  ESP_LOGD(TAG, "state: heat=%d cool=%d room=%.2f cs=%d hold=%lus idle=%lum mode=%d biasC=%.2f biasH=%.2f drift=%.3f",
            heat_gear_, cool_gear_, room, current_cs_,
            time_in_gear / 1000,
            idle_since_ > 0 ? (now - idle_since_) / 60000 : 0,
-           (int)last_active_mode_, bias_c_, room_drift_cpm_);
+           (int)last_active_mode_, bias_c_, bias_h_, room_drift_cpm_);
 }
 
 // Failsafe detection + NaN-room grace. Returns true if the caller should stop
@@ -1773,6 +1870,7 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     heat_gear_ = -1;
     cool_gear_ = -1;
     bias_c_ = 0.0f;   // drop the adaptive equilibrium on failsafe — re-engage learns fresh
+    bias_h_ = 0.0f;
     idle_since_ = 0;
     last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
@@ -1914,7 +2012,13 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     return true;
   }
   float diff = room - target;
-  gear_diff = diff;
+  gear_diff = diff;  // debug always reports REAL (unbiased) diff
+  // Phase 2 adaptive (heat): advance the integral and get the effective diff for the active-gear
+  // switch cases. Mirror of the cool call. Re-engage/idle/mode-switch AND the pong-critical 1→0
+  // STOP decision stay on real diff. Called every heat pass so the integral advances/decays.
+  float eff_diff = adaptive_heat_eff_diff_(diff, now, time_in_gear);
+  // Upshift comparisons use the rate-gated diff (bias removed while the room isn't cooling).
+  float up_diff = heat_eff_up_diff_;
   int gear = heat_gear_;
   int new_gear = gear;
 
@@ -1960,15 +2064,17 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         break;
       }
       case 1:
-        if (can_upshift_to(2) && diff < H_UP_12)  new_gear = 2;
-        else if (diff > H_DN_10)                   new_gear = 0;
+        // Upshift on rate-gated diff; STOP (1→0) on REAL diff (pong-critical H_DN_10 must not
+        // be shifted by bias_h_ — see the heating-deadband block).
+        if (can_upshift_to(2) && up_diff < H_UP_12)  new_gear = 2;
+        else if (diff > H_DN_10)                     new_gear = 0;
         break;
       case 2:
-        if (can_upshift_to(3) && diff < H_UP_23)  new_gear = 3;
-        else if (diff > H_DN_21)                   new_gear = 1;
+        if (can_upshift_to(3) && up_diff < H_UP_23)  new_gear = 3;
+        else if (eff_diff > H_DN_21)                 new_gear = 1;
         break;
       case 3:
-        if (diff > H_DN_32)                        new_gear = 2;
+        if (eff_diff > H_DN_32)                      new_gear = 2;
         break;
     }
   }
@@ -2061,6 +2167,9 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     heat_gear_ = -1;
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
   }
+  // Cool pass: heat is not the active mode → drop its integral so a later cool→heat switch starts
+  // from bias_h_ = 0 (mirror of the bias_c_ = 0 at the top of run_heat_mode_).
+  bias_h_ = 0.0f;
 
   update_furrion_setpoint_(false);
   float target = get_cool_target_();
@@ -2336,7 +2445,10 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   pub(debug_boot_ready_sensor_, boot_ready_ ? 1.0f : 0.0f);
 
   // Phase 2 adaptive observability
-  pub(debug_adaptive_bias_c_sensor_, bias_c_);
+  // Publish the ACTIVE mode's adaptive bias (the inactive mode's is held at 0). During heat this
+  // shows bias_h_; during cool, bias_c_ — so the one debug sensor tracks whichever loop is live.
+  pub(debug_adaptive_bias_c_sensor_,
+      (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? bias_h_ : bias_c_);
   pub(debug_room_drift_sensor_, room_drift_cpm_);
   pub(debug_fan_feedforward_sensor_,
       (adaptive_enable_ && vent_fan_on_()) ? (float)fan_feedforward_gears_ : 0.0f);

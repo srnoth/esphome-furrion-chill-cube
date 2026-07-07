@@ -80,6 +80,19 @@ class FurrionChillCube : public climate::Climate, public Component {
   // vane_step_duration_ms_ (non-blocking). Each press = one fixed-size step.
   void send_vane_step();
 
+  // ── CS characterization test hooks (active only when test_mode is set) ──────
+  // Drive the unit with explicit °C setpoint / CS values, bypassing the gear
+  // controller, for gear-mapping sweeps. Frames are byte-identical to production
+  // (they call the same transmit_* primitives); only the value SOURCE differs.
+  // While test_mode_ is set, loop() is inert (no gear/kickstart/keepalive/heartbeat)
+  // and the sensor gates in the transmit path are bypassed, so CS injection is
+  // fully deterministic and independent of the (wireless) room sensor.
+  void set_test_mode(bool t) { test_mode_ = t; }
+  void test_cool_on(int setpoint_c);       // mode ON + COOL + setpoint, idle CS
+  void test_set_setpoint(int setpoint_c);  // change setpoint, bracketed by current CS
+  void test_send_cs(int cs_c);             // transmit one raw °C CS value (sweep step)
+  void test_off();                         // mode OFF
+
  protected:
   // Climate interface
   climate::ClimateTraits traits() override;
@@ -310,6 +323,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Flags
   bool boot_ready_{false};
   bool failsafe_active_{false};
+  bool test_mode_{false};             // CS characterization test mode: loop() inert, manual CS injection
   bool user_changed_{false};
   bool temp_dirty_{false};
   bool heater_locked_out_{false};

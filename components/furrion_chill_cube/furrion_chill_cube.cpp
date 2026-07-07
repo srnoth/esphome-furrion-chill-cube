@@ -405,7 +405,8 @@ void FurrionChillCube::transmit_mode_command_() {
   // always allowed. A transient gap is harmless (the unit coasts); a gap longer
   // than the unit's ~7-min CS-mode timeout hands control back to its internal
   // controller. See project_failover_invariant.
-  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && isnan(get_active_ir_target_())) {
+  if (!test_mode_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
+      isnan(get_active_ir_target_())) {
     return;
   }
 
@@ -539,8 +540,13 @@ void FurrionChillCube::transmit_cs_update_() {
   // both a valid inside temperature and a valid setpoint. On a transient gap
   // the unit just coasts; on a gap longer than its ~7-min CS-mode timeout it
   // hands control back to its internal sensor. See project_failover_invariant.
-  if (isnan(inside_temp_c_)) return;
-  if (isnan(get_active_ir_target_())) return;
+  // Test mode injects CS deterministically from current_cs_ / furrion_setpoint_c_,
+  // independent of the wireless room sensor — bypass the failover sensor gates so a
+  // sensor dropout mid-sweep can't silently stall the CS stream.
+  if (!test_mode_) {
+    if (isnan(inside_temp_c_)) return;
+    if (isnan(get_active_ir_target_())) return;
+  }
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
@@ -600,6 +606,53 @@ void FurrionChillCube::transmit_mode_with_cs_() {
   transmit_mode_command_();
   transmit_cs_update_();
   last_cs_heartbeat_ = millis();  // a CS just went out — restart the 30s heartbeat clock
+}
+
+// ── CS characterization test hooks ─────────────────────────────────────────
+// These reuse the production transmit primitives, so every frame on the wire is
+// byte-identical to what the gear controller ships — only the value SOURCE
+// (explicit args vs. the gear logic) differs. furrion_setpoint_c_ drives the
+// (°C-protocol) setpoint byte; current_cs_ drives the raw °C CS byte. We also set
+// target_temperature_high so the HA climate card stays consistent. Active only
+// while test_mode_ is set (loop() is inert; the transmit sensor gates bypassed).
+void FurrionChillCube::test_cool_on(int setpoint_c) {
+  test_mode_ = true;
+  failsafe_active_ = false;
+  boot_ready_ = true;
+  active_ir_mode_ = climate::CLIMATE_MODE_COOL;
+  furrion_setpoint_c_ = setpoint_c;
+  this->target_temperature_high = (float) setpoint_c;
+  current_cs_ = setpoint_c - 5;                 // idle CS: power-on implies no cooling
+  transmit_mode_with_cs_();                     // CS(idle) → MODE-ON(setpoint) → CS(idle)
+  if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
+  ESP_LOGI(TAG, "TEST: cool ON, setpoint=%d C, idle CS=%d", setpoint_c, current_cs_);
+}
+
+void FurrionChillCube::test_set_setpoint(int setpoint_c) {
+  furrion_setpoint_c_ = setpoint_c;
+  this->target_temperature_high = (float) setpoint_c;
+  // Bracket the setpoint change with the CURRENT CS so the unit is never left
+  // holding a stale CS against the new setpoint (mirrors transmit_mode_with_cs_).
+  transmit_cs_update_();
+  transmit_mode_command_();
+  transmit_cs_update_();
+  last_cs_heartbeat_ = millis();
+  ESP_LOGI(TAG, "TEST: setpoint=%d C (CS held at %d)", setpoint_c, current_cs_);
+}
+
+void FurrionChillCube::test_send_cs(int cs_c) {
+  current_cs_ = cs_c;
+  transmit_cs_update_();
+  last_cs_heartbeat_ = millis();
+  if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
+  ESP_LOGI(TAG, "TEST: CS=%d (setpoint=%d C, delta=%+d)", cs_c, furrion_setpoint_c_,
+           cs_c - furrion_setpoint_c_);
+}
+
+void FurrionChillCube::test_off() {
+  active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+  transmit_mode_command_();
+  ESP_LOGI(TAG, "TEST: unit OFF");
 }
 
 void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg) {
@@ -807,6 +860,12 @@ void FurrionChillCube::setup() {
 
 void FurrionChillCube::loop() {
   uint32_t now = millis();
+
+  // CS characterization test mode: the gear controller, kickstart, keepalive and
+  // heartbeat are all suspended — every IR frame is driven explicitly by the
+  // test_* hooks instead. See project_failover_invariant (this is a bench test,
+  // operator present) and the test_* methods below.
+  if (test_mode_) return;
 
   // 1. Advance keep-alive state machine
   if (keepalive_phase_ != KeepAlivePhase::IDLE) {

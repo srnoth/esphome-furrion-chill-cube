@@ -46,6 +46,7 @@ CONF_COOL_VENT_INTERVAL = "cool_final_position_interval"
 CONF_USE_FAHRENHEIT = "use_fahrenheit"
 # Phase 2 adaptive equilibrium-gear controller (cool mode)
 CONF_ADAPTIVE_ENABLE = "adaptive_enable"
+CONF_TEST_MODE = "test_mode"
 CONF_VENT_FAN = "vent_fan"
 CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
 
@@ -220,6 +221,11 @@ CONFIG_SCHEMA = cv.All(
             # Keep-alive pulse: periodic CS bump to sustain compressor at low gears.
             # Disable if the bump causes unwanted compressor spikes.
             cv.Optional(CONF_KEEPALIVE_ENABLE, default=True): cv.boolean,
+            # CS characterization test mode. When true, the gear controller is
+            # suspended and the unit is driven only by the test_* hooks (manual °C
+            # setpoint / CS injection) for gear-mapping sweeps. Default false =
+            # normal production behavior (bit-identical to without this option).
+            cv.Optional(CONF_TEST_MODE, default=False): cv.boolean,
             # Target temperature encoding sent to the unit via Toshiba IR.
             # true (default) = Fahrenheit (RAC-PT1411HWRU F-protocol, 60-86°F,
             #   FAH flag set, unit panel displays °F).
@@ -338,6 +344,7 @@ async def to_code(config):
     cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
     cg.add(var.set_mode_switch_off_ms(config[CONF_MODE_SWITCH_OFF].total_milliseconds))
     cg.add(var.set_keepalive_enable(config[CONF_KEEPALIVE_ENABLE]))
+    cg.add(var.set_test_mode(config[CONF_TEST_MODE]))
     cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
 
     # Timed vane positioning (optional; only plumbed when set)

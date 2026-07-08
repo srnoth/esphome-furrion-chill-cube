@@ -117,8 +117,8 @@ static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
 // adaptive_heat_eff_diff_) added the same day — WITHOUT it, widening these rungs would just deepen
 // a fixed COLD offset (heat used to select on raw `diff`). With the integral floating the ladder,
 // the rungs can be widened + regularized and the slow loop centers the cycle on the heat setpoint.
-//   • Modulation boundaries 1/2, 2/3: spacing S=0.40°C, hysteresis h=0.45°C (matches cool; EXPANDED
-//     2026-07-08 from S=0.25/h=0.20). Down-rail still spaced >> ~0.07 coast overshoot → cascade-safe.
+//   • Modulation boundaries 1/2, 2/3: uniform spacing S=0.25°C, uniform hysteresis h=0.20°C (matches
+//     cool). Down-rail spaced 0.25 >> ~0.07 coast overshoot → cascade-safe. Per-gear hold bands 0.45°C.
 //   • 0/1 boundary: NOT mirrored to cool's wide 0.70°C anti-short-cycle band. Heat's stop point is
 //     PINNED near setpoint by a thermal-carry / heat→cool-pong constraint (2026-04-13 incident:
 //     stopping heat above setpoint let post-drop carry overshoot past mode_switch_temp_offset_c_ and
@@ -126,15 +126,15 @@ static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
 //     re-trigger the pong. So H_DN_10 stays -0.15 (stop 0.27°F BELOW setpoint; carry lands ~setpoint),
 //     and — belt-and-suspenders — run_heat_mode_ keeps the 1→0 STOP decision on REAL diff, not
 //     eff_diff, so the integral can never shift the pong-critical boundary (see case 1 there).
-// Up-rail (start/upshift): -0.35 / -0.75 / -1.15 ; Down-rail (stop/downshift): -0.15 / -0.30 / -0.70.
+// Up-rail (start/upshift): -0.35 / -0.60 / -0.85 ; Down-rail (stop/downshift): -0.15 / -0.40 / -0.65.
 // Both monotonic (more negative = higher gear). SAME retune constraints as cool (cascade/chatter/
 // loop-separation). ⚠️ UNTESTABLE until heating season — validate the pong margin + centering on the
 // first real heat cycle before trusting; the heat-integral risk note is on adaptive_heat_eff_diff_.
-static const float H_UP_01 = -0.35f;  // 0→1 start heat  ┐ base held (tight mild hunt + pong pin)
-static const float H_UP_12 = -0.75f;  // 1→2            │ up-rail step S=0.40 (widened from 0.25)
-static const float H_UP_23 = -1.15f;  // 2→3            ┘ 2026-07-08: upper rungs expanded
-static const float H_DN_32 = -0.70f;  // 3→2            ┐ down-rail = up-rail + h (h=0.45, was 0.20)
-static const float H_DN_21 = -0.30f;  // 2→1            ┘
+static const float H_UP_01 = -0.35f;  // 0→1 start heat  ┐
+static const float H_UP_12 = -0.60f;  // 1→2            │ uniform up-rail, S=0.25
+static const float H_UP_23 = -0.85f;  // 2→3            ┘
+static const float H_DN_32 = -0.65f;  // 3→2            ┐ uniform down-rail = up-rail + h (h=0.20)
+static const float H_DN_21 = -0.40f;  // 2→1            ┘
 // H_DN_10 PINNED (not part of the uniform grid): gear 1 → 0 stops heat BEFORE reaching setpoint to
 // absorb the Furrion's ~0.85°F post-drop thermal carry (2026-04-13). Stopping above setpoint let peak
 // reach +1.44°F > mode_switch_temp_offset_c_ → heat→cool pong. -0.15 drops gear 0.27°F below setpoint;
@@ -150,32 +150,29 @@ static const float H_IDLE  =  0.3f;   // 0→-1 threshold
 // cool gears + idle — the old 5-gear ladder's gears 1&2 (both ~3A) and 4&5 (both ~max) collapsed,
 // and holding an intermediate fixed CS just loafed slowly to its floor. The controller now uses
 // LOW=SP-2 / MED=SP+0 / MAX=SP+3 / idle=SP-5 on the CS (control) side (see compute_gear_cs_), and
-// this cabin-temp (decision) side is now a straight MIRROR of the heat ladder: up-rail step S,
-// down-rail = up-rail − h. 2026-07-08 EXPANDED the upper rungs (S 0.25→0.40, h 0.20→0.45) to hold a
-// 2-gear hunt on hot days (kill the 1↔3 thrash from MAX momentum + bias-inflated upshift); the 0↔1
-// compressor start/stop rungs are held OFF the widened grid (preserve the tight mild LOW↔IDLE hunt +
-// the pong pin). The old wide anti-short-cycle 0/1 boundary (C_DN_10=-0.55) existed
+// this cabin-temp (decision) side is now a straight MIRROR of the heat ladder: uniform up-rail
+// S=0.25°C, down-rail = up-rail − h (h=0.20°C), every rung — INCLUDING the 0↔1 compressor start/
+// stop — on the uniform grid. The old wide anti-short-cycle 0/1 boundary (C_DN_10=-0.55) existed
 // to compensate for loafing 2→1 and 1→idle transitions; with LOW descending fast and IDLE (SP-5)
 // stopping fast, that compensation is no longer needed, so the stop pins at +0.15 (0.27°F above
 // setpoint → thermal carry lands at setpoint, mirror of heat's -0.15). The Phase-2 adaptive
 // integral (bias_c_) still centers the steady-state LOW↔MED cycle on setpoint within ~1°F.
 // CONSTRAINTS TO PRESERVE ON RETUNE: down-rail spacing > coast overshoot (cascade safety);
 // h > overshoot (chatter safety); h small enough that the up-stroke << integral timescale.
-// Up=0.35/0.75/1.15, Down=0.15/0.30/0.70 — both monotonic, mirror heat -0.35/-0.75/-1.15.
+// Up=0.35/0.60/0.85, Down=0.15/0.40/0.65 — both monotonic, mirror heat -0.35/-0.60/-0.85.
 // 3-gear cool ladder (2026-07-07): mirror of the heat ladder. Empirical CS testing this
 // day proved cool has only 3 real, responsive gears (LOW=SP-2, MED=SP+0, MAX=SP+3) + idle
 // (SP-5) — old gears 1&2 and 4&5 collapsed. With the loafing 2→1 / 1→idle transitions gone
 // (LOW descends fast, IDLE stops fast), cool no longer needs the wide anti-short-cycle
-// compressor on/off boundary that compensated for them, so it takes heat's bands:
-// up-rail S=0.40 (was 0.25), down-rail = up-rail − h (h=0.45, was 0.20) on the 1↔2/2↔3 rungs
-// (2026-07-08 EXPANSION). The 1→0 stop stays PINNED at +0.15 off the widened grid (lands 0.27°F
-// above setpoint so thermal carry settles at setpoint — mirror of heat's −0.15).
-static const float C_UP_01 =  0.35f;  // 0→1 compressor start  ┐ base held (tight mild hunt + pong pin)
-static const float C_UP_12 =  0.75f;  // 1→2                   │ up-rail step S=0.40 (widened from 0.25)
-static const float C_UP_23 =  1.15f;  // 2→3 (max)             ┘ 2026-07-08: upper rungs expanded
-static const float C_DN_32 =  0.70f;  // 3→2                   ┐ down-rail = up-rail − h (h=0.45, was 0.20)
-static const float C_DN_21 =  0.30f;  // 2→1                   │
-static const float C_DN_10 =  0.15f;  // 1→0 compressor stop   ┘ (PINNED off-grid; carry lands at setpoint)
+// compressor on/off boundary that compensated for them, so it now takes heat's tight bands:
+// up-rail S=0.25, down-rail = up-rail − h (h=0.20). All rungs uniform (incl. 1→0 stop, which
+// lands 0.27°F above setpoint so thermal carry settles at setpoint — mirror of heat's −0.15).
+static const float C_UP_01 =  0.35f;  // 0→1 compressor start  ┐
+static const float C_UP_12 =  0.60f;  // 1→2                   │ uniform up-rail, S=0.25
+static const float C_UP_23 =  0.85f;  // 2→3 (max)             ┘
+static const float C_DN_32 =  0.65f;  // 3→2                   ┐ down-rail = up-rail − h (h=0.20)
+static const float C_DN_21 =  0.40f;  // 2→1                   │
+static const float C_DN_10 =  0.15f;  // 1→0 compressor stop   ┘ (carry lands at setpoint)
 static const float C_IDLE  = -0.30f;  // 0→-1 threshold (mirror of heat H_IDLE +0.30)
 
 // ── Phase 2 adaptive equilibrium-gear controller (cool mode) ────────────────────

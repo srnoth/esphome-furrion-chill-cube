@@ -146,47 +146,35 @@ static const float H_IDLE  =  0.3f;   // 0→-1 threshold
 
 // Cooling deadbands (diff = room - target, positive = hot)
 //
-// ── 2026-07-03 UNIFORM-LADDER REDESIGN (PROVISIONAL — pending full-range hot-day gear test) ──
-// Supersedes the accreted empirical tunings below (2026-05-18 2↔4-hunt fix; 2026-06-03 gear-2
-// sustain floor; 2026-07-03 C_DN_54 spot fix). Those all patched a Phase-1 pathology: with NO
-// integral, the ONLY way to hold the room near setpoint was to pack the rungs tight so the
-// closest-fitting gear sat at a small fixed offset. Accuracy came FROM the tightness — but the
-// tightness also (a) crammed the top of the down-rail (C_DN_54=0.45 sat 0.05°C above C_DN_43=0.40)
-// so a gear-5 pull cascaded 5→4→3 through gear 4's 0.05°C sliver in <1 min (the 3→4→5→3 hot-day
-// cycle), and (b) forced multi-gear oscillation across a wide thermal spread (g3 too weak → warm
-// drift; g5 too strong → cold shots).
-//
-// Phase 2 added the adaptive integral (bias_c_), which now removes steady-state offset on its own.
-// So the ladder no longer has to be accurate — only stable + responsive. That frees us to WIDEN
-// and REGULARIZE the rungs and let the slow loop center the resulting cycle on setpoint. Design:
-//   • Modulation boundaries 1/2, 2/3, 3/4, 4/5: UNIFORM spacing S=0.25°C (~0.45°F, ≈2 gears per
-//     1°F) and UNIFORM hysteresis h=0.20°C. Every gear now gets a ~0.45°C (0.8°F) hold band
-//     (was 0.05°C on gear-4's down side). Down-rail spaced 0.25°C apart >> ~0.07°C thermal-coast
-//     overshoot → NO cascade at ANY boundary (generalizes the C_DN_54 spot fix to the whole ladder).
-//   • 0/1 boundary (compressor START/STOP, not modulation): KEEP the large anti-short-cycle
-//     hysteresis (C_UP_01=0.15, C_DN_10=-0.55, span 0.70°C). Uniform-h here would short-cycle
-//     the compressor.
-//   • Anchored to keep C_UP_01=0.15 (start point) and C_UP_45=1.00 (top-gear spike response).
-// Steady state: on a load between gears N/N+1 the integral winds bias so the N↔N+1 cycle centers
-// on setpoint; amplitude ≈ h + overshoot ≈ 0.3–0.4°F, and once centered the whole swing sits
-// inside ADAPT_DEADBAND_C so the integral goes quiet. Non-adjacent gears (e.g. g3 on a g4/g5 load)
-// never engage. Up-stroke on the near-equilibrium gear ~20–30 min — kept under the integral's
-// ~30-min timescale so the loops still separate (this is the CEILING on how wide h can go; if the
-// full test wants a bigger amplitude, raise ADAPT_KI in step). CONSTRAINTS TO PRESERVE ON RETUNE:
-// down-rail spacing > coast overshoot (cascade safety); h > overshoot (chatter safety); h small
-// enough that the up-stroke << integral timescale (loop separation). Up=0.15/0.25/0.50/0.75/1.00,
-// Down=-0.55/0.05/0.30/0.55/0.80 — both monotonic.
-static const float C_UP_01 =  0.15f;  // 0→1 compressor start (wide anti-short-cycle boundary)
-static const float C_UP_12 =  0.25f;  // 1→2  ┐
-static const float C_UP_23 =  0.50f;  // 2→3  │ uniform modulation up-rail, S=0.25
-static const float C_UP_34 =  0.75f;  // 3→4  │
-static const float C_UP_45 =  1.00f;  // 4→5  ┘ (kept at 1.00 for top-gear spike response)
-static const float C_DN_54 =  0.80f;  // 5→4  ┐
-static const float C_DN_43 =  0.55f;  // 4→3  │ uniform modulation down-rail = up-rail − h (h=0.20)
-static const float C_DN_32 =  0.30f;  // 3→2  │
-static const float C_DN_21 =  0.05f;  // 2→1  ┘
-static const float C_DN_10 = -0.55f;  // 1→0 compressor stop (wide anti-short-cycle boundary)
-static const float C_IDLE  = -0.15f;
+// ── 2026-07-07 3-GEAR REDESIGN (PROVISIONAL — pending a real cool-day cycle) ──
+// A full-range CS characterization this day proved the Furrion has only THREE real, responsive
+// cool gears + idle — the old 5-gear ladder's gears 1&2 (both ~3A) and 4&5 (both ~max) collapsed,
+// and holding an intermediate fixed CS just loafed slowly to its floor. The controller now uses
+// LOW=SP-2 / MED=SP+0 / MAX=SP+3 / idle=SP-5 on the CS (control) side (see compute_gear_cs_), and
+// this cabin-temp (decision) side is now a straight MIRROR of the heat ladder: uniform up-rail
+// S=0.25°C, down-rail = up-rail − h (h=0.20°C), every rung — INCLUDING the 0↔1 compressor start/
+// stop — on the uniform grid. The old wide anti-short-cycle 0/1 boundary (C_DN_10=-0.55) existed
+// to compensate for loafing 2→1 and 1→idle transitions; with LOW descending fast and IDLE (SP-5)
+// stopping fast, that compensation is no longer needed, so the stop pins at +0.15 (0.27°F above
+// setpoint → thermal carry lands at setpoint, mirror of heat's -0.15). The Phase-2 adaptive
+// integral (bias_c_) still centers the steady-state LOW↔MED cycle on setpoint within ~1°F.
+// CONSTRAINTS TO PRESERVE ON RETUNE: down-rail spacing > coast overshoot (cascade safety);
+// h > overshoot (chatter safety); h small enough that the up-stroke << integral timescale.
+// Up=0.35/0.60/0.85, Down=0.15/0.40/0.65 — both monotonic, mirror heat -0.35/-0.60/-0.85.
+// 3-gear cool ladder (2026-07-07): mirror of the heat ladder. Empirical CS testing this
+// day proved cool has only 3 real, responsive gears (LOW=SP-2, MED=SP+0, MAX=SP+3) + idle
+// (SP-5) — old gears 1&2 and 4&5 collapsed. With the loafing 2→1 / 1→idle transitions gone
+// (LOW descends fast, IDLE stops fast), cool no longer needs the wide anti-short-cycle
+// compressor on/off boundary that compensated for them, so it now takes heat's tight bands:
+// up-rail S=0.25, down-rail = up-rail − h (h=0.20). All rungs uniform (incl. 1→0 stop, which
+// lands 0.27°F above setpoint so thermal carry settles at setpoint — mirror of heat's −0.15).
+static const float C_UP_01 =  0.35f;  // 0→1 compressor start  ┐
+static const float C_UP_12 =  0.60f;  // 1→2                   │ uniform up-rail, S=0.25
+static const float C_UP_23 =  0.85f;  // 2→3 (max)             ┘
+static const float C_DN_32 =  0.65f;  // 3→2                   ┐ down-rail = up-rail − h (h=0.20)
+static const float C_DN_21 =  0.40f;  // 2→1                   │
+static const float C_DN_10 =  0.15f;  // 1→0 compressor stop   ┘ (carry lands at setpoint)
+static const float C_IDLE  = -0.30f;  // 0→-1 threshold (mirror of heat H_IDLE +0.30)
 
 // ── Phase 2 adaptive equilibrium-gear controller (cool mode) ────────────────────
 // A slow integral floats the cool ladder's operating point to the gear that sustains
@@ -262,12 +250,10 @@ static float gear_output_pct(bool is_heat, int gear) {
       default: return 33.3f;
     }
   }
-  switch (gear) {
-    case 5:  return 100.0f;
-    case 4:  return 80.0f;
-    case 3:  return 60.0f;
-    case 2:  return 40.0f;
-    default: return 20.0f;
+  switch (gear) {  // 3-gear cool: LOW / MED / MAX (mirror heat)
+    case 3:  return 100.0f;
+    case 2:  return 66.6f;
+    default: return 33.3f;
   }
 }
 
@@ -874,7 +860,7 @@ void FurrionChillCube::loop() {
   // 4. Keep-alive trigger for low-CS gears (cool 1-2, heat 1)
   if (keepalive_enable_ && !kickstart_active_() && keepalive_phase_ == KeepAlivePhase::IDLE &&
       boot_ready_ && !failsafe_active_) {
-    bool cool_eligible = (cool_gear_ >= 1 && cool_gear_ <= 2 &&
+    bool cool_eligible = (cool_gear_ == 1 &&
                           active_ir_mode_ == climate::CLIMATE_MODE_COOL);
     bool heat_eligible = (heat_gear_ == 1 &&
                           active_ir_mode_ == climate::CLIMATE_MODE_HEAT);
@@ -1133,12 +1119,10 @@ bool FurrionChillCube::gear_in_band_heat_(int gear, float diff) {
 bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
   // Gear N stays in (C_DN_N(N-1), C_UP_N(N+1)) — its own transition thresholds.
   switch (gear) {
-    case 0: return diff >= C_IDLE  && diff <= C_UP_01;      // (-0.15, 0.15)
-    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // (-0.55, 0.25)
-    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // ( 0.05, 0.50)
-    case 3: return diff >= C_DN_32 && diff <= C_UP_34;      // ( 0.30, 0.75)
-    case 4: return diff >= C_DN_43 && diff <= C_UP_45;      // ( 0.55, 1.00)
-    case 5: return diff >= C_DN_54;                          // max cool, no upper bound
+    case 0: return diff >= C_IDLE  && diff <= C_UP_01;      // (-0.30, 0.35)
+    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // ( 0.15, 0.60)
+    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // ( 0.40, 0.85)
+    case 3: return diff >= C_DN_32;                          // max cool, no upper bound
     default: return false;
   }
 }
@@ -1216,7 +1200,7 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // accumulation is never rail-blocked because gear 0/idle is always reachable (downshifts are
   // not hold-gated). This also lets a stale positive bias unwind at gear 1 (e<0 is not frozen),
   // fixing the prior sat_low trap, and stops windup behind a held upshift from cascading gears.
-  bool upshift_held = (cool_gear_ < 5) && (time_in_gear < HOLD_MS[cool_gear_ + 1]);
+  bool upshift_held = (cool_gear_ < 3) && (time_in_gear < HOLD_MS[cool_gear_ + 1]);
   // Rate gate: the room is "warming" (gear-raising allowed) only when dT/dt clears the threshold AND
   // a recent sample backs the reading. room_drift_cpm_ is recomputed only on a sample, so a plateau
   // that goes quiet freezes it at its last climbing value; trusting a POSITIVE reading only while
@@ -1229,7 +1213,7 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // upshift is hold-blocked, OR while the rate gate is suppressing the upshift (!warming). The
   // last clause is load-bearing: without it the integral would keep winding behind a drift-gated
   // upshift and then over-leap the moment the room ticked warm again (re-introducing the windup).
-  bool block_up = (e > 0.0f) && (cool_gear_ >= 5 || upshift_held || !warming);
+  bool block_up = (e > 0.0f) && (cool_gear_ >= 3 || upshift_held || !warming);
   bool freeze = kickstart_active_() || fan_edge_freeze || block_up;
 
   if (idle) {
@@ -1415,18 +1399,25 @@ int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
       default: return furrion_setpoint_c_ + 5;   // gear 0: raw, unclamped
     }
   } else {
-    int lo = furrion_setpoint_c_ - 3;
-    int hi = furrion_setpoint_c_ + 2;
-    int offset = (lo < 15) ? (15 - lo) : (hi > 30) ? (30 - hi) : 0;
+    // 3-gear cool: MAX=SP+3, MED=SP+0, LOW=SP-2, idle=SP-5 (raw, unclamped). cool_cs_()
+    // applies the 15-30 boundary offset shared with the SP+1/SP+0 kickstart CS.
     switch (gear) {
-      case 5:  return furrion_setpoint_c_ + 2 + offset;
-      case 4:  return furrion_setpoint_c_ + 1 + offset;
-      case 3:  return furrion_setpoint_c_     + offset;
-      case 2:  return furrion_setpoint_c_ - 1 + offset;
-      case 1:  return furrion_setpoint_c_ - 2 + offset;
+      case 3:  return cool_cs_(3);    // MAX
+      case 2:  return cool_cs_(0);    // MED
+      case 1:  return cool_cs_(-2);   // LOW
       default: return furrion_setpoint_c_ - 5;   // gear 0: raw, unclamped
     }
   }
+}
+
+// Cool active-CS with the boundary offset that keeps the active ladder (LOW=SP-2 … MAX=SP+3,
+// plus the SP+1 from-off / SP+0 from-idle kickstart CS) inside the Furrion's 15-30 CS range at
+// extreme setpoints. gear-0 idle (SP-5) is intentionally raw/unclamped (see compute_gear_cs_).
+int FurrionChillCube::cool_cs_(int off_from_sp) {
+  int lo = furrion_setpoint_c_ - 2;
+  int hi = furrion_setpoint_c_ + 3;
+  int offset = (lo < 15) ? (15 - lo) : (hi > 30) ? (30 - hi) : 0;
+  return furrion_setpoint_c_ + off_from_sp + offset;
 }
 
 void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
@@ -1472,9 +1463,9 @@ void FurrionChillCube::start_clamped_kickstart_(bool is_heat, uint32_t now) {
   // Defensive: clear any prior kickstart state
   quick_kick_active_ = false;
   clamp_is_heat_ = is_heat;
-  // Kickstart CS: heat=gear2 CS, cool=gear4 CS (includes boundary offset).
-  // No clamping — active-gear CS is already in 15-30 range via the offset.
-  clamp_kickstart_cs_ = compute_gear_cs_(is_heat, is_heat ? 2 : 4);
+  // Kickstart CS = from-off restart threshold: heat = gear-2 CS, cool = SP+1 (2026-07-07
+  // finding). cool_cs_() applies the same 15-30 boundary offset the gear CS values use.
+  clamp_kickstart_cs_ = is_heat ? compute_gear_cs_(true, 2) : cool_cs_(1);
 
   // PRE_CS: set kickstart CS before mode-on (500ms lead)
   current_cs_ = clamp_kickstart_cs_;
@@ -1602,7 +1593,7 @@ void FurrionChillCube::end_kickstart_(uint32_t now) {
   // gear 3+ CS for cool) over-stimulates the compressor harder than the clamp
   // did, undoing the careful ramp-up.
   bool keepalive_eligible = is_heat ? (heat_gear_ == 1)
-                                    : (cool_gear_ >= 1 && cool_gear_ <= 2);
+                                    : (cool_gear_ == 1);
   if (keepalive_eligible) {
     keepalive_last_ = now;
   }
@@ -2204,11 +2195,9 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     } else {
       // From -1: minimum gear 2 (gear 1 can't cold-start the compressor),
       // and never gear 0 (only reachable by downshift from 1)
-      if (diff > C_UP_45)         new_gear = 5;
-      else if (diff > C_UP_34)    new_gear = 4;
-      else if (diff > C_UP_23)    new_gear = 3;
-      else if (diff > C_UP_12)    new_gear = 2;
-      else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;
+      if (diff > C_UP_23)         new_gear = 3;   // MAX
+      else if (diff > C_UP_12)    new_gear = 2;   // MED
+      else if (diff > C_UP_01)    new_gear = (gear == -1) ? 2 : 1;  // from -1: min MED (can't cold-start LOW); running: LOW
       else if (gear == -1)        new_gear = -1;  // stays off
       // user_input at gear >=0 with room past setpoint → go to -1 (bypass restrictions)
       else if (user_input && diff < C_IDLE) new_gear = -1;
@@ -2227,9 +2216,7 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         // First compute post-restore: skip the 0→1→2→3 HOLD_MS ladder
         // (~6 min) and jump straight to the correct gear.
         if (last_gear_change_ == 0) {
-          if (diff > C_UP_45)         new_gear = 5;
-          else if (diff > C_UP_34)    new_gear = 4;
-          else if (diff > C_UP_23)    new_gear = 3;
+          if (diff > C_UP_23)         new_gear = 3;
           else if (diff > C_UP_12)    new_gear = 2;
           else if (diff > C_UP_01)    new_gear = 1;
         } else {
@@ -2255,16 +2242,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         if (can_upshift_to(3) && up_diff > C_UP_23)   new_gear = 3;
         else if (eff_diff < C_DN_21)                   new_gear = 1;
         break;
-      case 3:
-        if (can_upshift_to(4) && up_diff > C_UP_34)   new_gear = 4;
-        else if (eff_diff < C_DN_32)                   new_gear = 2;
-        break;
-      case 4:
-        if (can_upshift_to(5) && up_diff > C_UP_45)   new_gear = 5;
-        else if (eff_diff < C_DN_43)                   new_gear = 3;
-        break;
-      case 5:
-        if (eff_diff < C_DN_54)                        new_gear = 4;
+      case 3:  // MAX — no upshift
+        if (eff_diff < C_DN_32)                        new_gear = 2;
         break;
     }
   }
@@ -2292,8 +2271,9 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     ESP_LOGI(TAG, "COOL %d -> %d (room=%.2f target=%.2f diff=%.2f)",
              gear, new_gear, room, target, diff);
 
-    // Keep-alive: reset timer on entering eligible range, abort on leaving
-    if (new_gear >= 1 && new_gear <= 2) {
+    // Keep-alive: reset timer on entering eligible range, abort on leaving.
+    // LOW (gear 1) is the only low gear that can self-stop; MED/MAX hold on their own.
+    if (new_gear == 1) {
       keepalive_last_ = now;  // fresh 5-min window
     } else {
       abort_keepalive_();
@@ -2304,31 +2284,31 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   if (new_gear >= 0) {
     int cs = compute_gear_cs_(false, new_gear);
     if (gear == -1 && new_gear == 2) {
-      // OFF→gear 2: clamped kickstart (fan=LOW 5:30, CS=gear4 level)
+      // OFF→MED: from-off restart threshold is SP+1 (2026-07-07 finding), which MED's own
+      // CS (SP+0) can't reach — clamped kickstart kicks at SP+1 with fan=LOW for 5:30 (caps
+      // the fresh-start current spike ~4A, matching the unit's internal 5-min startup), then
+      // releases to MED. Clamp drops early only if MAX (gear 3) is called.
       last_mode_event_at_ = now;
       start_clamped_kickstart_(false, now);
     } else if (gear == -1 && new_gear == 3) {
-      // OFF→gear 3: quick kickstart (CS=gear4 briefly, then gear 3). A short hold is
-      // sufficient here — start_quick_kickstart_ also sends a MODE-ON command from OFF,
-      // which does the heavy lifting of waking the compressor.
-      last_mode_event_at_ = now;
-      start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, QUICK_KICK_HOLD_MS);
-    } else if (gear == -1 && new_gear >= 4) {
-      // OFF→gear 4+: direct, no kickstart
+      // OFF→MAX: MAX's CS (SP+3) is itself above the SP+1 from-off threshold, so it wakes the
+      // compressor directly — no kick, no clamp (full output is wanted immediately).
       last_mode_event_at_ = now;
       if (!kickstart_active_() && current_cs_ != cs) {
         set_cs_value_(cs, now);
       }
     } else if (gear == 0 && new_gear >= 1 && new_gear <= 2) {
-      // Idle→gear 1-2: quick kickstart at gear-4 CS (setpoint+1°C demand), held for
-      // IDLE_KICK_HOLD_MS (90s). This path is CS-only — the unit is already in COOL
-      // mode, so there is NO MODE-ON command behind it. A 10s hold failed on
-      // 2026-05-20: the CS=21 pulse fired inside the compressor's anti-short-cycle
-      // restart lockout and was gone before the lockout cleared, leaving the unit
-      // stopped ~11 min. The 90s hold keeps CS=21 asserted across that lockout.
-      // gear-4 CS (anchor+1) is the documented restart threshold; gear-3 CS (anchor)
-      // is sustain-only — see session_log 2026-05-20.
-      start_quick_kickstart_(false, compute_gear_cs_(false, 4), now, IDLE_KICK_HOLD_MS);
+      // Idle→LOW/MED: from-idle restart threshold is SP+0 (2026-07-07 finding). Kick at SP+0,
+      // held IDLE_KICK_HOLD_MS (90s) so the restart CS stays asserted across the compressor's
+      // anti-short-cycle lockout (a short pulse failed inside the lockout on 2026-05-20). At
+      // release end_kickstart_ sends the target's CS — LOW (SP-2) then descends fast to its
+      // floor; MED (SP+0) simply holds.
+      start_quick_kickstart_(false, cool_cs_(0), now, IDLE_KICK_HOLD_MS);
+    } else if (gear == 0 && new_gear == 3) {
+      // Idle→MAX: SP+3 is well above the SP+0 idle threshold — direct.
+      if (!kickstart_active_() && current_cs_ != cs) {
+        set_cs_value_(cs, now);
+      }
     } else if (!kickstart_active_() && current_cs_ != cs) {
       set_cs_value_(cs, now);
     }

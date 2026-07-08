@@ -106,6 +106,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   float get_active_ir_target_();
   void seed_last_tx_target_f_();   // sync last_tx_target_f_ to the active target (boot restore)
   int compute_gear_cs_(bool is_heat, int gear);
+  int cool_cs_(int off_from_sp);   // cool active-CS with 15-30 boundary offset (gears + kick CS)
   bool gear_in_band_heat_(int gear, float diff);
   bool gear_in_band_cool_(int gear, float diff);
 

@@ -87,14 +87,13 @@ static const int FURRION_MAX_TEMP_F = 86;
 //                        0      1       2       3        4        5
 static const uint32_t HOLD_MS[] = {0, 180000, 180000, 300000, 300000, 600000};
 static const uint32_t CLAMP_DURATION_MS = 305000;  // 5 min 5s (matches unit's internal 5-min enforced startup)
-// Quick-kickstart hold windows (ms). OFF→gear-3 needs only a brief CS kick because
-// start_quick_kickstart_ also sends a MODE-ON command from OFF, which does the heavy
-// lifting of waking the compressor. The idle→gear-1/2 path is CS-only (unit already in
-// COOL mode — no MODE-ON), so its kickstart CS must stay asserted long enough to outlast
-// the compressor's anti-short-cycle restart lockout (~3 min). See session_log 2026-05-20:
-// a 10s idle kick fired inside the lockout shadow and had zero effect (unit dead ~11 min).
-static const uint32_t QUICK_KICK_HOLD_MS = 10000;  // OFF→gear-3
-static const uint32_t IDLE_KICK_HOLD_MS = 90000;   // idle→gear-1/2
+// Idle→LOW/MED kickstart hold window (ms). This path is CS-only (unit already in COOL mode,
+// no MODE-ON), so its kickstart CS (SP+0 = the from-idle restart threshold) must stay asserted
+// long enough to outlast the compressor's anti-short-cycle restart lockout (~3 min). See
+// session_log 2026-05-20: a 10s idle kick fired inside the lockout shadow, zero effect (dead
+// ~11 min). (The old OFF→gear-3 QUICK_KICK path is gone with the 3-gear redesign: OFF→MAX is a
+// direct set_cs_value_, OFF→MED uses the clamped kickstart.)
+static const uint32_t IDLE_KICK_HOLD_MS = 90000;   // idle→LOW/MED
 static const uint32_t CS_HEARTBEAT_MS = 30000;  // 30s
 static const uint32_t GEAR_INTERVAL_MS = 60000;  // 60s fallback
 // Setpoint debounce: a temperature change is held this long (steady state, no further
@@ -680,7 +679,9 @@ void FurrionChillCube::setup() {
     int g = 0;
     GearPrefData saved_gear{};
     if (is_warm_reset_() && gear_pref_.load(&saved_gear)) {
-      int max_gear = is_heat ? 3 : 5;
+      int max_gear = 3;  // cool is now 3 gears (was 5); a saved gear 4/5 from old firmware
+                         // is out of range → falls through to gear 0 (cold-start path) rather
+                         // than restoring an invalid gear whose CS would resolve to idle.
       if (saved_gear.gear >= 0 && saved_gear.gear <= max_gear) {
         g = saved_gear.gear;
         // Bias only when the adaptive controller is actually running: with adaptive
@@ -1417,6 +1418,12 @@ int FurrionChillCube::cool_cs_(int off_from_sp) {
   int lo = furrion_setpoint_c_ - 2;
   int hi = furrion_setpoint_c_ + 3;
   int offset = (lo < 15) ? (15 - lo) : (hi > 30) ? (30 - hi) : 0;
+  // Cap the negative (high-setpoint) shift at -2 so LOW (SP-2) never collapses onto the raw
+  // idle CS (SP-5): LOW-idle = 3+offset, which would hit 0 at SP=30 with an uncapped -3,
+  // making LOW command a stop while reporting "cooling". Capping at -2 lets MAX land at 31 at
+  // SP=30 (out-of-range = stronger max, same treatment as the raw idle CS), keeping all active
+  // gears distinct. Only affects SP=30 (86°F cool — unrealistic, but correct).
+  if (offset < -2) offset = -2;
   return furrion_setpoint_c_ + off_from_sp + offset;
 }
 

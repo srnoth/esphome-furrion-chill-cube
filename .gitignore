@@ -7,3 +7,7 @@ tests/gear_test
 
 tests/adaptive_test
 tests/drift_window_test
+
+# build artifacts
+__pycache__/
+tests/config_reproduction_test

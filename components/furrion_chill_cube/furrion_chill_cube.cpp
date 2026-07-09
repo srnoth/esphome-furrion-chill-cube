@@ -1610,6 +1610,13 @@ void FurrionChillCube::end_kickstart_(uint32_t now) {
   clamp_phase_ = ClampPhase::IDLE;
   clamp_start_ = 0;
   clamp_phase_start_ = 0;
+  // Also tear down a transition maneuver: the running-unit → OFF paths (run_*_mode_'s new_gear==-1
+  // branch) call this via `if (kickstart_active_())`, and kickstart_active_() now covers maneuvers
+  // too. Without this a maneuver would leak active_==true past the OFF, keeping kickstart_active_()
+  // true and blocking OFF→ON re-engage for the rest of the maneuver window. Harmless no-op at a
+  // genuine clamp release (maneuvers and clamps are mutually exclusive). (bug-check 2026-07-09)
+  maneuver_active_ = false;
+  maneuver_start_ = 0;
   int gear = is_heat ? heat_gear_ : cool_gear_;
   if (gear >= 0) {
     set_cs_value_(compute_gear_cs_(is_heat, gear), now);

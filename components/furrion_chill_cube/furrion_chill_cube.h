@@ -166,8 +166,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   void start_maneuver_(bool is_heat, int via_cs, uint32_t duration_ms, uint32_t now);
   void advance_maneuver_(uint32_t now);
   void end_maneuver_(uint32_t now);
+  // Nested QuirkDef is fully defined in the config-members section below; forward-declare it
+  // HERE (in class scope) so find_quirk_'s return type binds to FurrionChillCube::QuirkDef —
+  // without this the elaborated-type-specifier would declare a namespace-scope QuirkDef and the
+  // out-of-line definition's return type would not match the declaration (compile error).
+  struct QuirkDef;
   // Look up a configured quirk for a (mode, from_gear→to_gear) transition; nullptr if none.
-  const struct QuirkDef *find_quirk_(bool is_heat, int from_gear, int to_gear);
+  const QuirkDef *find_quirk_(bool is_heat, int from_gear, int to_gear);
 
   // Timed vane positioning (open-loop IR homing off the power-on anchor).
   // On an OFF->active start the unit re-homes the vane to a fixed default; we then

@@ -112,31 +112,29 @@ static const uint32_t KEEPALIVE_STEP_MS = 5000;  // 5s between steps
 
 // Heating deadbands (diff = room - target, negative = cold; more negative = higher heat gear)
 //
-// ── 2026-07-03 UNIFORM-LADDER REDESIGN (PROVISIONAL — heat side, WINTER-VALIDATED not field-tested) ──
-// The MIRROR of the cool redesign below. Enabled by the new heat integral (bias_h_,
-// adaptive_heat_eff_diff_) added the same day — WITHOUT it, widening these rungs would just deepen
-// a fixed COLD offset (heat used to select on raw `diff`). With the integral floating the ladder,
-// the rungs can be widened + regularized and the slow loop centers the cycle on the heat setpoint.
-//   • Modulation boundaries 1/2, 2/3: spacing S=0.25°C, hysteresis h=0.20°C EXCEPT the 3→2 handoff which
-//     was tightened to h=0.07 (2026-07-08) so HIGH drops to MID sooner. Otherwise matches
-//     cool). Down-rail spaced 0.25 >> ~0.07 coast overshoot → cascade-safe. Per-gear hold bands 0.45°C.
-//   • 0/1 boundary: NOT mirrored to cool's wide 0.70°C anti-short-cycle band. Heat's stop point is
-//     PINNED near setpoint by a thermal-carry / heat→cool-pong constraint (2026-04-13 incident:
-//     stopping heat above setpoint let post-drop carry overshoot past mode_switch_temp_offset_c_ and
-//     pong to cool). Mirroring cool's -0.55 would put stop-heat at +0.55°C (1°F ABOVE setpoint) →
-//     re-trigger the pong. So H_DN_10 stays -0.15 (stop 0.27°F BELOW setpoint; carry lands ~setpoint),
-//     and — belt-and-suspenders — run_heat_mode_ keeps the 1→0 STOP decision on REAL diff, not
-//     eff_diff, so the integral can never shift the pong-critical boundary (see case 1 there).
-// Up-rail (start/upshift): -0.35 / -0.60 / -0.85 ; Down-rail (stop/downshift): -0.15 / -0.40 / -0.78
-// (3→2 early-handoff tightened 2026-07-08).
-// Both monotonic (more negative = higher gear). SAME retune constraints as cool (cascade/chatter/
-// loop-separation). ⚠️ UNTESTABLE until heating season — validate the pong margin + centering on the
-// first real heat cycle before trusting; the heat-integral risk note is on adaptive_heat_eff_diff_.
-static const float H_UP_01 = -0.35f;  // 0→1 start heat  ┐
-static const float H_UP_12 = -0.60f;  // 1→2            │ uniform up-rail, S=0.25
-static const float H_UP_23 = -0.85f;  // 2→3            ┘
-static const float H_DN_32 = -0.78f;  // 3→2 EARLY-HANDOFF (2026-07-08): h=0.07 (was 0.20), mirror of cool
-static const float H_DN_21 = -0.40f;  // 2→1  down-rail = up-rail + h (h=0.20)
+// ── 2026-07-08 SYMMETRIC 1°F LADDER (mirror of cool; heat side WINTER-VALIDATED, not field-tested) ──
+// The MIRROR of the cool redesign below. The GEAR-modulation boundaries (1↔2, 2↔3) are now SYMMETRIC
+// single lines — up-trip == down-trip, i.e. ZERO programmed hysteresis — spaced ~1°F (0.55°C) apart.
+// Rationale (2026-07-08 design discussion, full thread in session_log): in THIS system short-cycling
+// cannot occur (the Furrion's own ~5-min min-cycle gates the compressor; large cabin thermal inertia +
+// low-noise sensors mean the temp signal never chatters across a line), so programmed h earns nothing
+// and only widens the swing. The 1°F rung is RUNWAY, not anti-chatter: it gives each modulation gear
+// ~1°F (symmetric) to arrest a climb / catch a descent — e.g. MED catching MAX's ~9A wind-down
+// momentum instead of dropping straight through to LOW. The slow integral (bias_h_) is UNCHANGED and
+// still centers whichever boundary the load selects on the heat setpoint.
+//   • 0↔1 (start/stop) + idle: NOT on the 1°F grid. H_DN_10 is PINNED near setpoint by the heat→cool
+//     pong constraint (2026-04-13) and run_heat_mode_ evaluates 1→0 on REAL diff so bias can't move it.
+//   • Asymmetric runway (descent ≠ ascent) is NOT used — no data yet shows descent needs more room.
+//     Re-add only if a symmetric 1°F descent runway still drops MAX→MED→LOW on the hottest days
+//     (momentum is the one directional asymmetry; that drop-through is its signature).
+// Up-rail (start/upshift): -0.35 / -0.55 / -1.10 ; Down-rail (stop/downshift): -0.15 / -0.55 / -1.10.
+// Monotonic (more negative = higher gear). ⚠️ UNTESTABLE until heating season — validate the pong
+// margin + centering on the first real heat cycle before trusting.
+static const float H_UP_01 = -0.35f;  // 0→1 start heat (PINNED off grid)
+static const float H_UP_12 = -0.55f;  // 1→2  ┐ symmetric single line (up==down), ~1°F rungs
+static const float H_UP_23 = -1.10f;  // 2→3  ┘
+static const float H_DN_32 = -1.10f;  // 3→2  == H_UP_23 (symmetric, zero programmed hysteresis)
+static const float H_DN_21 = -0.55f;  // 2→1  == H_UP_12 (symmetric, zero programmed hysteresis)
 // H_DN_10 PINNED (not part of the uniform grid): gear 1 → 0 stops heat BEFORE reaching setpoint to
 // absorb the Furrion's ~0.85°F post-drop thermal carry (2026-04-13). Stopping above setpoint let peak
 // reach +1.44°F > mode_switch_temp_offset_c_ → heat→cool pong. -0.15 drops gear 0.27°F below setpoint;
@@ -147,36 +145,32 @@ static const float H_IDLE  =  0.3f;   // 0→-1 threshold
 
 // Cooling deadbands (diff = room - target, positive = hot)
 //
-// ── 2026-07-07 3-GEAR REDESIGN (PROVISIONAL — pending a real cool-day cycle) ──
-// A full-range CS characterization this day proved the Furrion has only THREE real, responsive
-// cool gears + idle — the old 5-gear ladder's gears 1&2 (both ~3A) and 4&5 (both ~max) collapsed,
-// and holding an intermediate fixed CS just loafed slowly to its floor. The controller now uses
-// LOW=SP-2 / MED=SP+0 / MAX=SP+3 / idle=SP-5 on the CS (control) side (see compute_gear_cs_), and
-// this cabin-temp (decision) side is now a straight MIRROR of the heat ladder: uniform up-rail
-// S=0.25°C, down-rail = up-rail − h (h=0.20°C), every rung — INCLUDING the 0↔1 compressor start/
-// stop — on the uniform grid. The old wide anti-short-cycle 0/1 boundary (C_DN_10=-0.55) existed
-// to compensate for loafing 2→1 and 1→idle transitions; with LOW descending fast and IDLE (SP-5)
-// stopping fast, that compensation is no longer needed, so the stop pins at +0.15 (0.27°F above
-// setpoint → thermal carry lands at setpoint, mirror of heat's -0.15). The Phase-2 adaptive
-// integral (bias_c_) still centers the steady-state LOW↔MED cycle on setpoint within ~1°F.
-// CONSTRAINTS TO PRESERVE ON RETUNE: down-rail spacing > coast overshoot (cascade safety);
-// h > overshoot (chatter safety); h small enough that the up-stroke << integral timescale.
-// Up=0.35/0.60/0.85, Down=0.15/0.40/0.78 — both monotonic, mirror heat -0.35/-0.60/-0.85 (3→2 handoff
-// tightened to 0.78 2026-07-08 so HIGH drops to MED sooner; all other rungs baseline).
-// 3-gear cool ladder (2026-07-07): mirror of the heat ladder. Empirical CS testing this
-// day proved cool has only 3 real, responsive gears (LOW=SP-2, MED=SP+0, MAX=SP+3) + idle
-// (SP-5) — old gears 1&2 and 4&5 collapsed. With the loafing 2→1 / 1→idle transitions gone
-// (LOW descends fast, IDLE stops fast), cool no longer needs the wide anti-short-cycle
-// compressor on/off boundary that compensated for them, so it now takes heat's tight bands:
-// up-rail S=0.25, down-rail = up-rail − h (h=0.20). All rungs uniform (incl. 1→0 stop, which
-// lands 0.27°F above setpoint so thermal carry settles at setpoint — mirror of heat's −0.15).
-static const float C_UP_01 =  0.35f;  // 0→1 compressor start  ┐
-static const float C_UP_12 =  0.60f;  // 1→2                   │ uniform up-rail, S=0.25
-static const float C_UP_23 =  0.85f;  // 2→3 (max)             ┘
-static const float C_DN_32 =  0.78f;  // 3→2 EARLY-HANDOFF (2026-07-08): h=0.07 (was 0.20) — drop HIGH→MED
-                                      //      after only ~0.13F fall so MED catches the descent while the unit
-                                      //      winds HIGH's momentum down through ~9A. Only rung changed this round.
-static const float C_DN_21 =  0.40f;  // 2→1  down-rail = up-rail − h (h=0.20)
+// ── 2026-07-08 SYMMETRIC 1°F LADDER (PROVISIONAL — pending a real hot cool-day cycle) ──
+// The GEAR-modulation boundaries (1↔2 = LOW↔MED, 2↔3 = MED↔MAX) are now SYMMETRIC single lines —
+// up-trip == down-trip, ZERO programmed hysteresis — spaced ~1°F (0.55°C) apart. Replaces the
+// 2026-07-07 S=0.25 / h=0.20 hysteretic ladder (and the 07-08 asymmetric 3→2 early-handoff hack).
+// Rationale (2026-07-08 design discussion — full thread in session_log):
+//   • Short-cycling CANNOT occur here: we don't drive the compressor directly (the Furrion's internal
+//     ~5-min min-cycle gates it), and cabin thermal inertia + low-noise sensors mean the temp signal
+//     never chatters across a line. So programmed hysteresis earns nothing and only WIDENS the swing.
+//   • The 1°F rung is RUNWAY, not anti-chatter: it gives MED a full ~1°F (both directions) to arrest a
+//     climb before punting to MAX, and to catch MAX's ~9A wind-down momentum on the descent instead of
+//     overshooting through MED to LOW (the 07-08 hot-day 1↔3 thrash). Ascent == descent (symmetric).
+//   • The slow integral (bias_c_) is UNCHANGED — it centers whichever boundary the load selects on
+//     setpoint (~1°F / 9-18 min). No rate-trigger / rate-adaptive gain was added: a fast upshift that
+//     doesn't recenter buys ~0.5°F off the peak for a self-decaying offset — not worth the machinery.
+//   • Effective hysteresis still exists for free: upshift uses rate-gated up_diff (bias stripped when
+//     not warming) while downshift uses full eff_diff, so a wound bias holds the higher gear a bit —
+//     load-adaptive, no constant needed.
+// 0↔1 (compressor start/stop) + idle KEPT off the 1°F grid: preserves the tight overnight LOW↔idle
+// hunt (0.6°F band) and the stop pin (carry lands at setpoint; mirror of heat's pong-pinned -0.15).
+// Asymmetric-runway is shelved (no data shows it's needed); re-add only if 1°F symmetric still drops
+// through on hot days. Up-rail 0.35 / 0.55 / 1.10 ; Down-rail 0.15 / 0.55 / 1.10 — monotonic, mirror heat.
+static const float C_UP_01 =  0.35f;  // 0→1 compressor start (PINNED off grid)
+static const float C_UP_12 =  0.55f;  // 1→2         ┐ symmetric single line (up==down), ~1°F rungs
+static const float C_UP_23 =  1.10f;  // 2→3 (max)   ┘
+static const float C_DN_32 =  1.10f;  // 3→2  == C_UP_23 (symmetric, zero programmed hysteresis)
+static const float C_DN_21 =  0.55f;  // 2→1  == C_UP_12 (symmetric, zero programmed hysteresis)
 static const float C_DN_10 =  0.15f;  // 1→0 compressor stop (PINNED; carry lands at setpoint)
 static const float C_IDLE  = -0.30f;  // 0→-1 threshold (mirror of heat H_IDLE +0.30)
 
@@ -1115,8 +1109,8 @@ bool FurrionChillCube::gear_in_band_heat_(int gear, float diff) {
   // (For heat, diff is negative when cold, so H_UP_* are the lower bounds.)
   switch (gear) {
     case 0: return diff >= H_UP_01 && diff <= H_IDLE;       // (-0.35, 0.30)
-    case 1: return diff >= H_UP_12 && diff <= H_DN_10;      // (-0.60, -0.15)
-    case 2: return diff >= H_UP_23 && diff <= H_DN_21;      // (-0.85, -0.40)
+    case 1: return diff >= H_UP_12 && diff <= H_DN_10;      // (-0.55, -0.15)
+    case 2: return diff >= H_UP_23 && diff <= H_DN_21;      // (-1.10, -0.55)
     case 3: return diff <= H_DN_32;                          // max heat, no lower bound
     default: return false;
   }
@@ -1126,8 +1120,8 @@ bool FurrionChillCube::gear_in_band_cool_(int gear, float diff) {
   // Gear N stays in (C_DN_N(N-1), C_UP_N(N+1)) — its own transition thresholds.
   switch (gear) {
     case 0: return diff >= C_IDLE  && diff <= C_UP_01;      // (-0.30, 0.35)
-    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // ( 0.15, 0.60)
-    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // ( 0.40, 0.85)
+    case 1: return diff >= C_DN_10 && diff <= C_UP_12;      // ( 0.15, 0.55)
+    case 2: return diff >= C_DN_21 && diff <= C_UP_23;      // ( 0.55, 1.10)
     case 3: return diff >= C_DN_32;                          // max cool, no upper bound
     default: return false;
   }

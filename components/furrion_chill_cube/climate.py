@@ -37,7 +37,32 @@ CONF_MODE_SWITCH_IDLE_MIN = "mode_switch_idle_min"
 CONF_MODE_SWITCH_EVENT_MIN = "mode_switch_event_min"
 CONF_MODE_SWITCH_TEMP_OFFSET = "mode_switch_temp_offset"
 CONF_MODE_SWITCH_OFF = "mode_switch_off_time"
-CONF_KEEPALIVE_ENABLE = "keepalive_enable"
+# Configurable gear ladders + transition quirks + CS transmit cadence.
+# Gears are (gear_number → CS offset from the °C setpoint anchor). Quirks are
+# path-dependent transition maneuvers: on a matching (mode, from→to) gear change,
+# the controller holds `via_offset` CS for `duration`, re-asserting every
+# `quirk_transmit_interval`, then re-evaluates the correct gear. See PHASE2 / session_log.
+CONF_COOL_GEARS = "cool_gears"
+CONF_HEAT_GEARS = "heat_gears"
+CONF_GEAR = "gear"
+CONF_CS_OFFSET = "cs_offset"
+CONF_COOL_LADDER = "cool_ladder"
+CONF_HEAT_LADDER = "heat_ladder"
+CONF_MODULATION_SPACING = "modulation_spacing"
+CONF_MODULATION_HYSTERESIS = "modulation_hysteresis"
+CONF_LADDER_START = "start"
+CONF_LADDER_STOP = "stop"
+CONF_LADDER_IDLE = "idle"
+CONF_QUIRKS = "quirks"
+CONF_QUIRK_MODE = "mode"
+CONF_QUIRK_FROM = "from_gear"
+CONF_QUIRK_TO = "to_gear"
+CONF_QUIRK_VIA_OFFSET = "via_offset"
+CONF_QUIRK_DURATION = "duration"
+CONF_QUIRK_DURATION_DEFAULT = "quirk_duration"
+CONF_CS_TRANSMIT_INTERVAL = "cs_transmit_interval"
+CONF_QUIRK_TRANSMIT_INTERVAL = "quirk_transmit_interval"
+CONF_GEAR_STEP_C = "gear_step_c"
 # Timed vane positioning (per-mode delay + interval; ESPHome time format, no defaults)
 CONF_HEAT_VENT_MOVE_DELAY = "heat_vent_move_delay"
 CONF_HEAT_VENT_INTERVAL = "heat_final_position_interval"
@@ -181,6 +206,97 @@ def _validate_vent_pairs(config):
     return config
 
 
+# ── Configurable ladders + quirks ───────────────────────────────────────────
+# One gear row: which gear number, and its CS offset (°C) from the setpoint anchor.
+GEAR_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_GEAR): cv.int_range(min=0, max=3),
+        cv.Required(CONF_CS_OFFSET): cv.int_range(min=-15, max=15),
+    }
+)
+
+# One quirk: a path-dependent transition maneuver. On a `mode` gear change from
+# `from_gear`→`to_gear`, hold `via_offset` CS for `duration` (or the global
+# quirk_duration if unset), then re-evaluate. from_gear -1 = OFF, 0 = idle.
+QUIRK_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_QUIRK_MODE): cv.one_of("cool", "heat", lower=True),
+        cv.Required(CONF_QUIRK_FROM): cv.int_range(min=-1, max=3),
+        cv.Required(CONF_QUIRK_TO): cv.int_range(min=0, max=3),
+        cv.Required(CONF_QUIRK_VIA_OFFSET): cv.int_range(min=-15, max=15),
+        cv.Optional(CONF_QUIRK_DURATION): cv.positive_time_period_milliseconds,
+    }
+)
+
+# Ladder = gear-selection thresholds (diff = room − target, °C). Modulation rungs
+# (1↔2, 2↔3, …) are auto-built from spacing S: up-trip(n→n+1) = n·S, down-trip =
+# n·S − hysteresis. start (0→1), stop (1→0), idle (0→−1) are pinned off-grid.
+# Signs: cool positive-is-hot, heat negative-is-cold (caller supplies signed pins).
+LADDER_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_MODULATION_SPACING, default=0.55): cv.float_,
+        cv.Optional(CONF_MODULATION_HYSTERESIS, default=0.0): cv.float_,
+        cv.Required(CONF_LADDER_START): cv.float_,
+        cv.Required(CONF_LADDER_STOP): cv.float_,
+        cv.Required(CONF_LADDER_IDLE): cv.float_,
+    }
+)
+
+# Defaults reproduce the shipped behavior bit-identically.
+_DEFAULT_COOL_GEARS = [
+    {CONF_GEAR: 0, CONF_CS_OFFSET: -5},  # idle (raw, unclamped)
+    {CONF_GEAR: 1, CONF_CS_OFFSET: -2},  # LOW
+    {CONF_GEAR: 2, CONF_CS_OFFSET: 0},   # MED
+    {CONF_GEAR: 3, CONF_CS_OFFSET: 3},   # MAX
+]
+_DEFAULT_HEAT_GEARS = [
+    {CONF_GEAR: 0, CONF_CS_OFFSET: 5},   # idle (raw, unclamped)
+    {CONF_GEAR: 1, CONF_CS_OFFSET: 1},
+    {CONF_GEAR: 2, CONF_CS_OFFSET: 0},
+    {CONF_GEAR: 3, CONF_CS_OFFSET: -1},
+]
+_DEFAULT_COOL_LADDER = {
+    CONF_MODULATION_SPACING: 0.55,
+    CONF_MODULATION_HYSTERESIS: 0.0,
+    CONF_LADDER_START: 0.35,
+    CONF_LADDER_STOP: 0.15,
+    CONF_LADDER_IDLE: -0.30,
+}
+_DEFAULT_HEAT_LADDER = {
+    CONF_MODULATION_SPACING: 0.55,
+    CONF_MODULATION_HYSTERESIS: 0.0,
+    CONF_LADDER_START: -0.35,
+    CONF_LADDER_STOP: -0.15,
+    CONF_LADDER_IDLE: 0.30,
+}
+# Cool-only live quirks:
+#   idle→LOW (0→1) via SP+0, held 90s: the from-idle restart threshold is SP+0; the 90s hold
+#     (explicit per-quirk override, preserves the pre-refactor IDLE_KICK_HOLD_MS behavior) keeps it
+#     asserted across the compressor's ~3-min anti-short-cycle lockout, then settles to LOW's SP−2.
+#   MAX→MED (3→2) via SP−1, held the global quirk_duration (60s): MED is path-dependent (~9A from
+#     MAX vs ~6A from LOW), so dip below MED to re-seat it from underneath (2026-07-09).
+_DEFAULT_QUIRKS = [
+    {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: 0, CONF_QUIRK_TO: 1, CONF_QUIRK_VIA_OFFSET: 0,
+     CONF_QUIRK_DURATION: "90s"},
+    {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: 3, CONF_QUIRK_TO: 2, CONF_QUIRK_VIA_OFFSET: -1},
+]
+
+
+def _validate_gears(key):
+    """Each gear number appears once; gear 0 (idle) is required."""
+    def validator(value):
+        seen = set()
+        for row in value:
+            g = row[CONF_GEAR]
+            if g in seen:
+                raise cv.Invalid(f"{key}: gear {g} listed more than once")
+            seen.add(g)
+        if 0 not in seen:
+            raise cv.Invalid(f"{key}: must define gear 0 (idle) offset")
+        return value
+    return validator
+
+
 CONFIG_SCHEMA = cv.All(
     climate.climate_schema(FurrionChillCube)
     .extend(
@@ -217,9 +333,26 @@ CONFIG_SCHEMA = cv.All(
             # Manual vane-step nudge: each press of the vane_step button pulses the swing
             # ON then OFF after this duration, for a uniform incremental move. Default 0.5s.
             cv.Optional(CONF_VANE_STEP_DURATION, default="0.5s"): cv.positive_time_period_milliseconds,
-            # Keep-alive pulse: periodic CS bump to sustain compressor at low gears.
-            # Disable if the bump causes unwanted compressor spikes.
-            cv.Optional(CONF_KEEPALIVE_ENABLE, default=True): cv.boolean,
+            # Configurable gear CS-offset tables (gear → °C offset from setpoint).
+            cv.Optional(CONF_COOL_GEARS, default=_DEFAULT_COOL_GEARS): cv.All(
+                cv.ensure_list(GEAR_SCHEMA), _validate_gears("cool_gears")
+            ),
+            cv.Optional(CONF_HEAT_GEARS, default=_DEFAULT_HEAT_GEARS): cv.All(
+                cv.ensure_list(GEAR_SCHEMA), _validate_gears("heat_gears")
+            ),
+            # Gear-selection ladders (auto-built from spacing + pinned start/stop/idle).
+            cv.Optional(CONF_COOL_LADDER, default=_DEFAULT_COOL_LADDER): LADDER_SCHEMA,
+            cv.Optional(CONF_HEAT_LADDER, default=_DEFAULT_HEAT_LADDER): LADDER_SCHEMA,
+            # Path-dependent transition quirks (see QUIRK_SCHEMA).
+            cv.Optional(CONF_QUIRKS, default=_DEFAULT_QUIRKS): cv.ensure_list(QUIRK_SCHEMA),
+            # Uniform quirk hold (per-quirk `duration` overrides). Default 60s.
+            cv.Optional(CONF_QUIRK_DURATION_DEFAULT, default="60s"): cv.positive_time_period_milliseconds,
+            # CS re-transmit cadence: normal heartbeat + denser re-assert during a quirk.
+            cv.Optional(CONF_CS_TRANSMIT_INTERVAL, default="10s"): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_QUIRK_TRANSMIT_INTERVAL, default="5s"): cv.positive_time_period_milliseconds,
+            # Fan feedforward scale: °C of eff_diff per fan-gear (adaptive cool). NOTE:
+            # historically tied to modulation spacing; left at 0.25 for behavior-parity.
+            cv.Optional(CONF_GEAR_STEP_C, default=0.25): cv.float_range(min=0.0, max=2.0),
             # Target temperature encoding sent to the unit via Toshiba IR.
             # true (default) = Fahrenheit (RAC-PT1411HWRU F-protocol, 60-86°F,
             #   FAH flag set, unit panel displays °F).
@@ -337,8 +470,53 @@ async def to_code(config):
     cg.add(var.set_mode_switch_event_min(config[CONF_MODE_SWITCH_EVENT_MIN]))
     cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
     cg.add(var.set_mode_switch_off_ms(config[CONF_MODE_SWITCH_OFF].total_milliseconds))
-    cg.add(var.set_keepalive_enable(config[CONF_KEEPALIVE_ENABLE]))
     cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
+
+    # Configurable gear CS-offset tables
+    for row in config[CONF_COOL_GEARS]:
+        cg.add(var.add_cool_gear(row[CONF_GEAR], row[CONF_CS_OFFSET]))
+    for row in config[CONF_HEAT_GEARS]:
+        cg.add(var.add_heat_gear(row[CONF_GEAR], row[CONF_CS_OFFSET]))
+
+    # Gear-selection ladders (spacing + pinned start/stop/idle)
+    cool_l = config[CONF_COOL_LADDER]
+    cg.add(
+        var.set_cool_ladder(
+            cool_l[CONF_MODULATION_SPACING],
+            cool_l[CONF_MODULATION_HYSTERESIS],
+            cool_l[CONF_LADDER_START],
+            cool_l[CONF_LADDER_STOP],
+            cool_l[CONF_LADDER_IDLE],
+        )
+    )
+    heat_l = config[CONF_HEAT_LADDER]
+    cg.add(
+        var.set_heat_ladder(
+            heat_l[CONF_MODULATION_SPACING],
+            heat_l[CONF_MODULATION_HYSTERESIS],
+            heat_l[CONF_LADDER_START],
+            heat_l[CONF_LADDER_STOP],
+            heat_l[CONF_LADDER_IDLE],
+        )
+    )
+
+    # Transition quirks (per-quirk duration 0 = use global default)
+    default_quirk_ms = config[CONF_QUIRK_DURATION_DEFAULT].total_milliseconds
+    for q in config[CONF_QUIRKS]:
+        dur = q[CONF_QUIRK_DURATION].total_milliseconds if CONF_QUIRK_DURATION in q else 0
+        cg.add(
+            var.add_quirk(
+                q[CONF_QUIRK_MODE] == "heat",
+                q[CONF_QUIRK_FROM],
+                q[CONF_QUIRK_TO],
+                q[CONF_QUIRK_VIA_OFFSET],
+                dur,
+            )
+        )
+    cg.add(var.set_quirk_duration_ms(default_quirk_ms))
+    cg.add(var.set_cs_transmit_interval_ms(config[CONF_CS_TRANSMIT_INTERVAL].total_milliseconds))
+    cg.add(var.set_quirk_transmit_interval_ms(config[CONF_QUIRK_TRANSMIT_INTERVAL].total_milliseconds))
+    cg.add(var.set_gear_step_c(config[CONF_GEAR_STEP_C]))
 
     # Timed vane positioning (optional; only plumbed when set)
     for key, setter in [

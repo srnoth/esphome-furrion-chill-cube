@@ -105,6 +105,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   // set_test_mode(false) the next production gear pass re-anchors the unit's setpoint to the
   // real HA target, so failover is restored on exit.
   void set_test_mode(bool t);
+  bool is_test_mode() const { return test_mode_; }   // single source of truth for the sequencer
   // Send one full test frame: mode (0=OFF,1=COOL,2=HEAT), °C setpoint, raw CS byte, fan
   // (0=AUTO,1=LOW,2=MED,3=HIGH). Sets state + transmits the CS→MODE→CS bracket (or OFF).
   void test_frame(int mode, int setpoint_c, int cs, int fan);

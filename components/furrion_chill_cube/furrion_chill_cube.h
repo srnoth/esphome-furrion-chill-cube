@@ -97,6 +97,21 @@ class FurrionChillCube : public climate::Climate, public Component {
   // vane_step_duration_ms_ (non-blocking). Each press = one fixed-size step.
   void send_vane_step();
 
+  // ── Bench test harness hooks (active only when test_mode is set) ─────────────
+  // While test_mode_ is set, loop() is INERT (no gear controller / kickstart / maneuver /
+  // heartbeat) and the transmit sensor-availability gates are bypassed — the unit is driven
+  // ENTIRELY by these hooks from the YAML sequencer. Deliberately overrides the failover
+  // anchor (see project_failover_invariant): this is an operator-present bench test. On
+  // set_test_mode(false) the next production gear pass re-anchors the unit's setpoint to the
+  // real HA target, so failover is restored on exit.
+  void set_test_mode(bool t);
+  // Send one full test frame: mode (0=OFF,1=COOL,2=HEAT), °C setpoint, raw CS byte, fan
+  // (0=AUTO,1=LOW,2=MED,3=HIGH). Sets state + transmits the CS→MODE→CS bracket (or OFF).
+  void test_frame(int mode, int setpoint_c, int cs, int fan);
+  // Re-assert the current CS only (keep-alive tick; no-op when the held mode is OFF).
+  void test_resend_cs();
+  void test_off();
+
  protected:
   // Climate interface
   climate::ClimateTraits traits() override;
@@ -365,6 +380,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Flags
   bool boot_ready_{false};
   bool failsafe_active_{false};
+  bool test_mode_{false};   // bench test harness: loop() inert, unit driven only by test_* hooks
+  int test_fan_{-1};        // fan override for test frames (-1 = none; 0=AUTO,1=LOW,2=MED,3=HIGH)
   bool user_changed_{false};
   bool temp_dirty_{false};
   bool heater_locked_out_{false};

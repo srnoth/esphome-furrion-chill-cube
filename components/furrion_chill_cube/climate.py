@@ -69,6 +69,7 @@ CONF_HEAT_VENT_INTERVAL = "heat_final_position_interval"
 CONF_COOL_VENT_MOVE_DELAY = "cool_vent_move_delay"
 CONF_COOL_VENT_INTERVAL = "cool_final_position_interval"
 CONF_USE_FAHRENHEIT = "use_fahrenheit"
+CONF_TEST_MODE = "test_mode"
 # Phase 2 adaptive equilibrium-gear controller (cool mode)
 CONF_ADAPTIVE_ENABLE = "adaptive_enable"
 CONF_VENT_FAN = "vent_fan"
@@ -364,6 +365,9 @@ CONFIG_SCHEMA = cv.All(
             # tracks the unit's internal target regardless of the F/C protocol
             # used to transmit it.
             cv.Optional(CONF_USE_FAHRENHEIT, default=True): cv.boolean,
+            # Bench test harness: when true, loop() is inert and the unit is driven only by the
+            # test_* hooks (from a YAML sequencer). Production controller suspended. Default false.
+            cv.Optional(CONF_TEST_MODE, default=False): cv.boolean,
             # Phase 2 adaptive equilibrium-gear controller (cool mode).
             # When enabled, a slow integral floats the cool ladder's operating point to the
             # gear that sustains the current (unobservable-from-outside) load, so the room
@@ -471,6 +475,7 @@ async def to_code(config):
     cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
     cg.add(var.set_mode_switch_off_ms(config[CONF_MODE_SWITCH_OFF].total_milliseconds))
     cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
+    cg.add(var.set_test_mode(config[CONF_TEST_MODE]))
 
     # Configurable gear CS-offset tables
     for row in config[CONF_COOL_GEARS]:

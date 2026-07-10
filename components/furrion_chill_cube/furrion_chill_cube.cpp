@@ -376,7 +376,7 @@ void FurrionChillCube::transmit_mode_command_() {
   // always allowed. A transient gap is harmless (the unit coasts); a gap longer
   // than the unit's ~7-min CS-mode timeout hands control back to its internal
   // controller. See project_failover_invariant.
-  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && isnan(get_active_ir_target_())) {
+  if (!test_mode_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF && isnan(get_active_ir_target_())) {
     return;
   }
 
@@ -510,8 +510,12 @@ void FurrionChillCube::transmit_cs_update_() {
   // both a valid inside temperature and a valid setpoint. On a transient gap
   // the unit just coasts; on a gap longer than its ~7-min CS-mode timeout it
   // hands control back to its internal sensor. See project_failover_invariant.
-  if (isnan(inside_temp_c_)) return;
-  if (isnan(get_active_ir_target_())) return;
+  // In bench test mode the CS stream is operator-driven, independent of the room sensor —
+  // bypass the failover sensor gates so a sensor dropout can't stall the test CS stream.
+  if (!test_mode_) {
+    if (isnan(inside_temp_c_)) return;
+    if (isnan(get_active_ir_target_())) return;
+  }
 
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
@@ -778,6 +782,11 @@ void FurrionChillCube::setup() {
 
 void FurrionChillCube::loop() {
   uint32_t now = millis();
+
+  // Bench test harness: while test_mode_ is set the production controller is fully inert —
+  // no gear pass, kickstart, maneuver, vane, or heartbeat. The unit is driven ONLY by the
+  // test_* hooks (from the YAML sequencer). set_test_mode(false) re-anchors on the next pass.
+  if (test_mode_) return;
 
   // 1b. Commit a settled setpoint change (debounce). A temp change arms setpoint_pending_
   // in control() but does NOT transmit; once the user stops stepping (SETPOINT_SETTLE_MS of
@@ -1353,6 +1362,16 @@ void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
 }
 
 climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
+  // Bench test: honor the operator's per-frame fan override so startup-clamp (fan=LOW)
+  // sequences can be exercised directly.
+  if (test_mode_ && test_fan_ >= 0) {
+    switch (test_fan_) {
+      case 1:  return climate::CLIMATE_FAN_LOW;
+      case 2:  return climate::CLIMATE_FAN_MEDIUM;
+      case 3:  return climate::CLIMATE_FAN_HIGH;
+      default: return climate::CLIMATE_FAN_AUTO;
+    }
+  }
   if (clamp_phase_ == ClampPhase::CLAMPED) {
     return climate::CLIMATE_FAN_LOW;
   }
@@ -2412,6 +2431,65 @@ void FurrionChillCube::publish_debug_state_(float diff) {
 // ============================================================
 // Diagnostics
 // ============================================================
+
+// ============================================================
+// Bench Test Harness Hooks (active only when test_mode_ is set)
+// ============================================================
+
+void FurrionChillCube::set_test_mode(bool t) {
+  if (test_mode_ && !t) {
+    // Resuming production: clear the fan override and force a gear pass next loop so the unit's
+    // setpoint/CS re-anchor to the real HA target (failover restored — project_failover_invariant).
+    test_fan_ = -1;
+    user_changed_ = true;
+    last_gear_run_ = 0;
+    ESP_LOGI(TAG, "TEST mode OFF — resuming production controller (will re-anchor next pass)");
+  } else if (!test_mode_ && t) {
+    ESP_LOGI(TAG, "TEST mode ON — production controller suspended");
+  }
+  test_mode_ = t;
+}
+
+// Send one full test frame. mode 0=OFF, 1=COOL, 2=HEAT; fan 0=AUTO,1=LOW,2=MED,3=HIGH (-1=AUTO).
+void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
+  test_mode_ = true;          // a test frame always implies test mode
+  failsafe_active_ = false;
+  boot_ready_ = true;
+  test_fan_ = fan;
+  if (mode == 0) {
+    active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+  } else if (mode == 2) {
+    active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
+    furrion_setpoint_c_ = setpoint_c;
+    this->target_temperature_low = (float) setpoint_c;   // keep the HA card consistent
+  } else {
+    active_ir_mode_ = climate::CLIMATE_MODE_COOL;
+    furrion_setpoint_c_ = setpoint_c;
+    this->target_temperature_high = (float) setpoint_c;
+  }
+  current_cs_ = cs;
+  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
+    transmit_mode_command_();
+  } else {
+    transmit_mode_with_cs_();   // CS → MODE/setpoint → CS bracket
+  }
+  last_cs_heartbeat_ = millis();
+  if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
+  ESP_LOGI(TAG, "TEST frame: mode=%d sp=%dC cs=%d fan=%d", mode, setpoint_c, cs, fan);
+}
+
+// Keep-alive tick: re-assert the current CS (no-op when the held mode is OFF).
+void FurrionChillCube::test_resend_cs() {
+  transmit_cs_update_();
+  last_cs_heartbeat_ = millis();
+}
+
+void FurrionChillCube::test_off() {
+  test_mode_ = true;
+  active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+  transmit_mode_command_();
+  ESP_LOGI(TAG, "TEST: unit OFF");
+}
 
 void FurrionChillCube::dump_config() {
   ESP_LOGCONFIG(TAG, "Furrion Chill Cube:");

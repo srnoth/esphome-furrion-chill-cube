@@ -34,9 +34,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_mode_switch_off_ms(uint32_t ms) { mode_switch_off_ms_ = ms; }
   void set_use_fahrenheit(bool enable) { use_fahrenheit_ = enable; }
 
-  // Configurable gear CS-offset tables (gear number → °C offset from setpoint anchor).
-  void add_cool_gear(int gear, int cs_offset) { set_gear_offset_(false, gear, cs_offset); }
-  void add_heat_gear(int gear, int cs_offset) { set_gear_offset_(true, gear, cs_offset); }
+  // Configurable gear tables (gear number → °C CS offset from setpoint anchor + optional
+  // commanded fan; fan -1 = unset → falls through to the HA fan-mode entity).
+  void add_cool_gear(int gear, int cs_offset, int fan) { set_gear_offset_(false, gear, cs_offset, fan); }
+  void add_heat_gear(int gear, int cs_offset, int fan) { set_gear_offset_(true, gear, cs_offset, fan); }
   // Ladder params (spacing S, hysteresis h, pinned start/stop/idle). The modulation
   // rungs are auto-built from S in setup() (build_ladders_); pins stored as-is.
   void set_cool_ladder(float spacing, float hyst, float start, float stop, float idle) {
@@ -45,8 +46,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_heat_ladder(float spacing, float hyst, float start, float stop, float idle) {
     heat_spacing_ = spacing; heat_hyst_ = hyst; heat_start_ = start; heat_stop_ = stop; heat_idle_ = idle;
   }
-  // Register a transition quirk (path-dependent maneuver). duration_ms 0 = use global default.
-  void add_quirk(bool is_heat, int from_gear, int to_gear, int via_offset, uint32_t duration_ms);
+  // Register a transition quirk (path-dependent maneuver). from_gear -1 = OFF→gear clamped start.
+  // via_fan -1 = leave fan; escape_up = release early if a higher gear is demanded. duration 0 = global.
+  void add_quirk(bool is_heat, int from_gear, int to_gear, int via_offset, int via_fan,
+                 bool escape_up, uint32_t duration_ms);
   void set_quirk_duration_ms(uint32_t ms) { quirk_duration_ms_ = ms; }
   void set_cs_transmit_interval_ms(uint32_t ms) { cs_transmit_interval_ms_ = ms; }
   void set_quirk_transmit_interval_ms(uint32_t ms) { quirk_transmit_interval_ms_ = ms; }
@@ -140,8 +143,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   void seed_last_tx_target_f_();   // sync last_tx_target_f_ to the active target (boot restore)
   int compute_gear_cs_(bool is_heat, int gear);   // CS for a gear from its configured offset
   int gear_cs_with_clamp_(bool is_heat, int offset);  // SP+offset with the 15-30 group boundary shift
-  void set_gear_offset_(bool is_heat, int gear, int cs_offset);  // codegen: register a gear's offset
+  void set_gear_offset_(bool is_heat, int gear, int cs_offset, int fan);  // codegen: register a gear
   void build_ladders_();                          // build modulation up/dn trips from spacing (setup)
+  void compute_cold_start_floors_();              // derive OFF-start floor from the -1 quirks (setup)
   bool gear_in_band_heat_(int gear, float diff);
   bool gear_in_band_cool_(int gear, float diff);
 
@@ -159,36 +163,29 @@ class FurrionChillCube : public climate::Climate, public Component {
   float update_room_drift_(uint32_t now);  // push sample + return 3-min windowed slope (°C/min)
   bool vent_fan_on_();
 
-  // Kickstart system (OFF→gear restart only). Clamped kickstart: OFF→low gear, fan=LOW for 5:05,
-  // gear controller runs but CS overridden. Running-unit restarts/dips are handled by the separate
-  // transition maneuver engine (start_maneuver_), not here.
-  enum class ClampPhase : uint8_t {
-    IDLE,
-    PRE_CS,     // 500ms: kickstart CS pre-set before mode-on
-    CLAMPED,    // 5:30: fan=LOW, kickstart CS retransmitted, gear controller monitored
-  };
-  void start_clamped_kickstart_(bool is_heat, uint32_t now);
-  void advance_kickstart_(uint32_t now);   // clamped kickstart only
-  void end_kickstart_(uint32_t now);       // release the clamp → restore the gear's CS
-  // "IR override active" — an override state machine (clamped kickstart OR a running-unit
-  // transition maneuver) currently owns the CS/mode, so the normal gear-pass CS writes and
-  // OFF→ON mode command must stand down. (Name kept for the many existing call sites.)
-  bool kickstart_active_() { return clamp_phase_ != ClampPhase::IDLE || maneuver_active_; }
+  // "IR override active" — a transition maneuver (which now also runs the OFF→gear clamped start)
+  // currently owns the CS/mode/fan, so the normal gear-pass CS writes and OFF→ON mode command must
+  // stand down. (Name kept for the many existing call sites.) maneuver_phase_ / ManeuverPhase are
+  // declared in the config-members section below; an inline body may reference them (the class is
+  // fully parsed before inline bodies are compiled).
+  bool kickstart_active_() { return maneuver_phase_ != ManeuverPhase::IDLE; }
 
-  // Transition maneuver (path-dependent quirk). Replaces the old idle→LOW/MED quick
-  // kickstart with a general "hold via CS for a window, re-asserting at the quirk
-  // interval, then re-evaluate the gear" engine. Only for a RUNNING unit (OFF→gear
-  // transitions use the clamped kickstart). See session_log 2026-07-09 quirk design.
-  void start_maneuver_(bool is_heat, int via_cs, uint32_t duration_ms, uint32_t now);
+  // Unified transition maneuver engine (path-dependent quirk). Absorbs the old clamped kickstart:
+  // a quirk with from_gear == -1 runs the OFF→gear start (PRE_CS lead → mode-on with via_fan);
+  // from_gear >= 0 is a running-unit maneuver. In all cases: hold via CS (and, if set, via_fan) for
+  // the window, re-asserting at the quirk interval, then release + re-evaluate the gear. escape_up
+  // releases early if the demanded gear rises above to_gear. See design_gear_engine_v2.
+  // Nested QuirkDef is fully defined in the config-members section below; forward-declare it HERE so
+  // the pointer parameter / find_quirk_ return type bind to FurrionChillCube::QuirkDef.
+  struct QuirkDef;
+  void start_maneuver_(const QuirkDef *q, uint32_t now);
+  void enter_maneuver_hold_(uint32_t now);   // PRE_CS→HOLD (or immediate HOLD for a running unit)
   void advance_maneuver_(uint32_t now);
   void end_maneuver_(uint32_t now);
-  // Nested QuirkDef is fully defined in the config-members section below; forward-declare it
-  // HERE (in class scope) so find_quirk_'s return type binds to FurrionChillCube::QuirkDef —
-  // without this the elaborated-type-specifier would declare a namespace-scope QuirkDef and the
-  // out-of-line definition's return type would not match the declaration (compile error).
-  struct QuirkDef;
   // Look up a configured quirk for a (mode, from_gear→to_gear) transition; nullptr if none.
   const QuirkDef *find_quirk_(bool is_heat, int from_gear, int to_gear);
+  climate::ClimateFanMode fan_int_to_mode_(int f);   // 0 AUTO, 1 LOW, 2 MED, 3 HIGH (else AUTO)
+  void maybe_apply_gear_fan_(uint32_t now);           // emit a mode frame if the current gear's fan changed
 
   // Timed vane positioning (open-loop IR homing off the power-on anchor).
   // On an OFF->active start the unit re-homes the vane to a fixed default; we then
@@ -280,6 +277,8 @@ class FurrionChillCube : public climate::Climate, public Component {
                                // detection (furrion_setpoint_c_ tracks live, so can't be it).
   int last_tx_target_f_{0};   // Last °F target byte actually transmitted (F-protocol);
                               // lets update_furrion_setpoint_() catch sub-°C changes
+  int last_tx_fan_{-1};       // Last fan enum put on the wire via a mode frame (-1 = none/OFF).
+                              // Set inside transmit_mode_command_(); gates the per-gear fan resend.
   climate::ClimateMode active_ir_mode_{climate::CLIMATE_MODE_OFF};
 
   // Timing (all uint32_t for millis())
@@ -300,21 +299,22 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t ha_disconnect_time_{0};
   uint32_t temp_nan_since_{0};
 
-  // Clamped kickstart (OFF→low gear: fan=LOW + CS override for 5:30)
-  ClampPhase clamp_phase_{ClampPhase::IDLE};
-  uint32_t clamp_start_{0};           // when CLAMPED phase began (for 5:30 timeout)
-  uint32_t clamp_phase_start_{0};     // when current phase began (for PRE_CS 500ms)
-  int clamp_kickstart_cs_{0};         // CS to hold during clamp
-  bool clamp_is_heat_{false};         // which mode the clamp is for
-
-  // Transition maneuver (running-unit quirk): hold via_cs for maneuver_duration_ms_,
-  // re-asserting every quirk_transmit_interval_ms_, then release + re-evaluate the gear.
-  bool maneuver_active_{false};
-  uint32_t maneuver_start_{0};
+  // Unified transition maneuver (path-dependent quirk) — also runs the OFF→gear clamped start.
+  // from_gear == -1: PRE_CS (set via CS ~500ms before mode-on) → HOLD (unit on, hold via_cs and,
+  // if set, via_fan; re-assert every quirk_transmit_interval_ms_; release + re-evaluate the gear at
+  // duration, or when the demanded gear escapes above to_gear). from_gear >= 0 enters HOLD directly.
+  enum class ManeuverPhase : uint8_t { IDLE, PRE_CS, HOLD };
+  ManeuverPhase maneuver_phase_{ManeuverPhase::IDLE};
+  uint32_t maneuver_start_{0};         // HOLD start (times the duration window)
+  uint32_t maneuver_phase_start_{0};   // current phase start (PRE_CS 500ms lead)
   uint32_t maneuver_last_tx_{0};       // last via-CS re-assert (for quirk_transmit_interval_ms_)
   int maneuver_via_cs_{0};             // CS held during the maneuver
-  uint32_t maneuver_duration_ms_{0};   // this maneuver's hold window
+  int8_t maneuver_via_fan_{-1};        // fan held during HOLD (-1 = leave fan as-is)
+  uint32_t maneuver_duration_ms_{0};   // this maneuver's HOLD window
   bool maneuver_is_heat_{false};
+  int8_t maneuver_from_gear_{0};       // -1 = OFF→gear entry (PRE_CS + mode-on path)
+  int8_t maneuver_to_gear_{0};
+  bool maneuver_escape_up_{false};     // release early if the demanded gear > to_gear
 
   // Timed vane positioning config (ms; 0 = unset → feature off for that mode)
   uint32_t heat_vent_move_delay_ms_{0};
@@ -341,24 +341,30 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool use_fahrenheit_{true};
 
   // ── Configurable gear ladders + transition quirks (populated by codegen) ─────
-  // This build fixes the gear COUNT at 3 (idle + LOW/MED/MAX) to match the unit's
-  // confirmed physical reality; the OFFSETS, ladder thresholds, quirks and CS
-  // cadence are all YAML-tunable. Extending to N gears means generalizing the
-  // run_*_mode_ selection switch (future). Defaults below reproduce the shipped
-  // 2026-07-08 symmetric-1°F ladder + 3-gear CS map bit-identically.
-  static constexpr int MAX_GEARS = 4;    // indices 0..3
-  static constexpr int MAX_QUIRKS = 12;
+  // Gear COUNT is dynamic (v2, 2026-07-18): the YAML gear list drives cool_max_gear_/heat_max_gear_
+  // and the run_*_mode_ selection loops + ladder auto-derive from it. MAX_GEARS is a compile ceiling
+  // only. Each gear also carries an optional commanded fan; each quirk an optional via_fan + escape_up
+  // and may start from OFF (from_gear -1). Defaults below reproduce the shipped 2026-07-08 3-gear
+  // ladder bit-identically. See design_gear_engine_v2.
+  static constexpr int MAX_GEARS = 8;    // compile ceiling; actual count = *_max_gear_ (indices 0..7)
+  static constexpr int MAX_QUIRKS = 16;
   struct QuirkDef {
     bool is_heat;
     int8_t from_gear;     // -1 = OFF, 0 = idle, 1.. = active
     int8_t to_gear;
     int8_t via_offset;    // CS offset (°C) from setpoint anchor, held during the maneuver
+    int8_t via_fan;       // fan held during the maneuver: -1 unset, 0 AUTO, 1 LOW, 2 MED, 3 HIGH
+    bool escape_up;       // release early if the demanded gear rises above to_gear
     uint32_t duration_ms; // 0 = use quirk_duration_ms_
   };
-  int cool_gear_offset_[MAX_GEARS] = {-5, -2, 0, 3};   // idle, LOW, MED, MAX
-  int heat_gear_offset_[MAX_GEARS] = {5, 1, 0, -1};    // idle, g1, g2, g3
+  int cool_gear_offset_[MAX_GEARS] = {-5, -2, 0, 3, 0, 0, 0, 0};    // idle, LOW, MED, MAX (defaults)
+  int heat_gear_offset_[MAX_GEARS] = {5, 1, 0, -1, 0, 0, 0, 0};     // idle, g1, g2, g3
+  int cool_gear_fan_[MAX_GEARS] = {-1, -1, -1, -1, -1, -1, -1, -1}; // per-gear commanded fan (-1 = HA fan)
+  int heat_gear_fan_[MAX_GEARS] = {-1, -1, -1, -1, -1, -1, -1, -1};
   int cool_max_gear_{3};
   int heat_max_gear_{3};
+  int cool_cold_start_floor_{1};   // lowest gear pickable from OFF; derived from OFF quirks in setup()
+  int heat_cold_start_floor_{1};
   QuirkDef quirks_[MAX_QUIRKS];
   int quirk_count_{0};
   // Ladder params (defaults = shipped values). Modulation rungs auto-built in build_ladders_().

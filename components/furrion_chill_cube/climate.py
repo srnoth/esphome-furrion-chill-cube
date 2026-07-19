@@ -46,6 +46,7 @@ CONF_COOL_GEARS = "cool_gears"
 CONF_HEAT_GEARS = "heat_gears"
 CONF_GEAR = "gear"
 CONF_CS_OFFSET = "cs_offset"
+CONF_GEAR_FAN = "fan"
 CONF_COOL_LADDER = "cool_ladder"
 CONF_HEAT_LADDER = "heat_ladder"
 CONF_MODULATION_SPACING = "modulation_spacing"
@@ -58,7 +59,18 @@ CONF_QUIRK_MODE = "mode"
 CONF_QUIRK_FROM = "from_gear"
 CONF_QUIRK_TO = "to_gear"
 CONF_QUIRK_VIA_OFFSET = "via_offset"
+CONF_QUIRK_VIA_FAN = "via_fan"
+CONF_QUIRK_ESCAPE_UP = "escape_up"
 CONF_QUIRK_DURATION = "duration"
+
+# Fan name → int for the C++ setters (add_*_gear / add_quirk). -1 = unset.
+_FAN_TO_INT = {"auto": 0, "low": 1, "med": 2, "medium": 2, "high": 3}
+_FAN_NAMES = cv.one_of(*_FAN_TO_INT.keys(), lower=True)
+
+
+def _fan_int(row, key):
+    """Map an optional validated fan name in row[key] to its int, or -1 if absent."""
+    return _FAN_TO_INT[row[key]] if key in row else -1
 CONF_QUIRK_DURATION_DEFAULT = "quirk_duration"
 CONF_CS_TRANSMIT_INTERVAL = "cs_transmit_interval"
 CONF_QUIRK_TRANSMIT_INTERVAL = "quirk_transmit_interval"
@@ -208,23 +220,29 @@ def _validate_vent_pairs(config):
 
 
 # ── Configurable ladders + quirks ───────────────────────────────────────────
-# One gear row: which gear number, and its CS offset (°C) from the setpoint anchor.
+# One gear row: gear number, CS offset (°C) from the setpoint anchor, and an optional commanded
+# fan (auto|low|med|high). When `fan` is set the controller commands it while holding this gear,
+# overriding the HA fan-mode entity; omitted → falls through to the HA fan mode.
 GEAR_SCHEMA = cv.Schema(
     {
-        cv.Required(CONF_GEAR): cv.int_range(min=0, max=3),
+        cv.Required(CONF_GEAR): cv.int_range(min=0, max=7),
         cv.Required(CONF_CS_OFFSET): cv.int_range(min=-15, max=15),
+        cv.Optional(CONF_GEAR_FAN): _FAN_NAMES,
     }
 )
 
-# One quirk: a path-dependent transition maneuver. On a `mode` gear change from
-# `from_gear`→`to_gear`, hold `via_offset` CS for `duration` (or the global
-# quirk_duration if unset), then re-evaluate. from_gear -1 = OFF, 0 = idle.
+# One quirk: a path-dependent transition maneuver. On a `mode` gear change from `from_gear`→
+# `to_gear`, hold `via_offset` CS (and, if set, `via_fan`) for `duration` (or the global
+# quirk_duration if unset), then re-evaluate. from_gear -1 = OFF (a clamped start), 0 = idle.
+# escape_up releases the maneuver early if a higher gear is demanded (default: true iff from_gear -1).
 QUIRK_SCHEMA = cv.Schema(
     {
         cv.Required(CONF_QUIRK_MODE): cv.one_of("cool", "heat", lower=True),
-        cv.Required(CONF_QUIRK_FROM): cv.int_range(min=-1, max=3),
-        cv.Required(CONF_QUIRK_TO): cv.int_range(min=0, max=3),
+        cv.Required(CONF_QUIRK_FROM): cv.int_range(min=-1, max=7),
+        cv.Required(CONF_QUIRK_TO): cv.int_range(min=0, max=7),
         cv.Required(CONF_QUIRK_VIA_OFFSET): cv.int_range(min=-15, max=15),
+        cv.Optional(CONF_QUIRK_VIA_FAN): _FAN_NAMES,
+        cv.Optional(CONF_QUIRK_ESCAPE_UP): cv.boolean,
         cv.Optional(CONF_QUIRK_DURATION): cv.positive_time_period_milliseconds,
     }
 )
@@ -270,21 +288,27 @@ _DEFAULT_HEAT_LADDER = {
     CONF_LADDER_STOP: -0.15,
     CONF_LADDER_IDLE: 0.30,
 }
-# Cool-only live quirks:
-#   idle→LOW (0→1) via SP+0, held 90s: the from-idle restart threshold is SP+0; the 90s hold
-#     (explicit per-quirk override, preserves the pre-refactor IDLE_KICK_HOLD_MS behavior) keeps it
-#     asserted across the compressor's ~3-min anti-short-cycle lockout, then settles to LOW's SP−2.
-#   MAX→MED (3→2) via SP−1, held the global quirk_duration (60s): MED is path-dependent (~9A from
-#     MAX vs ~6A from LOW), so dip below MED to re-seat it from underneath (2026-07-09).
+# Default quirks reproduce the v1 behavior — INCLUDING the OFF→gear clamped starts, which v1
+# hardcoded in C++ and v2 expresses as from_gear:-1 quirks (escape_up defaults true for from:-1):
+#   cool OFF→MED (-1→2) via SP+1, fan=LOW, 305s: the clamped cold-start (caps the startup spike;
+#     drops early if MAX is demanded). The cool cold-start floor (2) is derived from this quirk.
+#   cool idle→LOW (0→1) via SP+0, 90s: holds the restart CS across the ~3-min anti-short-cycle lockout.
+#   cool MAX→MED (3→2) via SP−1, global quirk_duration (60s): re-seat the path-dependent MED (2026-07-09).
+#   heat OFF→g1 (-1→1) via SP+0, fan=LOW, 305s: the heat clamped cold-start.
 _DEFAULT_QUIRKS = [
+    {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: -1, CONF_QUIRK_TO: 2, CONF_QUIRK_VIA_OFFSET: 1,
+     CONF_QUIRK_VIA_FAN: "low", CONF_QUIRK_DURATION: "305s"},
     {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: 0, CONF_QUIRK_TO: 1, CONF_QUIRK_VIA_OFFSET: 0,
      CONF_QUIRK_DURATION: "90s"},
     {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: 3, CONF_QUIRK_TO: 2, CONF_QUIRK_VIA_OFFSET: -1},
+    {CONF_QUIRK_MODE: "heat", CONF_QUIRK_FROM: -1, CONF_QUIRK_TO: 1, CONF_QUIRK_VIA_OFFSET: 0,
+     CONF_QUIRK_VIA_FAN: "low", CONF_QUIRK_DURATION: "305s"},
 ]
 
 
 def _validate_gears(key):
-    """Each gear number appears once; gear 0 (idle) is required."""
+    """Gear numbers must be unique and contiguous 0..N (0 = idle, required). The selection loops
+    and auto-built ladder assume a contiguous run with no gaps."""
     def validator(value):
         seen = set()
         for row in value:
@@ -294,6 +318,10 @@ def _validate_gears(key):
             seen.add(g)
         if 0 not in seen:
             raise cv.Invalid(f"{key}: must define gear 0 (idle) offset")
+        n = max(seen)
+        missing = [g for g in range(0, n + 1) if g not in seen]
+        if missing:
+            raise cv.Invalid(f"{key}: gears must be contiguous 0..{n}; missing {missing}")
         return value
     return validator
 
@@ -477,11 +505,11 @@ async def to_code(config):
     cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
     cg.add(var.set_test_mode(config[CONF_TEST_MODE]))
 
-    # Configurable gear CS-offset tables
+    # Configurable gear tables (CS offset + optional commanded fan; -1 = unset)
     for row in config[CONF_COOL_GEARS]:
-        cg.add(var.add_cool_gear(row[CONF_GEAR], row[CONF_CS_OFFSET]))
+        cg.add(var.add_cool_gear(row[CONF_GEAR], row[CONF_CS_OFFSET], _fan_int(row, CONF_GEAR_FAN)))
     for row in config[CONF_HEAT_GEARS]:
-        cg.add(var.add_heat_gear(row[CONF_GEAR], row[CONF_CS_OFFSET]))
+        cg.add(var.add_heat_gear(row[CONF_GEAR], row[CONF_CS_OFFSET], _fan_int(row, CONF_GEAR_FAN)))
 
     # Gear-selection ladders (spacing + pinned start/stop/idle)
     cool_l = config[CONF_COOL_LADDER]
@@ -505,16 +533,22 @@ async def to_code(config):
         )
     )
 
-    # Transition quirks (per-quirk duration 0 = use global default)
+    # Transition quirks (per-quirk duration 0 = use global default; via_fan -1 = unset;
+    # escape_up defaults to true iff from_gear == -1 — the OFF→gear clamped start's drop-early rule).
     default_quirk_ms = config[CONF_QUIRK_DURATION_DEFAULT].total_milliseconds
     for q in config[CONF_QUIRKS]:
         dur = q[CONF_QUIRK_DURATION].total_milliseconds if CONF_QUIRK_DURATION in q else 0
+        escape_up = (
+            q[CONF_QUIRK_ESCAPE_UP] if CONF_QUIRK_ESCAPE_UP in q else (q[CONF_QUIRK_FROM] == -1)
+        )
         cg.add(
             var.add_quirk(
                 q[CONF_QUIRK_MODE] == "heat",
                 q[CONF_QUIRK_FROM],
                 q[CONF_QUIRK_TO],
                 q[CONF_QUIRK_VIA_OFFSET],
+                _fan_int(q, CONF_QUIRK_VIA_FAN),
+                escape_up,
                 dur,
             )
         )

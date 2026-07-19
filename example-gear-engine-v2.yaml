@@ -1,0 +1,91 @@
+# ============================================================
+# Furrion Chill Cube — gear engine v2 config examples
+# ============================================================
+# Companion to context/camper-hvac/design_gear_engine_v2.md.
+# NOTE: this shows ONLY the gear-engine keys under `climate:`; a real device config also needs
+# transmitter_id, inside_temperature, sensors, buttons, etc. (see camper-hvac.yaml).
+#
+# NEW v2 fields, all optional (omit → today's behavior bit-identically):
+#   gear:  `fan:`            per-gear commanded fan (auto|low|med|high)
+#   quirk: `via_fan:`        fan held during the maneuver window
+#   quirk: `escape_up:`      release early if a higher gear is demanded (default true iff from_gear:-1)
+# Any number of gears (0..N, N<=7); the temperature ladder auto-derives from modulation_spacing.
+#
+# COLD-START FLOOR (no separate knob): the lowest gear the controller may start into from OFF =
+# the lowest `to_gear` among that mode's `from_gear:-1` quirks. Below = the cool OFF→2 clamp makes
+# the cool floor 2 (can't cold-start LOW); heat's OFF→1 clamp makes its floor 1. To allow cold-
+# starting a lower gear, add/lower an OFF→that-gear quirk.
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# (A) REPRODUCE-CURRENT — explicit spelling of today's shipped defaults.
+#     Kickstart clamps are now ordinary quirks (from_gear: -1). Behavior-identical to prod.
+# ────────────────────────────────────────────────────────────────────────────
+climate:
+  - platform: furrion_chill_cube
+    # ... transmitter_id / inside_temperature / etc. omitted ...
+
+    cool_gears:
+      - { gear: 0, cs_offset: -5 }          # idle (raw, unclamped)
+      - { gear: 1, cs_offset: -2 }          # LOW
+      - { gear: 2, cs_offset:  0 }          # MED
+      - { gear: 3, cs_offset:  3 }          # MAX
+    heat_gears:
+      - { gear: 0, cs_offset:  5 }          # idle
+      - { gear: 1, cs_offset:  1 }
+      - { gear: 2, cs_offset:  0 }
+      - { gear: 3, cs_offset: -1 }
+
+    cool_ladder: { modulation_spacing: 0.55, modulation_hysteresis: 0.0, start: 0.35, stop: 0.15, idle: -0.30 }
+    heat_ladder: { modulation_spacing: 0.55, modulation_hysteresis: 0.0, start: -0.35, stop: -0.15, idle: 0.30 }
+
+    quirks:
+      # OFF→MED clamped kickstart (was start_clamped_kickstart_): fan=LOW, SP+1, 5:05, drop early to MAX.
+      - { mode: cool, from_gear: -1, to_gear: 2, via_offset:  1, via_fan: low, duration: 305s }  # escape_up defaults true
+      # idle→LOW quick-kick: hold SP+0 across the anti-short-cycle lockout, then settle LOW.
+      - { mode: cool, from_gear:  0, to_gear: 1, via_offset:  0, duration: 90s }
+      # MAX→MED re-seat dip: SP−1 60s (no auto-escape).
+      - { mode: cool, from_gear:  3, to_gear: 2, via_offset: -1 }
+      # Heat OFF→gear-1 clamp (was the heat clamped kickstart): fan=LOW, SP+0, 5:05.
+      - { mode: heat, from_gear: -1, to_gear: 1, via_offset:  0, via_fan: low, duration: 305s }
+    # Cold-start floors: cool=2 (from the OFF→2 quirk above), heat=1 (from OFF→1). Derived, no knob.
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# (B) FINAL SCHEME — Stephen's 2026-07-18 ladder: 4 cool gears, top two split by FAN at the same CS,
+#     and a short fan-clamp on the 3→2 downshift. This is what the camper-hvac.yaml is set to.
+# ────────────────────────────────────────────────────────────────────────────
+climate:
+  - platform: furrion_chill_cube
+    # ... hardware config omitted ...
+
+    cool_gears:
+      - { gear: 0, cs_offset: -5 }                    # idle
+      - { gear: 1, cs_offset: -2 }                    # LOW   (CS18 @ SP20)  fan=auto
+      - { gear: 2, cs_offset:  0 }                    # MED   (CS20 @ SP20)  fan=auto — clean mid from below
+      - { gear: 3, cs_offset:  3, fan: med }          # CS23 + fan=med
+      - { gear: 4, cs_offset:  3, fan: high }         # CS23 + fan=high (MAX) — same CS as gear 3, higher fan
+    heat_gears:
+      - { gear: 0, cs_offset:  5 }
+      - { gear: 1, cs_offset:  1 }
+      - { gear: 2, cs_offset:  0 }
+      - { gear: 3, cs_offset: -1 }
+
+    cool_ladder: { modulation_spacing: 0.55, start: 0.35, stop: 0.15, idle: -0.30 }
+    heat_ladder: { modulation_spacing: 0.55, start: -0.35, stop: -0.15, idle: 0.30 }
+
+    quirks:
+      # OFF→MED clamped start (was hardcoded): fan=LOW, SP+1, ~5 min, escape early to a higher gear.
+      - { mode: cool, from_gear: -1, to_gear: 2, via_offset: 1, via_fan: low, duration: 305s }
+      # idle→LOW quick-kick.
+      - { mode: cool, from_gear:  0, to_gear: 1, via_offset: 0, duration: 90s }
+      # ⭐ 3→2 FAN-CLAMP: hold CS23 (via_offset +3) but drop fan to LOW to knock the compressor down to
+      #    proper gear-2, then release to gear-2 (fan=auto). The release-spike is INEVITABLE regardless
+      #    of hold length (Stephen 2026-07-18), so the clamp is SHORT — 30s — to get it over with fast.
+      - { mode: cool, from_gear:  3, to_gear: 2, via_offset: 3, via_fan: low, duration: 30s }
+      # Heat OFF→gear-1 clamped start (was hardcoded).
+      - { mode: heat, from_gear: -1, to_gear: 1, via_offset: 0, via_fan: low, duration: 305s }
+
+    # 4 active cool gears → modulation_spacing 0.55 puts rung trips at 0.55/1.10/1.65 °C (gear 3↔4 at
+    # 1.65 °C ≈ 3 °F over setpoint). Reachable on a hot day; lower spacing if gear 4 proves too high.
+    # Cold-start floor = 2 (from the OFF→2 quirk). No 4→3 or 3↔4 quirk: those are same-CS fan-only steps.

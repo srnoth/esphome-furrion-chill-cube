@@ -89,6 +89,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_debug_adaptive_bias_c_sensor(sensor::Sensor *s) { debug_adaptive_bias_c_sensor_ = s; }
   void set_debug_room_drift_sensor(sensor::Sensor *s) { debug_room_drift_sensor_ = s; }
   void set_debug_fan_feedforward_sensor(sensor::Sensor *s) { debug_fan_feedforward_sensor_ = s; }
+  void set_debug_effective_fan_sensor(sensor::Sensor *s) { debug_effective_fan_sensor_ = s; }
 
   // IR commands (public for button access)
   void send_display_toggle();
@@ -255,6 +256,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *debug_adaptive_bias_c_sensor_{nullptr};
   sensor::Sensor *debug_room_drift_sensor_{nullptr};
   sensor::Sensor *debug_fan_feedforward_sensor_{nullptr};
+  sensor::Sensor *debug_effective_fan_sensor_{nullptr};   // last-transmitted fan (0 auto/1 low/2 med/3 high, -1 off)
 
   // Phase 2 adaptive input
   binary_sensor::BinarySensor *vent_fan_sensor_{nullptr};

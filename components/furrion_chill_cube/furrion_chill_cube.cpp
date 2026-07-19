@@ -2412,6 +2412,20 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   pub(debug_room_drift_sensor_, room_drift_cpm_);
   pub(debug_fan_feedforward_sensor_,
       (adaptive_enable_ && vent_fan_on_()) ? (float)fan_feedforward_gears_ : 0.0f);
+
+  // Effective (last-transmitted) fan, normalized to the config `fan:` convention:
+  // -1 off / nothing transmitted · 0 auto · 1 low · 2 med · 3 high. Sourced from last_tx_fan_
+  // (the exact ClimateFanMode enum put on the last mode frame), so it reflects the CONTROLLER-driven
+  // fan — including a per-gear fan (g3=med/g4=high) or a maneuver via_fan clamp — not the HA fan entity.
+  float eff_fan;
+  switch (last_tx_fan_) {
+    case climate::CLIMATE_FAN_AUTO:   eff_fan = 0.0f; break;
+    case climate::CLIMATE_FAN_LOW:    eff_fan = 1.0f; break;
+    case climate::CLIMATE_FAN_MEDIUM: eff_fan = 2.0f; break;
+    case climate::CLIMATE_FAN_HIGH:   eff_fan = 3.0f; break;
+    default:                          eff_fan = -1.0f; break;   // -1 (OFF) or an unmapped mode
+  }
+  pub(debug_effective_fan_sensor_, eff_fan);
 }
 
 // ============================================================

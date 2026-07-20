@@ -1185,11 +1185,16 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
   bool warming = isnan(room_drift_cpm_) ||
                  (room_drift_cpm_ > ADAPT_UPSHIFT_DRIFT_MIN_CPM && drift_fresh);
-  // Freeze positive accumulation whenever the gear can't rise right now — at gear 5, while an
-  // upshift is hold-blocked, OR while the rate gate is suppressing the upshift (!warming). The
-  // last clause is load-bearing: without it the integral would keep winding behind a drift-gated
-  // upshift and then over-leap the moment the room ticked warm again (re-introducing the windup).
-  bool block_up = (e > 0.0f) && (cool_gear_ >= cool_max_gear_ || upshift_held || !warming);
+  // Freeze positive accumulation only when the gear physically can't rise — at max gear or while an
+  // upshift is hold-blocked. The `!warming` clause was REMOVED (iter-1 #4, 2026-07-20): it froze
+  // accumulation whenever the room wasn't actively rising, which during a steady above-SP hunt gated
+  // out ~7 of every 8 minutes of integration → the integral ran at ~1/8 speed and lagged the diurnal
+  // load by HOURS (room sat +0.5-0.75°F above SP all afternoon, then overcooled all evening). The
+  // upshift itself is still protected against grabbing a top gear off stale climb data by the
+  // `warming ? eff : fminf(...)` gate on cool_eff_up_diff_ below — so a wound bias can accumulate but
+  // still can't force an upshift unless the room is genuinely warming. Accepted trade: a mild
+  // wind-then-step as the room ticks warm, bounded by HOLD_MS (one gear/pass). Tuning this empirically.
+  bool block_up = (e > 0.0f) && (cool_gear_ >= cool_max_gear_ || upshift_held);
   bool freeze = kickstart_active_() || fan_edge_freeze || block_up;
 
   if (idle) {
@@ -1637,8 +1642,15 @@ void FurrionChillCube::set_gear_offset_(bool is_heat, int gear, int cs_offset, i
 // − for heat (negative=cold). start/stop/idle pins are stored as-is (not on the grid).
 void FurrionChillCube::build_ladders_() {
   for (int n = 1; n < MAX_GEARS; n++) {
-    cool_up_[n] = n * cool_spacing_;
-    cool_dn_[n] = n * cool_spacing_ - cool_hyst_;
+    // COOL: offset the modulation grid by the 0↔1 start pin so gear 1 gets a FULL-spacing runway
+    // from its entry (cool_start_) to its upshift (cool_up_[1] = start + S), matching every other
+    // rung. Without the offset gear 1's runway is only (S − start) ≈ 0.20°C — the narrowest rung and
+    // the first to collapse under a residual adaptive bias (the overnight 0↔1→2 popping diagnosed
+    // 2026-07-20). Trade: shifts the whole cool ladder top up by cool_start_ (~0.35°C), so MAX needs
+    // a touch more demand — acceptable once the bias tracks (iter-1 #1). HEAT keeps the un-offset grid
+    // (winter-unvalidated; do the sign-mirror deliberately before heating season).
+    cool_up_[n] = cool_start_ + n * cool_spacing_;
+    cool_dn_[n] = cool_start_ + n * cool_spacing_ - cool_hyst_;
     heat_up_[n] = -(n * heat_spacing_);
     heat_dn_[n] = -(n * heat_spacing_ - heat_hyst_);
   }
@@ -2225,7 +2237,13 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       // First compute post-restore: jump straight to the correct gear (skip the HOLD_MS ladder).
       if (last_gear_change_ == 0) {
         new_gear = pick_from_below(diff);
-      } else if (can_upshift_to(1) && diff > C_UP_01) {
+      } else if (can_upshift_to(1) && eff_diff > C_UP_01) {
+        // iter-1 #2 (2026-07-20): re-engage 0→1 on eff_diff (real + bias), not real diff, so the
+        // integral shifts the WHOLE ladder together — the 1→2 upshift already trips on eff_diff, so
+        // matching the 0→1 entry to it stops the bias from inverting gear 1's narrow band overnight.
+        // Made safe by iter-1 #4 (fast unwind → bias won't sit wound while the room is at SP). The
+        // 0→-1 off-decision below deliberately stays on REAL diff (failover / don't cool below SP on
+        // a stale bias). Summer/cool-only; revisit for heat↔cool mode hunting before fall.
         new_gear = 1;
       }
       // 0→-1 gate (natural path only — user_input handled above)

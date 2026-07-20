@@ -134,8 +134,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool check_failsafe_(uint32_t now, float room);
   void update_outside_lockout_();
   void arbitrate_mode_(float room, bool &do_heat, bool &do_cool);
-  bool run_heat_mode_(float room, uint32_t now, bool user_input, float &gear_diff);
-  bool run_cool_mode_(float room, uint32_t now, bool user_input, float &gear_diff);
+  bool run_heat_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
+  bool run_cool_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
   void run_idle_mode_(uint32_t now);
   uint32_t time_in_gear_(uint32_t now);
   float get_heat_target_();
@@ -392,6 +392,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool test_mode_{false};   // bench test harness: loop() inert, unit driven only by test_* hooks
   int test_fan_{-1};        // fan override for test frames (-1 = none; 0=AUTO,1=LOW,2=MED,3=HIGH)
   bool user_changed_{false};
+  bool resume_from_test_{false};  // set on test-exit → gear re-pick uses eff_diff (bias-aware), not real diff
   bool temp_dirty_{false};
   bool heater_locked_out_{false};
   // Setpoint debounce (see SETPOINT_SETTLE_MS): a temp change arms this; loop() commits it

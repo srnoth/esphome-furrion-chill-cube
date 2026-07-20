@@ -1780,6 +1780,11 @@ void FurrionChillCube::run_gear_controller_() {
 
   bool user_input = user_changed_;
   if (user_input) user_changed_ = false;
+  // Test-exit re-anchor: land the gear on the bias-justified value (eff_diff pick), not a real-diff
+  // drop that discards the wound-up integral. Latched/cleared with user_input; preserved across a
+  // NaN-target hold below, exactly like user_input.
+  bool from_test = resume_from_test_;
+  if (from_test) resume_from_test_ = false;
 
   // Captured before dispatch so the periodic state log reports the hold time the
   // gear logic actually saw (a gear change this pass resets last_gear_change_).
@@ -1794,9 +1799,9 @@ void FurrionChillCube::run_gear_controller_() {
   // early (NaN-target) hold-return — propagate it so this pass stops cleanly.
   float gear_diff = NAN;  // active diff, for debug publishing
   if (do_heat) {
-    if (run_heat_mode_(room, now, user_input, gear_diff)) return;
+    if (run_heat_mode_(room, now, user_input, from_test, gear_diff)) return;
   } else if (do_cool) {
-    if (run_cool_mode_(room, now, user_input, gear_diff)) return;
+    if (run_cool_mode_(room, now, user_input, from_test, gear_diff)) return;
   } else {
     run_idle_mode_(now);
   }
@@ -1973,7 +1978,7 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
 }
 
 // HEATING mode pass. Returns true if it took an early (NaN-target) hold-return.
-bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
+bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input, bool from_test,
                                      float &gear_diff) {
   // The cool-mode adaptive bias is meaningless in heat; clear it here (not just in the
   // post-dispatch !do_cool clear) so it's cleared even if this pass early-returns on a NaN
@@ -2009,6 +2014,7 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   if (isnan(target)) {
     ESP_LOGW(TAG, "Heat target NaN — holding gear/CS");
     user_changed_ = user_input;  // don't consume a user event during a NaN hold
+    resume_from_test_ = from_test;  // ditto: preserve the test-exit re-pick across the hold
     publish_debug_state_(NAN);
     return true;
   }
@@ -2044,7 +2050,9 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       new_gear = gear;
     } else {
       // From -1: floor at the derived cold-start floor (heat default 1 → no-op); never gear 0.
-      int picked = pick_from_below(diff);
+      // Test-exit (from_test): pick on eff_diff (sign-mirror of cool) so the wound bias lands the
+      // load-justified gear, not a real-diff drop. Genuine user events keep the REAL-diff pick.
+      int picked = pick_from_below(from_test ? eff_diff : diff);
       if (picked >= 1) {
         new_gear = picked;
         if (gear == -1 && new_gear < heat_cold_start_floor_) new_gear = heat_cold_start_floor_;
@@ -2144,7 +2152,7 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
 }
 
 // COOLING mode pass. Returns true if it took an early (NaN-target) hold-return.
-bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
+bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input, bool from_test,
                                      float &gear_diff) {
   uint32_t time_in_gear = time_in_gear_(now);
   auto can_upshift_to = [&](int target_gear) -> bool {
@@ -2180,6 +2188,7 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   if (isnan(target)) {
     ESP_LOGW(TAG, "Cool target NaN — holding gear/CS");
     user_changed_ = user_input;  // don't consume a user event during a NaN hold
+    resume_from_test_ = from_test;  // ditto: preserve the test-exit re-pick across the hold
     publish_debug_state_(NAN);
     return true;
   }
@@ -2217,7 +2226,10 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     } else {
       // From -1: floor at the derived cold-start floor (compressor can't cold-start below it) and
       // never gear 0 (only reachable by downshift from 1). Running (user_input, gear>=0): no floor.
-      int picked = pick_from_below(diff);
+      // Test-exit (from_test): pick on eff_diff so the wound-up bias lands the load-justified gear
+      // instead of a real-diff drop (real diff can be ~0 while the load needs a top gear). Genuine
+      // user events keep the REAL-diff pick (fresh target — the reverted Round-1/2 bias-aware pick).
+      int picked = pick_from_below(from_test ? eff_diff : diff);
       if (picked >= 1) {
         new_gear = picked;
         if (gear == -1 && new_gear < cool_cold_start_floor_) new_gear = cool_cold_start_floor_;
@@ -2460,6 +2472,7 @@ void FurrionChillCube::set_test_mode(bool t) {
     // setpoint/CS re-anchor to the real HA target (failover restored — project_failover_invariant).
     test_fan_ = -1;
     user_changed_ = true;
+    resume_from_test_ = true;   // land on the bias-justified gear (eff_diff pick), not a real-diff drop
     last_gear_run_ = 0;
     ESP_LOGI(TAG, "TEST mode OFF — resuming production controller (will re-anchor next pass)");
   } else if (!test_mode_ && t) {

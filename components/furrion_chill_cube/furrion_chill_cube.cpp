@@ -172,7 +172,18 @@ static const uint32_t SETPOINT_SETTLE_MS = 2500;  // 2.5s
 static const float ADAPT_KI = 0.06f;          // bias_c (°C) per (°C-error · min). Primary tuning knob.
 static const float ADAPT_BIAS_C_MAX = 2.0f;   // authority clamp (~2-3 gears) + runaway backstop
 static const float ADAPT_DEADBAND_C = 0.15f;  // don't integrate noise / tiny offset
-static const float ADAPT_DECAY_TAU_MIN = 30.0f; // idle: forget a stale equilibrium with this time const
+// Idle decay time constant. Idle is BLIND: the compressor is off, so unlike an active gear (where a
+// stale bias self-corrects the instant load moves — the room drifts, e flips sign, the integrator
+// unwinds) there is NO feedback to catch a bias that has gone stale. This decay is the only stand-in
+// for that missing feedback, so it must run on the timescale over which the real load actually changes
+// while we're blind (HOURS), NOT the timescale of a normal cooling cycle (minutes). It is emphatically
+// NOT anti-windup. A natural glide to idle (2↔1↔0 hunts) already unwinds the bias via e<0 on the way
+// down, so the ONLY path that reaches idle with a heavily-wound bias is a discontinuity — SP jumped or
+// the unit was toggled off mid-load — where the physical load is UNCHANGED and the bias should be kept.
+// τ=30 was pathological: it sat on the cycle timescale and shed ~1/3 of a still-valid bias across a
+// ~12-min SP-nudge idle (2026-07-20 incident: re-engaged underpowered → ~1°F overshoot for ~25 min).
+// τ=180 makes short idles near-lossless (~6%/12min) while still fully forgetting an overnight idle.
+static const float ADAPT_DECAY_TAU_MIN = 180.0f; // idle memory-fade; hours, not minutes (see note above)
 static const float ADAPT_DT_CAP_MIN = 5.0f;   // clamp dt across stalls/reboots
 // Fan feedforward scale (°C eff_diff per fan-gear) is now the configurable member gear_step_c_
 // (default 0.25 = behavior-parity). ⚠️ Latent inconsistency preserved: its comment historically
@@ -1198,7 +1209,9 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   bool freeze = kickstart_active_() || fan_edge_freeze || block_up;
 
   if (idle) {
-    // Idle: forget a stale equilibrium so a re-engage doesn't inherit a wrong load.
+    // Idle is blind (no feedback) — slowly fade the stored bias on the load-change timescale (hours).
+    // A natural descent already unwound it via e<0; this only meaningfully bites a long blind idle,
+    // and near-freezes a short one so a mid-load SP-nudge/off keeps its still-valid bias. See ADAPT_DECAY_TAU_MIN.
     if (dt_min > 0.0f) bias_c_ *= expf(-dt_min / ADAPT_DECAY_TAU_MIN);
   } else if (!freeze && dt_min > 0.0f) {
     bias_c_ += ADAPT_KI * e * dt_min;
@@ -1261,7 +1274,8 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
   bool freeze = kickstart_active_() || block_up;  // no fan-edge freeze (no heat fan feedforward)
 
   if (idle) {
-    // Idle: forget a stale equilibrium so a re-engage doesn't inherit a wrong load.
+    // Idle is blind — slow memory-fade on the load-change timescale (hours); mirror of cool. See
+    // ADAPT_DECAY_TAU_MIN. ⚠️ WINTER-UNVALIDATED: shares the cool τ; not independently tuned for heat.
     if (dt_min > 0.0f) bias_h_ *= expf(-dt_min / ADAPT_DECAY_TAU_MIN);
   } else if (!freeze && dt_min > 0.0f) {
     bias_h_ += ADAPT_KI * e * dt_min;

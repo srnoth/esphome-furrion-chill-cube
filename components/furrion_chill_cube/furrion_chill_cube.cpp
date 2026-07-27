@@ -514,7 +514,7 @@ bool FurrionChillCube::transmit_mode_command_() {
   // Arm the one-shot reinforcement (fired in loop() step 3d): re-send this frame once,
   // mode_resend_delay_ms_ later (0 = disabled). Any newer mode frame re-arms, so the
   // reinforcement always carries the LATEST state (it re-reads mode/setpoint/fan at fire
-  // time). mode_resending_ keeps the reinforcement itself from re-arming — exactly two
+  // time). mode_resending_ keeps the reinforcement itself from re-arming — at most two
   // frames per change, never a chain.
   if (mode_resend_delay_ms_ > 0 && !mode_resending_ && !test_mode_) {
     mode_resend_pending_ = true;
@@ -881,20 +881,30 @@ void FurrionChillCube::loop() {
   // release resend), see reference_furrion_millis_now_footgun. Covers OFF frames too (a missed OFF
   // is the worst miss: the unit keeps running). Dropped, not deferred, under failsafe/boot — it is
   // reinforcement only, and a stale late resend is worse than none. DEFERRED (pending kept) while
-  // a setpoint debounce is in flight: firing mid-debounce would transmit the uncommitted target
-  // and stamp last_tx_setpoint_c_/last_tx_target_f_, making the settle commit see "unchanged" and
-  // skip its deliberate CS→MODE→CS bracket. The commit's own transmit re-arms with a fresh stamp;
-  // if the settle produces no transmit, the deferred resend fires then with committed state.
-  if (mode_resend_pending_ && !setpoint_pending_ &&
+  // an uncommitted setpoint is in flight — BOTH the debounce (setpoint_pending_) AND the converted
+  // commit (user_changed_, which a NaN-room grace hold preserves across passes while CS frames
+  // can't transmit): firing then would put the uncommitted target on the wire and stamp
+  // last_tx_setpoint_c_/last_tx_target_f_, making the eventual commit see "unchanged" and skip its
+  // deliberate CS→MODE→CS bracket (up to the full grace, ~5 min, of new-setpoint-vs-stale-CS).
+  // Also deferred through a maneuver's 500ms PRE_CS lead so a large-delay config can't inject a
+  // frame into the CS→mode-on choreography. NOT deferred during HOLD: a mid-HOLD fire re-reads
+  // via_fan and usefully reinforces the maneuver's own frames. Accepted leak: during an OFF-start
+  // kickstart whose quirk leaves via_fan unset, a fire can carry a user fan change that control()
+  // deliberately withholds mid-wake — all shipped OFF-entry quirks pin via_fan, so unreachable in
+  // practice. The commit's own transmit re-arms with a fresh stamp; if a deferred window ends with
+  // no transmit, the resend fires then with committed state.
+  if (mode_resend_pending_ && !setpoint_pending_ && !user_changed_ &&
+      maneuver_phase_ != ManeuverPhase::PRE_CS &&
       (millis() - mode_resend_armed_at_) >= mode_resend_delay_ms_) {
+    uint32_t elapsed = millis() - mode_resend_armed_at_;
     mode_resend_pending_ = false;
     if (boot_ready_ && !failsafe_active_) {
       mode_resending_ = true;
       bool sent = transmit_mode_command_();
       mode_resending_ = false;
       if (sent) {
-        ESP_LOGI(TAG, "Mode frame reinforced (+%lums) mode=%d fan=%d",
-                 (unsigned long) mode_resend_delay_ms_, (int) active_ir_mode_, last_tx_fan_);
+        ESP_LOGI(TAG, "Mode frame reinforced (+%lums actual) mode=%d fan=%d",
+                 (unsigned long) elapsed, (int) active_ir_mode_, last_tx_fan_);
       }
     }
   }
@@ -1044,9 +1054,15 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     auto cur_fan = this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
     fan_changed = (new_fan != cur_fan);
     this->fan_mode = new_fan;
-    if (fan_changed && active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_()) {
-      transmit_mode_command_();
-      ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)new_fan);
+    // Deferred while a setpoint debounce is in flight: transmitting here would stamp
+    // last_tx_setpoint_c_/last_tx_target_f_ with the uncommitted target (if a mid-debounce
+    // gear pass already re-anchored it), making the flushed commit below see "unchanged" and
+    // skip its CS→MODE→CS bracket. The flush's immediate gear pass delivers the fan instead
+    // (commit bracket when sp/f changed, else the maybe_apply_gear_fan_ last_tx_fan_ diff).
+    if (fan_changed && active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_() &&
+        !setpoint_pending_) {
+      bool sent = transmit_mode_command_();
+      if (sent) ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)new_fan);
     }
   }
 
@@ -1528,8 +1544,13 @@ void FurrionChillCube::send_swing_state_() {
 // gear 4 = high) needs this to reach the unit. No-op in v1-style configs (no gear sets a fan →
 // get_effective_fan_mode_() == the HA fan, which the last mode frame already carried).
 void FurrionChillCube::maybe_apply_gear_fan_(uint32_t now) {
+  // setpoint_pending_ defers, not drops: a mid-debounce transmit would stamp last_tx_setpoint_c_/
+  // last_tx_target_f_ with the uncommitted target and suppress the settle commit's CS→MODE→CS
+  // bracket (unit holds new setpoint against stale CS for up to a heartbeat). This runs every
+  // gear pass and self-retries on the last_tx_fan_ diff, so the fan goes out right after the
+  // commit — or rides the commit's own bracket.
   if (!boot_ready_ || failsafe_active_ || active_ir_mode_ == climate::CLIMATE_MODE_OFF ||
-      kickstart_active_())
+      kickstart_active_() || setpoint_pending_)
     return;
   if ((int) get_effective_fan_mode_() != last_tx_fan_) {
     transmit_mode_command_();   // carries the new fan; updates last_tx_fan_
@@ -2598,7 +2619,7 @@ void FurrionChillCube::dump_config() {
   ESP_LOGCONFIG(TAG, "  CS transmit interval: %lus (quirk %lus)",
                 (unsigned long)(cs_transmit_interval_ms_ / 1000),
                 (unsigned long)(quirk_transmit_interval_ms_ / 1000));
-  ESP_LOGCONFIG(TAG, "  Mode resend delay: %lums%s", (unsigned long) mode_resend_delay_ms_,
+  ESP_LOGCONFIG(TAG, "  Mode resend delay: %.1fs%s", mode_resend_delay_ms_ / 1000.0f,
                 mode_resend_delay_ms_ == 0 ? " (disabled)" : "");
   ESP_LOGCONFIG(TAG, "  Quirks: %d (default hold %lus)", quirk_count_,
                 (unsigned long)(quirk_duration_ms_ / 1000));

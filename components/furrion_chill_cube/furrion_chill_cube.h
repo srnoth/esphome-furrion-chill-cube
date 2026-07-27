@@ -395,7 +395,6 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool mode_resend_pending_{false};
   bool mode_resending_{false};         // reinforcement in flight — suppresses re-arm in transmit_mode_command_
 
-
   // Flags
   bool boot_ready_{false};
   bool failsafe_active_{false};

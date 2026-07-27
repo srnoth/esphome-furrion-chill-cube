@@ -53,6 +53,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_quirk_duration_ms(uint32_t ms) { quirk_duration_ms_ = ms; }
   void set_cs_transmit_interval_ms(uint32_t ms) { cs_transmit_interval_ms_ = ms; }
   void set_quirk_transmit_interval_ms(uint32_t ms) { quirk_transmit_interval_ms_ = ms; }
+  void set_mode_resend_delay_ms(uint32_t ms) { mode_resend_delay_ms_ = ms; }
   void set_gear_step_c(float c) { gear_step_c_ = c; }
 
   // Timed vane positioning (optional). Per-mode (delay, interval) in ms; 0 = unset.
@@ -382,6 +383,14 @@ class FurrionChillCube : public climate::Climate, public Component {
   // CS transmit cadence + quirk timing (all YAML-configurable)
   uint32_t cs_transmit_interval_ms_{10000};    // normal heartbeat (was fixed 30s)
   uint32_t quirk_transmit_interval_ms_{5000};  // denser re-assert during a maneuver
+  // One-shot mode-frame reinforcement: every mode frame re-sends itself once after this delay
+  // (0 = disabled, the default — preserves bit-identical default IR traffic). Mode/fan frames
+  // have no heartbeat, unlike CS frames; a single missed frame on a fan-only gear shift sticks
+  // the unit at the old operating point (2026-07-27 overcool).
+  uint32_t mode_resend_delay_ms_{0};
+  uint32_t mode_resend_armed_at_{0};   // millis() stamp of the arming frame (self-clocked timer)
+  bool mode_resend_pending_{false};
+  bool mode_resending_{false};         // reinforcement in flight — suppresses re-arm in transmit_mode_command_
   uint32_t quirk_duration_ms_{60000};          // default maneuver hold (per-quirk override)
   float gear_step_c_{0.25f};                   // fan feedforward: °C eff_diff per fan-gear
 

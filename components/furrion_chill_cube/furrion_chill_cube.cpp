@@ -510,6 +510,16 @@ void FurrionChillCube::transmit_mode_command_() {
   // transmit_mode_with_cs_), so this is the single point that keeps last_tx_fan_ current — which
   // maybe_apply_gear_fan_() diffs against to decide whether a per-gear fan change needs a new frame.
   last_tx_fan_ = (active_ir_mode_ == climate::CLIMATE_MODE_OFF) ? -1 : (int) fan;
+
+  // Arm the one-shot reinforcement (fired in loop() step 3d): re-send this frame once,
+  // mode_resend_delay_ms_ later (0 = disabled). Any newer mode frame re-arms, so the
+  // reinforcement always carries the LATEST state (it re-reads mode/setpoint/fan at fire
+  // time). mode_resending_ keeps the reinforcement itself from re-arming — exactly two
+  // frames per change, never a chain.
+  if (mode_resend_delay_ms_ > 0 && !mode_resending_ && !test_mode_) {
+    mode_resend_pending_ = true;
+    mode_resend_armed_at_ = millis();
+  }
 }
 
 void FurrionChillCube::transmit_cs_update_() {
@@ -860,6 +870,24 @@ void FurrionChillCube::loop() {
     send_swing_off();
     vane_step_active_ = false;
     ESP_LOGI(TAG, "Vane: step OFF");
+  }
+
+  // 3d. Fire the one-shot mode-frame reinforcement armed by transmit_mode_command_(). Mode/fan
+  // frames are fire-and-forget with no ack and no heartbeat (unlike CS): one missed frame on a
+  // fan-only gear shift (g3↔g4, same CS) leaves fan AND compressor at the old operating point with
+  // nothing to correct it (2026-07-27 15:36 overcool). Self-clocked on millis(), NOT loop's cached
+  // `now` — the arming transmit can happen AFTER the step-2/3 re-sample (e.g. end_maneuver_'s
+  // release resend), see reference_furrion_millis_now_footgun. Covers OFF frames too (a missed OFF
+  // is the worst miss: the unit keeps running). Dropped, not deferred, under failsafe/boot — it is
+  // reinforcement only, and a stale late resend is worse than none.
+  if (mode_resend_pending_ && (millis() - mode_resend_armed_at_) >= mode_resend_delay_ms_) {
+    mode_resend_pending_ = false;
+    if (boot_ready_ && !failsafe_active_) {
+      mode_resending_ = true;
+      transmit_mode_command_();
+      mode_resending_ = false;
+      ESP_LOGI(TAG, "Mode frame reinforced (+%lums)", (unsigned long) mode_resend_delay_ms_);
+    }
   }
 
   // 4. CS heartbeat every cs_transmit_interval_ms_ (default 10s; current_cs_ is the override CS

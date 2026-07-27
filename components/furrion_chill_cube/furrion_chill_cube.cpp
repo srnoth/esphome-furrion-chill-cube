@@ -1061,8 +1061,10 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     // Both flags: setpoint_pending_ is the normal debounce; user_changed_ is a settled-but-
     // unconsumed commit held across passes by a NaN-room grace hold — and this fan door is the
     // one transmit path live while user_changed_ is set, so it must gate on it too (mirrors the
-    // step-3d reinforcement fire). The flush re-sets user_changed_, so the fan still rides the
-    // post-grace commit's bracket — deferring here loses nothing.
+    // step-3d reinforcement fire). The flush re-sets user_changed_, so the deferred fan is
+    // delivered by the next gear pass to run — on grace-clear that pass consumes user_changed_
+    // and maybe_apply_gear_fan_ transmits it via the last_tx_fan_ diff (or the commit bracket if
+    // the setpoint also changed). Delayed at most until grace clears, never lost.
     if (fan_changed && active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_() &&
         !setpoint_pending_ && !user_changed_) {
       bool sent = transmit_mode_command_();

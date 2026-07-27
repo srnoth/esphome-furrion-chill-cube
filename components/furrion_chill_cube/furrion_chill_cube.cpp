@@ -893,10 +893,9 @@ void FurrionChillCube::loop() {
   // deliberately withholds mid-wake — all shipped OFF-entry quirks pin via_fan, so unreachable in
   // practice. The commit's own transmit re-arms with a fresh stamp; if a deferred window ends with
   // no transmit, the resend fires then with committed state.
+  uint32_t resend_elapsed = millis() - mode_resend_armed_at_;
   if (mode_resend_pending_ && !setpoint_pending_ && !user_changed_ &&
-      maneuver_phase_ != ManeuverPhase::PRE_CS &&
-      (millis() - mode_resend_armed_at_) >= mode_resend_delay_ms_) {
-    uint32_t elapsed = millis() - mode_resend_armed_at_;
+      maneuver_phase_ != ManeuverPhase::PRE_CS && resend_elapsed >= mode_resend_delay_ms_) {
     mode_resend_pending_ = false;
     if (boot_ready_ && !failsafe_active_) {
       mode_resending_ = true;
@@ -904,7 +903,7 @@ void FurrionChillCube::loop() {
       mode_resending_ = false;
       if (sent) {
         ESP_LOGI(TAG, "Mode frame reinforced (+%lums actual) mode=%d fan=%d",
-                 (unsigned long) elapsed, (int) active_ir_mode_, last_tx_fan_);
+                 (unsigned long) resend_elapsed, (int) active_ir_mode_, last_tx_fan_);
       }
     }
   }
@@ -1054,13 +1053,18 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     auto cur_fan = this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
     fan_changed = (new_fan != cur_fan);
     this->fan_mode = new_fan;
-    // Deferred while a setpoint debounce is in flight: transmitting here would stamp
+    // Deferred while a setpoint change is uncommitted: transmitting here would stamp
     // last_tx_setpoint_c_/last_tx_target_f_ with the uncommitted target (if a mid-debounce
     // gear pass already re-anchored it), making the flushed commit below see "unchanged" and
     // skip its CS→MODE→CS bracket. The flush's immediate gear pass delivers the fan instead
     // (commit bracket when sp/f changed, else the maybe_apply_gear_fan_ last_tx_fan_ diff).
+    // Both flags: setpoint_pending_ is the normal debounce; user_changed_ is a settled-but-
+    // unconsumed commit held across passes by a NaN-room grace hold — and this fan door is the
+    // one transmit path live while user_changed_ is set, so it must gate on it too (mirrors the
+    // step-3d reinforcement fire). The flush re-sets user_changed_, so the fan still rides the
+    // post-grace commit's bracket — deferring here loses nothing.
     if (fan_changed && active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_() &&
-        !setpoint_pending_) {
+        !setpoint_pending_ && !user_changed_) {
       bool sent = transmit_mode_command_();
       if (sent) ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)new_fan);
     }

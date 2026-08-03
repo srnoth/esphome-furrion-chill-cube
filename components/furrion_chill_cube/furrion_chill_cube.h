@@ -112,9 +112,11 @@ class FurrionChillCube : public climate::Climate, public Component {
   // implemented 2026-08-03). 0 (default) = OFF (bit-identical). When the room is below the cool
   // setpoint (above the heat setpoint) and a sustained fresh drift predicts an SP crossing within
   // this lead time, the controller enters gear 1 early and holds it until the crossing, so the fan
-  // is already moving air and the compressor ramps via the unit's own CS modulation instead of a
-  // late clamp-and-climb. Trigger is PREDICTED TIME-TO-CROSSING, not the SP-change event — storage
-  // mode (SP parked far away, no approach in progress) stays fully off by construction.
+  // is already moving air and running by the crossing instead of a late clamp-and-climb. OFF
+  // entries go through the NORMAL kickstart clamp (required — from-OFF start needs CS ≥ SP+1 per
+  // the 2026-07-07 characterization; no gentle cold start exists on this hardware). Trigger is
+  // PREDICTED TIME-TO-CROSSING, not the SP-change event — storage mode (SP parked far away, no
+  // approach in progress) stays fully off by construction.
   void set_approach_lead_ms(uint32_t ms) { approach_lead_ms_ = ms; }
 
   // Diagnostic sensor setters

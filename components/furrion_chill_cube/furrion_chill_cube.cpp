@@ -2260,13 +2260,13 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         new_gear = picked;
         if (gear == -1 && new_gear < heat_cold_start_floor_) new_gear = heat_cold_start_floor_;
       } else if (gear == -1 && approach_predict_heat_(diff, now)) {
-        // Approach-side early engagement from OFF — DIRECT entry bypassing the heat OFF→1 clamp
-        // (via_offset −3 = a hard heat burst above SP; sign-mirror of the cool bypass rationale).
+        // Approach-side early engagement from OFF — through the normal heat OFF→1 clamp (mirror
+        // of cool: kickstart quirks are REQUIRED for all OFF entries; see the cool comment).
         new_gear = heat_cold_start_floor_;
         approach_hold_heat_ = true;
         approach_engaged_this_pass = true;
         approach_started_at_ = now;
-        ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — direct gear-%d engagement",
+        ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — gear-%d engagement via clamp",
                  new_gear);
       } else if (gear == -1) {
         new_gear = -1;                               // stays off
@@ -2355,8 +2355,7 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     int cs = compute_gear_cs_(true, new_gear);
     if (!kickstart_active_()) {
       if (gear == -1) last_mode_event_at_ = now;
-      // Approach engagements from OFF skip the kickstart quirk (direct entry; see cool mirror).
-      const QuirkDef *q = approach_engaged_this_pass ? nullptr : find_quirk_(true, gear, new_gear);
+      const QuirkDef *q = find_quirk_(true, gear, new_gear);
       if (q != nullptr) {
         start_maneuver_(q, now);
       } else if (current_cs_ != cs) {
@@ -2536,18 +2535,20 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         new_gear = picked;
         if (gear == -1 && new_gear < cool_cold_start_floor_) new_gear = cool_cold_start_floor_;
       } else if (gear == -1 && approach_predict_cool_(diff, now)) {
-        // Approach-side early engagement from OFF — DIRECT entry, deliberately BYPASSING the
-        // OFF-entry kickstart quirk (bug-check round-1 BUG: the OFF→1 clamp commands CS=SP+3 for
-        // 305s — a hard compressor burst below SP, the opposite of airflow-first). Direct entry
-        // sends the mode-on with gear-1's own CS (below SP ≈ at/above the room), so the unit runs
-        // its fan and self-stages the compressor as the room climbs past the detent — the clamp's
-        // cold-start protection is unnecessary when nothing asks the compressor for output yet.
-        // The off-dwell lockout was already enforced above.
+        // Approach-side early engagement from OFF — through the NORMAL OFF-entry clamp, like every
+        // other cold start. HARD RULE (Stephen, 2026-08-03, after a live failure): kickstart quirks
+        // are REQUIRED for all OFF→gear changes INCLUDING approach entries. The 2026-07-07 CS
+        // characterization is unambiguous: from-OFF compressor start needs CS ≥ SP+1 (from-idle
+        // SP+0), and any start-capable CS saturates output upward — there is NO gentle cold start
+        // on this hardware. A brief "direct entry" variant (mode-on at gear-1's SP−1 CS) shipped
+        // 2026-08-03 and simply never started the compressor. The clamp's ~5-min burst below SP is
+        // accepted: an approach fires ~lead-time before a predicted crossing, so it's time-shifted
+        // cooling the room needs within minutes anyway. The off-dwell lockout was enforced above.
         new_gear = cool_cold_start_floor_;
         approach_hold_cool_ = true;
         approach_engaged_this_pass = true;
         approach_started_at_ = now;
-        ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — direct gear-%d engagement",
+        ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — gear-%d engagement via clamp",
                  new_gear);
       } else if (gear == -1) {
         new_gear = -1;                               // stays off
@@ -2651,9 +2652,7 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     int cs = compute_gear_cs_(false, new_gear);
     if (!kickstart_active_()) {
       if (gear == -1) last_mode_event_at_ = now;
-      // Approach engagements from OFF skip the kickstart quirk (direct entry — see the
-      // engagement comment); everything else runs the normal quirk lookup.
-      const QuirkDef *q = approach_engaged_this_pass ? nullptr : find_quirk_(false, gear, new_gear);
+      const QuirkDef *q = find_quirk_(false, gear, new_gear);
       if (q != nullptr) {
         start_maneuver_(q, now);
       } else if (current_cs_ != cs) {

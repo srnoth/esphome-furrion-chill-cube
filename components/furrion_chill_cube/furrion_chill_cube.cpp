@@ -82,6 +82,8 @@ static const int FURRION_MAX_TEMP_F = 86;
 // Gear controller constants — no fixed anchors; setpoint is dynamic
 
 // Per-gear upshift hold times (ms) — indexed by target gear number.
+// Standard name: MINIMUM DWELL TIMES (move constraints) for the stage sequencer —
+// the upshift-side inter-stage timers of classic staged-equipment control.
 // HOLD_MS[0] is unused (gear 0 never upshifts via can_upshift_to) but
 // kept for direct array indexing by gear number without offset.
 //                        0      1       2       3        4        5        6        7
@@ -169,7 +171,7 @@ static const uint32_t SETPOINT_SETTLE_MS = 2500;  // 2.5s
 // the current load (which is NOT observable from outside temp — bodies, the CO2 vent
 // fan, solar gain). PI control: the static ladder is the proportional inner loop; this
 // integral removes its steady-state offset. See PHASE2_ADAPTIVE_DESIGN.md.
-static const float ADAPT_KI = 0.06f;          // bias_c (°C) per (°C-error · min). Primary tuning knob.
+static const float ADAPT_KI = 0.06f;          // integral gain: bias_c (°C) per (°C-error · min). Primary tuning knob.
 static const float ADAPT_BIAS_C_MAX = 2.0f;   // authority clamp (~2-3 gears) + runaway backstop
 static const float ADAPT_DEADBAND_C = 0.15f;  // don't integrate noise / tiny offset
 // Idle decay time constant. Idle is BLIND: the compressor is off, so unlike an active gear (where a
@@ -1217,7 +1219,10 @@ float FurrionChillCube::update_room_drift_(uint32_t now) {
   return (inside_temp_c_ - base_temp) / dt_min;
 }
 
-// Phase 2 adaptive (cool): advance the integral bias (bias_c_) with anti-windup, then return
+// Phase 2 adaptive (cool) — standard name: INPUT-DISTURBANCE ESTIMATOR via integral action
+// (a crude disturbance observer with conditional-integration anti-windup); its output added to
+// the raw error forms the DEMAND SIGNAL the stage sequencer quantizes.
+// Advance the integral bias (bias_c_) with anti-windup, then return
 // the effective diff the cool ladder's ACTIVE-gear thresholds select on
 // (real_diff + bias_c_ + vent-fan feedforward). Returns real_diff unchanged when adaptive is
 // disabled. The caller uses this ONLY for switch cases 1-5 — re-engage/idle decisions stay on
@@ -2099,7 +2104,9 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
   }
 }
 
-// Approach-side predictive re-engagement (fix-setpoint-transition-integral §Deferred design).
+// Approach-side predictive re-engagement — standard name: OPTIMUM START (optimal start/stop
+// recovery, classic building-automation technique: measure the drift rate, predict time-to-
+// setpoint, start the equipment early enough to arrive at equilibrium).
 // Fires only from off/idle via the callers below; all gear machinery (off-dwell lockout,
 // OFF-entry clamps, HOLD_MS) still applies to the resulting entry. NaN drift (warmup) and NaN
 // diff can't reach here true: NaN comparisons are false.
@@ -2422,7 +2429,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   float diff = room - target;
   gear_diff = diff;  // debug always reports REAL (unbiased) diff
 
-  // Setpoint-transition detector (fix-setpoint-transition-integral, 2026-08-02). Compare the
+  // Setpoint-transition detector — standard name: REFERENCE FEEDFORWARD (two-degree-of-freedom
+  // control / setpoint weighting; Åström & Hägglund). Compare the
   // COMMITTED target against the last committed one; skip while a debounce is in flight so a
   // mid-scroll intermediate never preloads (the settled pass then sees the full delta once).
   // A NAN baseline (boot restore, mode re-entry after the !do_cool clear, failsafe, test session)
@@ -2497,7 +2505,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     }
   }
 
-  // Generalized N-gear selection (design_gear_engine_v2). M = highest configured gear. Grid trips
+  // Generalized N-gear selection — standard name: STAGE SEQUENCER (staging differentials +
+  // minimum dwell). (design_gear_engine_v2.) M = highest configured gear. Grid trips
   // come from cool_up_[]/cool_dn_[]; the 0↔1 boundary + idle are the pinned C_UP_01/C_DN_10/C_IDLE.
   int M = cool_max_gear_;
   auto entry_thresh = [&](int g) -> float { return (g <= 1) ? C_UP_01 : cool_up_[g - 1]; };

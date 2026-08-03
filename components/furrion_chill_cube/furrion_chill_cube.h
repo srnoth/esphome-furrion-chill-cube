@@ -12,6 +12,41 @@
 namespace esphome {
 namespace furrion_chill_cube {
 
+// ============================================================================
+// ARCHITECTURE — in standard control-engineering terms (see ARCHITECTURE.md)
+//
+// This component is a SUPERVISORY CASCADE CONTROLLER for a variable-speed heat
+// pump whose only actuator interface is the unit's one-way IR remote protocol
+// (the genuinely bespoke half). The control LOGIC itself is the standard
+// industrial decomposition for staged/quantized actuators:
+//
+//   continuous DEMAND SIGNAL  ──▶  STAGE SEQUENCER  ──▶  actuator command shaping
+//   (error + disturbance est.)     (gear ladder w/       (IR frames, CS detents,
+//                                   staging differentials  kickstart clamps,
+//                                   + minimum dwell)       transition quirks)
+//
+// Rosetta table — project name ⇄ standard name:
+//   gear ladder / rungs / HOLD_MS   ⇄  stage sequencer, staging differentials,
+//                                       minimum dwell times (move constraints)
+//   bias_c_ / bias_h_ ("adaptive    ⇄  input-disturbance estimate from integral
+//     bias", the slow loop)             action (a crude disturbance observer)
+//   eff_diff = diff + bias          ⇄  demand signal (error + disturbance ff)
+//   anti-windup freeze at max gear  ⇄  conditional-integration anti-windup
+//   sp_preload (setpoint change)    ⇄  reference feedforward (2-DOF control)
+//   approach_lead (early engage)    ⇄  optimum start (optimal start/stop recovery)
+//   vent-fan feedforward            ⇄  measured-disturbance feedforward
+//   room_drift_cpm_                 ⇄  rate estimate (finite-difference)
+//   mode-switch dwell / lockouts    ⇄  equipment-protection interlocks
+//   failover invariant              ⇄  fail-operational degraded mode
+//   quirks / maneuver engine        ⇄  actuator-specific command shaping (bespoke)
+//
+// What a model-based (MPC) redesign would change and why we deliberately have
+// not: see context/camper-hvac/review-mpc-alignment.md — a quantized 4-level
+// actuator with dwell constraints makes true MPC a HYBRID-MPC problem; the
+// demand-signal + stage-sequencer split above IS the standard industrial
+// answer. Planned evolution: system-ID (RC plant model) → unified disturbance
+// observer → optional shadow-mode enumerated MPC.
+// ============================================================================
 class FurrionChillCube : public climate::Climate, public Component {
  public:
   void setup() override;

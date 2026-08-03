@@ -454,7 +454,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool approach_hold_cool_{false};       // gear-1 early-engagement hold active (cool approach)
   bool approach_hold_heat_{false};       // mirror (heat approach) — ⚠️ winter-unvalidated
   uint32_t approach_started_at_{0};      // hold start (for the duration cap)
-  uint32_t approach_abort_at_{0};        // last abort (retry cooldown); 0 = none
+  uint32_t approach_abort_at_{0};        // last abort (retry cooldown); 0 = none. Shared across
+                                         // modes (a cool abort also cools heat retries) — benign:
+                                         // the heat↔cool off-dwell dominates any real switch.
   // Room-drift estimator: ring buffer of recent (timestamp ms, inside °C) samples for the
   // trailing-window slope (see DRIFT_WINDOW_MS in the .cpp). Sized to hold ~6 min at normal cadence.
   static constexpr uint8_t DRIFT_BUF_N = 48;

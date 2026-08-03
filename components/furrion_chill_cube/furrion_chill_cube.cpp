@@ -1857,6 +1857,7 @@ void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
   last_committed_heat_target_c_ = NAN;
   approach_hold_cool_ = false;
   approach_hold_heat_ = false;
+  approach_abort_at_ = 0;   // stale retry cooldowns don't survive a mode switch
   maneuver_phase_ = ManeuverPhase::IDLE;
   if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
   if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
@@ -1989,6 +1990,7 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     last_committed_heat_target_c_ = NAN;
     approach_hold_cool_ = false;          // approach holds die with them (failsafe = hands off)
     approach_hold_heat_ = false;
+    approach_abort_at_ = 0;
     idle_since_ = 0;
     last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
@@ -2104,7 +2106,10 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
 bool FurrionChillCube::approach_predict_cool_(float diff, uint32_t now) {
   if (approach_lead_ms_ == 0) return false;
   if (approach_abort_at_ != 0 && (now - approach_abort_at_) < APPROACH_RETRY_MS) return false;
-  if (!(diff < 0.0f)) return false;  // already at/above SP — normal entry imminent, nothing to stage
+  // Fire only from meaningfully BELOW the setpoint: the release boundary lives at the ladder's
+  // 1→0 rail, so firing inside the deadband would engage and release in back-to-back passes
+  // (a wasted start). Bug-check round-1 finding.
+  if (!(diff < -ADAPT_DEADBAND_C)) return false;
   bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
   if (!drift_fresh || !(room_drift_cpm_ > APPROACH_DRIFT_MIN_CPM)) return false;
   float minutes_to_cross = (-diff) / room_drift_cpm_;
@@ -2115,7 +2120,7 @@ bool FurrionChillCube::approach_predict_cool_(float diff, uint32_t now) {
 bool FurrionChillCube::approach_predict_heat_(float diff, uint32_t now) {
   if (approach_lead_ms_ == 0) return false;
   if (approach_abort_at_ != 0 && (now - approach_abort_at_) < APPROACH_RETRY_MS) return false;
-  if (!(diff > 0.0f)) return false;
+  if (!(diff > ADAPT_DEADBAND_C)) return false;  // mirror of the cool deadband fire-gate
   bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
   if (!drift_fresh || !(room_drift_cpm_ < -APPROACH_DRIFT_MIN_CPM)) return false;
   float minutes_to_cross = diff / (-room_drift_cpm_);
@@ -2199,19 +2204,23 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   int gear = heat_gear_;
   int new_gear = gear;
 
+  bool approach_engaged_this_pass = false;  // set by the two engagement sites below
+
   // Approach-hold maintenance — sign-mirror of the cool block (see run_cool_mode_ for the full
-  // rationale; ⚠️ winter-unvalidated). Crossing = room within the deadband ABOVE the heat SP.
+  // rationale; ⚠️ winter-unvalidated). Release = the heat ladder's own gear-1 band.
   if (approach_hold_heat_) {
     bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
     float mins = (room_drift_cpm_ < 0.0f) ? diff / (-room_drift_cpm_) : 1e9f;
-    if (diff <= ADAPT_DEADBAND_C) {
+    if (diff <= H_DN_10) {
+      // Release at the heat ladder's gear-1 hold boundary. Deliberately REAL-diff (H_DN_10 is the
+      // pong-pinned real-diff rail) so the release keeps the heat 1→0 semantics intact.
       approach_hold_heat_ = false;
-      ESP_LOGI(TAG, "Approach (heat): crossed SP — hold released, ladder takes over");
+      ESP_LOGI(TAG, "Approach (heat): reached ladder band — hold released, ladder takes over");
     } else if (!drift_fresh || !(room_drift_cpm_ < 0.0f) ||
                mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
-               (now - approach_started_at_) >= 3 * approach_lead_ms_) {
+               (now - approach_started_at_) / 3 >= approach_lead_ms_) {
       approach_hold_heat_ = false;
-      approach_abort_at_ = now;
+      approach_abort_at_ = (now != 0) ? now : 1;  // 0 is the "no cooldown" sentinel
       ESP_LOGI(TAG, "Approach (heat): aborted (drift died/receded or hold cap) — standing down");
     }
   }
@@ -2244,11 +2253,13 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         new_gear = picked;
         if (gear == -1 && new_gear < heat_cold_start_floor_) new_gear = heat_cold_start_floor_;
       } else if (gear == -1 && approach_predict_heat_(diff, now)) {
-        // Approach-side early engagement from OFF (mirror of cool; through the heat OFF→1 clamp).
+        // Approach-side early engagement from OFF — DIRECT entry bypassing the heat OFF→1 clamp
+        // (via_offset −3 = a hard heat burst above SP; sign-mirror of the cool bypass rationale).
         new_gear = heat_cold_start_floor_;
         approach_hold_heat_ = true;
+        approach_engaged_this_pass = true;
         approach_started_at_ = now;
-        ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — early gear-%d engagement",
+        ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — direct gear-%d engagement",
                  new_gear);
       } else if (gear == -1) {
         new_gear = -1;                               // stays off
@@ -2266,9 +2277,10 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       } else if (can_upshift_to(1) && diff < H_UP_01) {
         new_gear = 1;
       } else if (can_upshift_to(1) && approach_predict_heat_(diff, now)) {
-        // Approach-side early engagement from idle (mirror of cool).
+        // Approach-side early engagement from idle (mirror of cool; idle quirk not bypassed).
         new_gear = 1;
         approach_hold_heat_ = true;
+        approach_engaged_this_pass = true;
         approach_started_at_ = now;
         ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — early gear-1 from idle");
       }
@@ -2285,7 +2297,9 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       // Active gears 1..M: upshift on the rate-gated up_diff (colder crosses heat_up_[gear]). The
       // 1→0 STOP is pong-critical and evaluated on REAL diff (bias_h_ must not move it); gears 2+
       // downshift on eff_diff. Downshift trip = heat_stop_ (gear 1) else heat_dn_[gear-1].
-      if (gear < M && can_upshift_to(gear + 1) && up_diff < heat_up_[gear]) {
+      if (gear < M && can_upshift_to(gear + 1) && up_diff < heat_up_[gear] &&
+          !(approach_hold_heat_ && gear == 1)) {
+        // Upshift suppressed during a hold — sign-mirror of the cool pin (see run_cool_mode_).
         new_gear = gear + 1;
       } else {
         float dn = (gear == 1) ? H_DN_10 : heat_dn_[gear - 1];
@@ -2324,11 +2338,18 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   // CS + maneuver (quirk) logic — unified. A matching quirk (including the OFF→gear-1 clamped start,
   // from_gear == -1) runs the maneuver engine; otherwise set the gear CS directly. OFF→2+ has no
   // quirk by default → direct start. Any OFF→gear (gear == -1) is a fresh-start → stamp last_mode_event.
+  // Selection-exit cleanup — mirror of the cool block (see run_cool_mode_).
+  if (approach_hold_heat_ && !approach_engaged_this_pass && new_gear != 1) {
+    approach_hold_heat_ = false;
+    ESP_LOGI(TAG, "Approach (heat): selection moved gear to %d — hold released", new_gear);
+  }
+
   if (new_gear >= 0) {
     int cs = compute_gear_cs_(true, new_gear);
     if (!kickstart_active_()) {
       if (gear == -1) last_mode_event_at_ = now;
-      const QuirkDef *q = find_quirk_(true, gear, new_gear);
+      // Approach engagements from OFF skip the kickstart quirk (direct entry; see cool mirror).
+      const QuirkDef *q = approach_engaged_this_pass ? nullptr : find_quirk_(true, gear, new_gear);
       if (q != nullptr) {
         start_maneuver_(q, now);
       } else if (current_cs_ != cs) {
@@ -2446,6 +2467,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   int gear = cool_gear_;
   int new_gear = gear;
 
+  bool approach_engaged_this_pass = false;  // set by the two engagement sites below
+
   // Approach-hold maintenance (early gear-1 engagement below SP; see approach_predict_cool_).
   // Re-validated every pass from LIVE signals — no event wiring: (a) crossing (room within the
   // deadband of SP, from below) completes the mission and hands the ladder over; (b) drift dying
@@ -2458,14 +2481,18 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   if (approach_hold_cool_) {
     bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
     float mins = (room_drift_cpm_ > 0.0f) ? (-diff) / room_drift_cpm_ : 1e9f;
-    if (diff >= -ADAPT_DEADBAND_C) {
+    if (eff_diff >= C_DN_10) {
+      // Release at the ladder's OWN gear-1 hold boundary (eff-based, like the cool 1→0 rail):
+      // the handover lands exactly where the ladder would keep gear 1 running — no release-pass
+      // downshift, no extra compressor cycle, and no minimum-bias floor for a seamless handoff
+      // (bug-check round-1: releasing at the raw deadband dropped 1→0 whenever bias < ~0.3).
       approach_hold_cool_ = false;
-      ESP_LOGI(TAG, "Approach (cool): crossed SP — hold released, ladder takes over");
+      ESP_LOGI(TAG, "Approach (cool): reached ladder band — hold released, ladder takes over");
     } else if (!drift_fresh || !(room_drift_cpm_ > 0.0f) ||
                mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
-               (now - approach_started_at_) >= 3 * approach_lead_ms_) {
+               (now - approach_started_at_) / 3 >= approach_lead_ms_) {
       approach_hold_cool_ = false;
-      approach_abort_at_ = now;
+      approach_abort_at_ = (now != 0) ? now : 1;  // 0 is the "no cooldown" sentinel
       ESP_LOGI(TAG, "Approach (cool): aborted (drift died/receded or hold cap) — standing down");
     }
   }
@@ -2500,14 +2527,18 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         new_gear = picked;
         if (gear == -1 && new_gear < cool_cold_start_floor_) new_gear = cool_cold_start_floor_;
       } else if (gear == -1 && approach_predict_cool_(diff, now)) {
-        // Approach-side early engagement from OFF: enter at the cold-start floor through the
-        // normal OFF-entry clamp (fan LOW) and hold until the crossing. The off-dwell lockout
-        // was already enforced above; gear 1's CS sits below SP so the unit's own modulation
-        // stages fan→low-compressor as the room climbs — no premature full cooling.
+        // Approach-side early engagement from OFF — DIRECT entry, deliberately BYPASSING the
+        // OFF-entry kickstart quirk (bug-check round-1 BUG: the OFF→1 clamp commands CS=SP+3 for
+        // 305s — a hard compressor burst below SP, the opposite of airflow-first). Direct entry
+        // sends the mode-on with gear-1's own CS (below SP ≈ at/above the room), so the unit runs
+        // its fan and self-stages the compressor as the room climbs past the detent — the clamp's
+        // cold-start protection is unnecessary when nothing asks the compressor for output yet.
+        // The off-dwell lockout was already enforced above.
         new_gear = cool_cold_start_floor_;
         approach_hold_cool_ = true;
+        approach_engaged_this_pass = true;
         approach_started_at_ = now;
-        ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — early gear-%d engagement",
+        ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — direct gear-%d engagement",
                  new_gear);
       } else if (gear == -1) {
         new_gear = -1;                               // stays off
@@ -2534,10 +2565,11 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         // a stale bias). Summer/cool-only; revisit for heat↔cool mode hunting before fall.
         new_gear = 1;
       } else if (can_upshift_to(1) && approach_predict_cool_(diff, now)) {
-        // Approach-side early engagement from idle: same rule as the OFF path, minus the clamp
-        // (compressor recently ran; direct 0→1 is the normal idle quick-kick path).
+        // Approach-side early engagement from idle. The idle→1 quick-kick quirk (CS=SP+0) is
+        // harmless here (CS above the below-SP room → fan only), so it is NOT bypassed.
         new_gear = 1;
         approach_hold_cool_ = true;
+        approach_engaged_this_pass = true;
         approach_started_at_ = now;
         ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — early gear-1 from idle");
       }
@@ -2555,11 +2587,15 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       // Active gears 1..M select on eff_diff (= diff + adaptive bias + fan feedforward); upshifts
       // use the rate-gated up_diff. eff_diff == up_diff == diff when adaptive is off → bit-identical
       // to the static ladder. Upshift trip = cool_up_[gear]; downshift trip = dn_thresh(gear).
-      if (gear < M && can_upshift_to(gear + 1) && up_diff > cool_up_[gear]) {
+      if (gear < M && can_upshift_to(gear + 1) && up_diff > cool_up_[gear] &&
+          !(approach_hold_cool_ && gear == 1)) {
+        // Upshift suppressed during an approach hold: the room is still below SP there, and
+        // up_diff carries the retained (frozen) bias — letting it climb would run gear 2+
+        // actively cooling below setpoint off exactly the bias the freeze protects
+        // (bug-check round-1 BUG). The hold pins gear 1 in BOTH directions; the maintenance
+        // block owns every exit.
         new_gear = gear + 1;
       } else if (eff_diff < dn_thresh(gear) && !(approach_hold_cool_ && gear == 1)) {
-        // The approach hold pins gear 1 below SP (eff_diff is legitimately under the 1→0 rail
-        // there); the hold-maintenance block above owns every exit from that state.
         new_gear = gear - 1;
       }
     }
@@ -2593,11 +2629,22 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // from_gear == -1) runs the maneuver engine; otherwise set the gear CS directly. Default cool
   // quirks: OFF→MED clamp (SP+1, fan=LOW), idle→LOW (SP+0 hold), MAX→MED dip / 3→2 fan-clamp.
   // Any OFF→gear (gear == -1) is a fresh-start event → stamp last_mode_event_at_.
+  // Selection-exit cleanup (bug-check round-1): if the pass moved the gear anywhere other than
+  // the held gear (user re-pick to -1/0, etc.), the hold no longer describes reality — release it
+  // plainly (no retry cooldown: a user action superseded it, and the deadband fire-gate prevents
+  // an instant spurious re-fire). The engagement pass itself is exempt.
+  if (approach_hold_cool_ && !approach_engaged_this_pass && new_gear != 1) {
+    approach_hold_cool_ = false;
+    ESP_LOGI(TAG, "Approach (cool): selection moved gear to %d — hold released", new_gear);
+  }
+
   if (new_gear >= 0) {
     int cs = compute_gear_cs_(false, new_gear);
     if (!kickstart_active_()) {
       if (gear == -1) last_mode_event_at_ = now;
-      const QuirkDef *q = find_quirk_(false, gear, new_gear);
+      // Approach engagements from OFF skip the kickstart quirk (direct entry — see the
+      // engagement comment); everything else runs the normal quirk lookup.
+      const QuirkDef *q = approach_engaged_this_pass ? nullptr : find_quirk_(false, gear, new_gear);
       if (q != nullptr) {
         start_maneuver_(q, now);
       } else if (current_cs_ != cs) {

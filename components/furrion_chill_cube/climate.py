@@ -87,6 +87,8 @@ CONF_TEST_MODE = "test_mode"
 CONF_ADAPTIVE_ENABLE = "adaptive_enable"
 CONF_VENT_FAN = "vent_fan"
 CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
+# Setpoint-transition preload (fix-setpoint-transition-integral, 2026-08-02)
+CONF_SP_PRELOAD_FACTOR = "sp_preload_factor"
 
 
 def validate_mode_switch_temp_offset(value):
@@ -414,6 +416,13 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_VENT_FAN): cv.use_id(binary_sensor.BinarySensor),
             # Gear-equivalents of feedforward applied while the vent fan runs (field-tuned).
             cv.Optional(CONF_FAN_FEEDFORWARD_GEARS, default=1): cv.int_range(min=0, max=3),
+            # Setpoint-transition preload (default 0 = OFF = bit-identical; needs
+            # adaptive_enable — silently inert without it). Fraction of a committed user
+            # setpoint change (°C, demand direction: cool drop / heat raise) added to that
+            # mode's integral bias immediately, gated on real demand at the new target — trip
+            # data 2026-07-30..08-02 showed ~0.3 °C bias needed per °C of drop; run below that
+            # so the integral tops up the remainder (under-prediction is the safe side).
+            cv.Optional(CONF_SP_PRELOAD_FACTOR, default=0.0): cv.float_range(min=0.0, max=1.0),
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -580,6 +589,7 @@ async def to_code(config):
     # Phase 2 adaptive equilibrium-gear controller (cool mode)
     cg.add(var.set_adaptive_enable(config[CONF_ADAPTIVE_ENABLE]))
     cg.add(var.set_fan_feedforward_gears(config[CONF_FAN_FEEDFORWARD_GEARS]))
+    cg.add(var.set_sp_preload_factor(config[CONF_SP_PRELOAD_FACTOR]))
     if CONF_VENT_FAN in config:
         fan = await cg.get_variable(config[CONF_VENT_FAN])
         cg.add(var.set_vent_fan_sensor(fan))

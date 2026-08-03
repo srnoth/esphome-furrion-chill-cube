@@ -1264,6 +1264,14 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // `warming ? eff : fminf(...)` gate on cool_eff_up_diff_ below — so a wound bias can accumulate but
   // still can't force an upshift unless the room is genuinely warming. Accepted trade: a mild
   // wind-then-step as the room ticks warm, bounded by HOLD_MS (one gear/pass). Tuning this empirically.
+  // NOTE (fix-setpoint-transition-integral, 2026-08-02): a "pulldown windup window" that exempted
+  // this max-gear freeze during user SP drops was implemented and CUT in the same session's bug
+  // check: at pulldown-scale errors (e ≈ 3 °C) KI integrates at ~0.2 °C/min — a clamp-pegger, not
+  // a trim — pinning max gear until the room passes BELOW the new SP, and its arrival-close
+  // (real_diff < deadband) is unreachable on exactly the hot nights that motivated it (Fri
+  // 2026-07-31 bottomed at +0.17 °C). The SP-drop bias PRELOAD (see run_cool_mode_) is the whole
+  // fix: it supplies the bias this freeze was starving, and the freeze then correctly prevents
+  // the double-count. Do not re-add a windup exemption without a rate cap + non-arrival close.
   bool block_up = (e > 0.0f) && (cool_gear_ >= cool_max_gear_ || upshift_held);
   bool freeze = kickstart_active_() || fan_edge_freeze || block_up;
 
@@ -1329,6 +1337,8 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
   // A POSITIVE-magnitude drift reading is trusted only while fresh; NaN stays legacy-permissive.
   bool cooling = isnan(room_drift_cpm_) ||
                  (room_drift_cpm_ < -ADAPT_UPSHIFT_DRIFT_MIN_CPM && drift_fresh);
+  // NOTE: the cut "pull-up windup window" (see the cool-side note in adaptive_cool_eff_diff_)
+  // applied here too — same reasoning, sign-mirrored. The SP-raise preload replaces it.
   bool block_up = (e > 0.0f) && (heat_gear_ >= heat_max_gear_ || upshift_held || !cooling);
   bool freeze = kickstart_active_() || block_up;  // no fan-edge freeze (no heat fan feedforward)
 
@@ -1825,6 +1835,10 @@ void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
   off_since_ = now;
   bias_c_ = 0.0f;
   bias_h_ = 0.0f;
+  // Mode switch ends both control episodes: drop SP-transition baselines with the biases
+  // (a target change observed across the OFF dwell must not preload onto a zeroed bias).
+  last_committed_cool_target_c_ = NAN;
+  last_committed_heat_target_c_ = NAN;
   maneuver_phase_ = ManeuverPhase::IDLE;
   if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
   if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
@@ -1888,8 +1902,8 @@ void FurrionChillCube::run_gear_controller_() {
   // mode's bias every pass so a mode switch (or a return from full-off) starts fresh rather than
   // inheriting a stale equilibrium. (Within-mode gear-0 idle is handled by the decay in
   // adaptive_*_eff_diff_, which still runs because do_cool/do_heat stays true at gear 0.)
-  if (!do_cool) bias_c_ = 0.0f;
-  if (!do_heat) bias_h_ = 0.0f;
+  if (!do_cool) { bias_c_ = 0.0f; last_committed_cool_target_c_ = NAN; }
+  if (!do_heat) { bias_h_ = 0.0f; last_committed_heat_target_c_ = NAN; }
 
   // Boot gate: first successful gear computation enables IR
   if (!boot_ready_) {
@@ -1953,6 +1967,8 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     cool_gear_ = -1;
     bias_c_ = 0.0f;   // drop the adaptive equilibrium on failsafe — re-engage learns fresh
     bias_h_ = 0.0f;
+    last_committed_cool_target_c_ = NAN;  // SP-transition baselines die with the biases
+    last_committed_heat_target_c_ = NAN;
     idle_since_ = 0;
     last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
@@ -2068,6 +2084,7 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   // post-dispatch !do_cool clear) so it's cleared even if this pass early-returns on a NaN
   // heat target — guaranteeing a later heat→cool switch always starts from bias_c_ = 0.
   bias_c_ = 0.0f;
+  last_committed_cool_target_c_ = NAN;  // cool SP-transition state dies with its bias
 
   uint32_t time_in_gear = time_in_gear_(now);
   auto can_upshift_to = [&](int target_gear) -> bool {
@@ -2104,6 +2121,29 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   }
   float diff = room - target;
   gear_diff = diff;  // debug always reports REAL (unbiased) diff
+
+  // Setpoint-transition detector — SIGN-MIRROR of the cool one (see run_cool_mode_ for the full
+  // rationale + accepted edges). Heat demand rises on a setpoint RAISE: preload bias_h_ with a
+  // fraction of the raise, gated on real heating demand (room below the NEW target by more than
+  // the deadband). A DROP retains the bias.
+  // ⚠️ WINTER-UNVALIDATED like the rest of the heat adaptive path — structurally symmetric only.
+  if (!setpoint_pending_) {
+    if (isnan(last_committed_heat_target_c_)) {
+      last_committed_heat_target_c_ = target;
+    } else if (target != last_committed_heat_target_c_) {
+      float delta_c = target - last_committed_heat_target_c_;
+      last_committed_heat_target_c_ = target;
+      if (delta_c > 0.0f && adaptive_enable_ && sp_preload_factor_ > 0.0f &&
+          diff < -ADAPT_DEADBAND_C) {
+        float preload = sp_preload_factor_ * delta_c;
+        bias_h_ += preload;
+        if (bias_h_ > ADAPT_BIAS_C_MAX) bias_h_ = ADAPT_BIAS_C_MAX;
+        if (bias_h_ < -ADAPT_BIAS_C_MAX) bias_h_ = -ADAPT_BIAS_C_MAX;
+        ESP_LOGI(TAG, "Heat SP raise %.2fC: bias preloaded +%.2f -> %.2fC", delta_c, preload, bias_h_);
+      }
+    }
+  }
+
   // Phase 2 adaptive (heat): advance the integral and get the effective diff for the active-gear
   // switch cases. Mirror of the cool call. Re-engage/idle/mode-switch AND the pong-critical 1→0
   // STOP decision stay on real diff. Called every heat pass so the integral advances/decays.
@@ -2262,6 +2302,7 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // Cool pass: heat is not the active mode → drop its integral so a later cool→heat switch starts
   // from bias_h_ = 0 (mirror of the bias_c_ = 0 at the top of run_heat_mode_).
   bias_h_ = 0.0f;
+  last_committed_heat_target_c_ = NAN;  // heat SP-transition state dies with its bias
 
   // Pinned ladder trips (start/stop/idle). The grid trips (gear n↔n+1) are read directly from
   // cool_up_[]/cool_dn_[] (built from spacing in build_ladders_()) by the generalized selection below.
@@ -2278,6 +2319,41 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   }
   float diff = room - target;
   gear_diff = diff;  // debug always reports REAL (unbiased) diff
+
+  // Setpoint-transition detector (fix-setpoint-transition-integral, 2026-08-02). Compare the
+  // COMMITTED target against the last committed one; skip while a debounce is in flight so a
+  // mid-scroll intermediate never preloads (the settled pass then sees the full delta once).
+  // A NAN baseline (boot restore, mode re-entry after the !do_cool clear, failsafe, test session)
+  // records only — preload requires a real prior committed target within this control episode.
+  // On a user SP DROP with real cooling demand (room above the NEW target by more than the
+  // deadband): pre-load the integral with a fraction of the drop. Trip data 2026-07-30..08-02:
+  // all 3 nights needed Δbias ≈ +0.3 °C per °C of drop; the factor is set BELOW that so
+  // under-prediction — which the integral tops up at the ordinary rate — is the failure mode,
+  // never overshoot. The demand gate stops a drop-while-already-satisfied (room at/below the new
+  // SP) from banking bias that would spuriously trip the eff_diff-based 0→1 re-engage.
+  // On a RAISE: retain the bias untouched (Sat AM outperformed Fri AM precisely because the bias
+  // survived the raise — day regimes need MORE bias, sun load dominates).
+  // Accepted (bounded) edge: separately-committed drop→raise→drop re-preloads each drop (raises
+  // never unload), so an oops-toggle can double a kick — clamped at ±ADAPT_BIAS_C_MAX and unwound
+  // by the never-frozen e<0 path. NOTE: in HEAT_COOL deadband idle the !do_cool clear wipes this
+  // baseline every pass, so preload is inert in that mode (pure COOL/HEAT only — documented).
+  if (!setpoint_pending_) {
+    if (isnan(last_committed_cool_target_c_)) {
+      last_committed_cool_target_c_ = target;
+    } else if (target != last_committed_cool_target_c_) {
+      float delta_c = target - last_committed_cool_target_c_;
+      last_committed_cool_target_c_ = target;
+      if (delta_c < 0.0f && adaptive_enable_ && sp_preload_factor_ > 0.0f &&
+          diff > ADAPT_DEADBAND_C) {
+        float preload = sp_preload_factor_ * (-delta_c);
+        bias_c_ += preload;
+        if (bias_c_ > ADAPT_BIAS_C_MAX) bias_c_ = ADAPT_BIAS_C_MAX;
+        if (bias_c_ < -ADAPT_BIAS_C_MAX) bias_c_ = -ADAPT_BIAS_C_MAX;
+        ESP_LOGI(TAG, "Cool SP drop %.2fC: bias preloaded +%.2f -> %.2fC", -delta_c, preload, bias_c_);
+      }
+    }
+  }
+
   // Phase 2 adaptive: advance the integral and get the effective diff used ONLY for the
   // active-gear switch cases (1-5). Re-engage/idle/mode-switch decisions stay on real diff.
   // Called every cool pass so the integral advances (or decays while idle) consistently.
@@ -2561,6 +2637,13 @@ void FurrionChillCube::set_test_mode(bool t) {
     ESP_LOGI(TAG, "TEST mode OFF — resuming production controller (will re-anchor next pass)");
   } else if (!test_mode_ && t) {
     mode_resend_pending_ = false;  // drop a pending reinforcement — stale late resends never cross a test session
+    // test_frame rewrites target_temperature_high/low; a surviving baseline would read the
+    // test-vs-real difference as a user SP change on exit and spuriously preload. Reset both
+    // (first post-test pass records a fresh baseline). Bench note: the post-test pass records the
+    // TEST setpoint, so the user's later restore of the real SP reads as a genuine drop and (with
+    // demand) preloads onto the surviving §9d bias — bounded by the clamp, bench-only, accepted.
+    last_committed_cool_target_c_ = NAN;
+    last_committed_heat_target_c_ = NAN;
     ESP_LOGI(TAG, "TEST mode ON — production controller suspended");
   }
   test_mode_ = t;
@@ -2570,6 +2653,8 @@ void FurrionChillCube::set_test_mode(bool t) {
 void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   test_mode_ = true;          // a test frame always implies test mode
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
+  last_committed_cool_target_c_ = NAN;  // bypasses set_test_mode() — reset SP-transition state here too
+  last_committed_heat_target_c_ = NAN;
   failsafe_active_ = false;
   boot_ready_ = true;
   test_fan_ = fan;
@@ -2627,6 +2712,8 @@ void FurrionChillCube::dump_config() {
                 (unsigned long)(quirk_transmit_interval_ms_ / 1000));
   ESP_LOGCONFIG(TAG, "  Mode resend delay: %.1fs%s", mode_resend_delay_ms_ / 1000.0f,
                 mode_resend_delay_ms_ == 0 ? " (disabled)" : "");
+  ESP_LOGCONFIG(TAG, "  SP preload factor: %.2f%s", sp_preload_factor_,
+                sp_preload_factor_ == 0.0f ? " (off)" : "");
   ESP_LOGCONFIG(TAG, "  Quirks: %d (default hold %lus)", quirk_count_,
                 (unsigned long)(quirk_duration_ms_ / 1000));
   ESP_LOGCONFIG(TAG, "  Cool gears: %d (cold-start floor %d); Heat gears: %d (floor %d)",

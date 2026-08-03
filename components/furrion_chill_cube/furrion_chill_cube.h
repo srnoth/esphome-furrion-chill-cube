@@ -68,6 +68,11 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_adaptive_enable(bool enable) { adaptive_enable_ = enable; }
   void set_vent_fan_sensor(binary_sensor::BinarySensor *s) { vent_fan_sensor_ = s; }
   void set_fan_feedforward_gears(int g) { fan_feedforward_gears_ = g; }
+  // Setpoint-transition preload (fix-setpoint-transition-integral, 2026-08-02). Default 0 = OFF
+  // (bit-identical). Fraction of a committed user setpoint change (°C, demand direction) added to
+  // the active mode's integral bias, gated on real demand at the new target. (A companion
+  // "pulldown windup" option was cut in bug-check — see the note in adaptive_cool_eff_diff_.)
+  void set_sp_preload_factor(float f) { sp_preload_factor_ = f; }
 
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
@@ -423,6 +428,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   float bias_h_{0.0f};                   // integral bias (°C): eff_diff = real_diff - bias_h_ for heat
   uint32_t heat_adaptive_last_advance_{0}; // last heat integral advance (for dt) — separate from cool's
   float heat_eff_up_diff_{NAN};          // eff_diff for heat UPSHIFT decisions (bias gated out while not cooling)
+  // Setpoint-transition preload (fix-setpoint-transition-integral). last_committed_* track the
+  // last COMMITTED (post-debounce) target seen by the active mode's pass; NAN = no baseline (boot,
+  // mode re-entry, failsafe, test session) → next pass records only, never preloads. Not persisted
+  // to NVS (a reboot just re-records; the preloaded bias itself rides the existing bias save).
+  float sp_preload_factor_{0.0f};        // 0 = preload disabled (default; bit-identical)
+  float last_committed_cool_target_c_{NAN};
+  float last_committed_heat_target_c_{NAN};
   // Room-drift estimator: ring buffer of recent (timestamp ms, inside °C) samples for the
   // trailing-window slope (see DRIFT_WINDOW_MS in the .cpp). Sized to hold ~6 min at normal cadence.
   static constexpr uint8_t DRIFT_BUF_N = 48;

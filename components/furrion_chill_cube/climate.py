@@ -89,6 +89,7 @@ CONF_VENT_FAN = "vent_fan"
 CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
 # Setpoint-transition preload (fix-setpoint-transition-integral, 2026-08-02)
 CONF_SP_PRELOAD_FACTOR = "sp_preload_factor"
+CONF_APPROACH_LEAD = "approach_lead"
 
 
 def validate_mode_switch_temp_offset(value):
@@ -423,6 +424,13 @@ CONFIG_SCHEMA = cv.All(
             # data 2026-07-30..08-02 showed ~0.3 °C bias needed per °C of drop; run below that
             # so the integral tops up the remainder (under-prediction is the safe side).
             cv.Optional(CONF_SP_PRELOAD_FACTOR, default=0.0): cv.float_range(min=0.0, max=1.0),
+            # Approach-side predictive re-engagement (default 0s = OFF = bit-identical). When the
+            # room drifts toward the setpoint (sun warming toward a cool SP / envelope loss sinking
+            # toward a heat SP) and the predicted crossing is within this lead time, engage gear 1
+            # early and hold it to the crossing — airflow before stuffiness, compressor staged by
+            # the unit's own CS modulation. Trigger is predicted time-to-crossing, NOT the SP
+            # change, so storage mode (SP parked far away) stays fully off by construction.
+            cv.Optional(CONF_APPROACH_LEAD, default="0s"): cv.positive_time_period_milliseconds,
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -590,6 +598,7 @@ async def to_code(config):
     cg.add(var.set_adaptive_enable(config[CONF_ADAPTIVE_ENABLE]))
     cg.add(var.set_fan_feedforward_gears(config[CONF_FAN_FEEDFORWARD_GEARS]))
     cg.add(var.set_sp_preload_factor(config[CONF_SP_PRELOAD_FACTOR]))
+    cg.add(var.set_approach_lead_ms(config[CONF_APPROACH_LEAD].total_milliseconds))
     if CONF_VENT_FAN in config:
         fan = await cg.get_variable(config[CONF_VENT_FAN])
         cg.add(var.set_vent_fan_sensor(fan))

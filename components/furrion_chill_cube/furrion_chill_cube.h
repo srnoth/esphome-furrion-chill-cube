@@ -73,6 +73,14 @@ class FurrionChillCube : public climate::Climate, public Component {
   // the active mode's integral bias, gated on real demand at the new target. (A companion
   // "pulldown windup" option was cut in bug-check — see the note in adaptive_cool_eff_diff_.)
   void set_sp_preload_factor(float f) { sp_preload_factor_ = f; }
+  // Approach-side predictive re-engagement (fix-setpoint-transition-integral §Deferred design,
+  // implemented 2026-08-03). 0 (default) = OFF (bit-identical). When the room is below the cool
+  // setpoint (above the heat setpoint) and a sustained fresh drift predicts an SP crossing within
+  // this lead time, the controller enters gear 1 early and holds it until the crossing, so the fan
+  // is already moving air and the compressor ramps via the unit's own CS modulation instead of a
+  // late clamp-and-climb. Trigger is PREDICTED TIME-TO-CROSSING, not the SP-change event — storage
+  // mode (SP parked far away, no approach in progress) stays fully off by construction.
+  void set_approach_lead_ms(uint32_t ms) { approach_lead_ms_ = ms; }
 
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
@@ -162,6 +170,11 @@ class FurrionChillCube : public climate::Climate, public Component {
   // conditional-integration anti-windup (freeze positive accumulation behind a hold-blocked
   // upshift). Must be called once per cool pass so the integral advances/decays.
   float adaptive_cool_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear);
+  // Approach-side prediction: true when a sustained fresh drift toward the setpoint predicts a
+  // crossing within approach_lead_ms_ (cool: room below SP drifting up; heat: above, drifting
+  // down). False when the feature is off, drift is stale/weak, or the retry cooldown is active.
+  bool approach_predict_cool_(float diff, uint32_t now);
+  bool approach_predict_heat_(float diff, uint32_t now);
   // Phase 2 adaptive (heat): mirror of the cool integral with inverted sign (heat demand = -diff).
   // Advances bias_h_ with anti-windup and returns eff_diff (real_diff - bias_h_); more-negative
   // eff selects a higher heat gear. Returns real_diff unchanged when adaptive is disabled. Must be
@@ -435,6 +448,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   float sp_preload_factor_{0.0f};        // 0 = preload disabled (default; bit-identical)
   float last_committed_cool_target_c_{NAN};
   float last_committed_heat_target_c_{NAN};
+  // Approach-side predictive re-engagement state (see set_approach_lead_ms). Holds are transient
+  // (not NVS-persisted; a reboot mid-approach just re-fires the prediction on fresh drift data).
+  uint32_t approach_lead_ms_{0};         // 0 = feature disabled (default; bit-identical)
+  bool approach_hold_cool_{false};       // gear-1 early-engagement hold active (cool approach)
+  bool approach_hold_heat_{false};       // mirror (heat approach) — ⚠️ winter-unvalidated
+  uint32_t approach_started_at_{0};      // hold start (for the duration cap)
+  uint32_t approach_abort_at_{0};        // last abort (retry cooldown); 0 = none
   // Room-drift estimator: ring buffer of recent (timestamp ms, inside °C) samples for the
   // trailing-window slope (see DRIFT_WINDOW_MS in the .cpp). Sized to hold ~6 min at normal cadence.
   static constexpr uint8_t DRIFT_BUF_N = 48;

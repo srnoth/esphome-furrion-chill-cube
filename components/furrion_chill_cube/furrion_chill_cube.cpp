@@ -2335,8 +2335,9 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // survived the raise — day regimes need MORE bias, sun load dominates).
   // Accepted (bounded) edge: separately-committed drop→raise→drop re-preloads each drop (raises
   // never unload), so an oops-toggle can double a kick — clamped at ±ADAPT_BIAS_C_MAX and unwound
-  // by the never-frozen e<0 path. NOTE: in HEAT_COOL deadband idle the !do_cool clear wipes this
-  // baseline every pass, so preload is inert in that mode (pure COOL/HEAT only — documented).
+  // by the never-frozen e<0 path. NOTE: in HEAT_COOL, a both-gears-off deadband idle wipes this
+  // baseline each pass (!do_cool clear), so a drop issued across such a gap records-only; drops
+  // during an engaged cool episode preload normally, as in pure COOL.
   if (!setpoint_pending_) {
     if (isnan(last_committed_cool_target_c_)) {
       last_committed_cool_target_c_ = target;

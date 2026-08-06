@@ -197,6 +197,31 @@ static const float ADAPT_DECAY_TAU_MIN = 180.0f; // idle memory-fade; hours, not
 // hard-cap the hold at 3× lead (drift overestimated).
 static const float APPROACH_DRIFT_MIN_CPM = 0.02f;
 static const uint32_t APPROACH_RETRY_MS = 600000;  // 10 min
+// Displacement arming gate (incident 2026-08-05): approach may fire only after the room has
+// genuinely TRAVELED — risen ≥ APPROACH_ARM_RISE_C above its trailing-window trough (cool;
+// heat mirrors as fall-below-peak). Both real approach regimes clear it fast (the 08-05 midday
+// SP-raise recovery hit +1.2 °C ten minutes in, 39 min before its crossing; a morning sun ramp
+// clears within ~20–60 min), while parked-room quantization noise is zero-mean (~±0.2 °C) and
+// cannot accumulate it at ANY rate floor — rate distributions overlap (noise tail 0.077 vs
+// design ~0.09 °C/min), displacement distributions do not. Replay 2026-08-05: blocks all 15
+// evening churn engagements AND the 4 off→blast cycles. 1.2 (not 1.0) so the ~1.03 °C warm-back
+// an OFF-entry blast manufactures for itself can never re-arm the loop that made it.
+static const float APPROACH_ARM_RISE_C = 1.2f;
+static const uint32_t APPROACH_ARM_SAMPLE_MS = 300000;   // 5-min ring cadence (12 slots ≈ 60 min)
+static const uint32_t APPROACH_ARM_WINDOW_MS = 3900000;  // 65-min validity horizon per sample
+// Natural-off gate (incident 2026-08-05): idle→OFF is for a room falling below SP on its OWN.
+// A wound integral marks the sub-SP room as self-inflicted (integral lag) — hold at idle and let
+// it unwind rather than going OFF, whose only road back is a 305 s clamped cold start. Unwind at
+// gear 0 is the τ=180 min idle DECAY (the e<0 integration path only runs at active gears; a very
+// large bias ≳0.9 instead bleeds off fast through sub-SP gear-1 pulses via the eff-based 0→1
+// re-engage) — so the bias leg can hold idle for HOURS, and a room that then parks flat below SP
+// fails the drift leg too: **never-OFF is the deliberate default for a parked room** (bug-check
+// 2026-08-06, accepted — idle is quiet: compressor off, CS SP−5 heartbeat, no thermal risk). OFF
+// still fires for a genuine ambient-driven slide, on any user tap past SP, and through the
+// HEAT_COOL handoff door (opposite-mode demand bypasses both legs — see the gate blocks).
+// One NVS quantum (GEAR_PREF_BIAS_QUANTUM_C): a warm-reset-restored "effectively zero" bias
+// floors at 0.1, so a smaller eps would block OFF for ~2 h after every reboot.
+static const float NATURAL_OFF_BIAS_EPS_C = 0.1f;
 static const float ADAPT_DT_CAP_MIN = 5.0f;   // clamp dt across stalls/reboots
 // Fan feedforward scale (°C eff_diff per fan-gear) is now the configurable member gear_step_c_
 // (default 0.25 = behavior-parity). ⚠️ Latent inconsistency preserved: its comment historically
@@ -772,9 +797,11 @@ void FurrionChillCube::setup() {
         drift_buf_head_ = 0;
         drift_buf_count_ = 0;
         room_drift_cpm_ = NAN;
+        arm_ring_reset_();  // same rule for the displacement ring: never measure travel across a gap
       } else {
         inside_temp_c_ = inside_temp_fahrenheit_ ? (value - 32.0f) * (5.0f / 9.0f) : value;
         room_drift_cpm_ = update_room_drift_(cb_now);  // 3-min windowed slope (°C/min)
+        arm_ring_record_(inside_temp_c_, cb_now);      // ~60-min displacement history (approach arming)
       }
       this->current_temperature = inside_temp_c_;
       this->last_temp_update_ = cb_now;
@@ -1996,6 +2023,9 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     approach_hold_cool_ = false;          // approach holds die with them (failsafe = hands off)
     approach_hold_heat_ = false;
     approach_abort_at_ = 0;
+    arm_ring_reset_();  // unit ran itself during failsafe — its travel is machine-made, don't
+                        // let the post-recovery warm-back arm approach off it (NaN path already
+                        // resets via the callback; this covers the HA-disconnect/boot triggers)
     idle_since_ = 0;
     last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
@@ -2104,6 +2134,54 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
   }
 }
 
+// ── Displacement arming ring (see APPROACH_ARM_RISE_C) ──────────────────────────────────────
+// Recorded from the temp-sensor callback (self-clocks on the callback's millis(), like the drift
+// ring — armed outside the gear pass, per the millis-vs-now convention). Read from the gear pass
+// with its cached `now`: a sample recorded after that cache was taken underflows to a huge age and
+// is skipped — harmless, the live side of the subtraction is inside_temp_c_ itself.
+void FurrionChillCube::arm_ring_record_(float temp_c, uint32_t now) {
+  if (arm_ring_last_sample_ != 0 && (now - arm_ring_last_sample_) < APPROACH_ARM_SAMPLE_MS) return;
+  arm_ring_at_[arm_ring_head_] = now;
+  arm_ring_temp_[arm_ring_head_] = temp_c;
+  arm_ring_head_ = (uint8_t)((arm_ring_head_ + 1) % ARM_RING_N);
+  if (arm_ring_count_ < ARM_RING_N) arm_ring_count_++;
+  arm_ring_last_sample_ = now;
+}
+
+void FurrionChillCube::arm_ring_reset_() {
+  arm_ring_head_ = 0;
+  arm_ring_count_ = 0;
+  arm_ring_last_sample_ = 0;
+}
+
+// Rise of the current room temp above the trailing-window trough (°C). NAN with no valid history
+// (boot / post-sensor-gap) — every caller compares with >=, and NAN comparisons are false, so the
+// gate FAILS CLOSED (approach stays unarmed until real history exists). A partial ring is fine: a
+// shorter window only makes the gate stricter, and noise cannot fake displacement at any length.
+// The age filter also retires stale samples if recording ever stalls (test_mode, sensor quiet).
+float FurrionChillCube::arm_rise_c_(uint32_t now) {
+  if (isnan(inside_temp_c_)) return NAN;
+  float trough = NAN;
+  for (uint8_t i = 0; i < arm_ring_count_; i++) {
+    if (now - arm_ring_at_[i] > APPROACH_ARM_WINDOW_MS) continue;
+    if (isnan(trough) || arm_ring_temp_[i] < trough) trough = arm_ring_temp_[i];
+  }
+  if (isnan(trough)) return NAN;
+  return inside_temp_c_ - trough;
+}
+
+// Heat mirror: fall of the current room temp below the trailing-window peak. ⚠️ winter-unvalidated.
+float FurrionChillCube::arm_fall_c_(uint32_t now) {
+  if (isnan(inside_temp_c_)) return NAN;
+  float peak = NAN;
+  for (uint8_t i = 0; i < arm_ring_count_; i++) {
+    if (now - arm_ring_at_[i] > APPROACH_ARM_WINDOW_MS) continue;
+    if (isnan(peak) || arm_ring_temp_[i] > peak) peak = arm_ring_temp_[i];
+  }
+  if (isnan(peak)) return NAN;
+  return peak - inside_temp_c_;
+}
+
 // Approach-side predictive re-engagement — standard name: OPTIMUM START (optimal start/stop
 // recovery, classic building-automation technique: measure the drift rate, predict time-to-
 // setpoint, start the equipment early enough to arrive at equilibrium).
@@ -2113,6 +2191,9 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
 bool FurrionChillCube::approach_predict_cool_(float diff, uint32_t now) {
   if (approach_lead_ms_ == 0) return false;
   if (approach_abort_at_ != 0 && (now - approach_abort_at_) < APPROACH_RETRY_MS) return false;
+  // Displacement arming gate (incident 2026-08-05): the room must have genuinely traveled before
+  // approach is eligible at all — see APPROACH_ARM_RISE_C. NAN rise (no history) fails closed.
+  if (!(arm_rise_c_(now) >= APPROACH_ARM_RISE_C)) return false;
   // Fire only from meaningfully BELOW the setpoint: the release boundary lives at the ladder's
   // 1→0 rail, so firing inside the deadband would engage and release in back-to-back passes
   // (a wasted start). Bug-check round-1 finding.
@@ -2127,6 +2208,8 @@ bool FurrionChillCube::approach_predict_cool_(float diff, uint32_t now) {
 bool FurrionChillCube::approach_predict_heat_(float diff, uint32_t now) {
   if (approach_lead_ms_ == 0) return false;
   if (approach_abort_at_ != 0 && (now - approach_abort_at_) < APPROACH_RETRY_MS) return false;
+  // Displacement arming gate — mirror of the cool gate (fall below the windowed peak).
+  if (!(arm_fall_c_(now) >= APPROACH_ARM_RISE_C)) return false;
   if (!(diff > ADAPT_DEADBAND_C)) return false;  // mirror of the cool deadband fire-gate
   bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
   if (!drift_fresh || !(room_drift_cpm_ < -APPROACH_DRIFT_MIN_CPM)) return false;
@@ -2297,7 +2380,19 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
       bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
       bool past_setpoint = diff > mode_switch_temp_offset_c_;
+      // Natural-off gate — sign-mirror of the cool block (see run_cool_mode_ + incident
+      // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): heat full-off only when the heat integral is
+      // unwound AND the room is still actively RISING on its own — EXCEPT through the HEAT_COOL
+      // handoff door (room risen into cool's engagement territory; this mirror bites in
+      // shoulder-season mornings: sun lifts the room while bias_h_ is still wound and heat idle
+      // would otherwise lock cool out). ⚠️ winter-unvalidated, structurally symmetric only.
+      bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
+                            (room >= get_cool_target_() - mode_switch_temp_offset_c_);
+      bool bias_unwound = bias_h_ <= NATURAL_OFF_BIAS_EPS_C;
+      bool off_drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
+      bool room_rising = off_drift_fresh && (room_drift_cpm_ > APPROACH_DRIFT_MIN_CPM);
       bool natural_off = idle_enough && event_ok && past_setpoint &&
+                         (handoff_demand || (bias_unwound && room_rising)) &&
                          !approach_predict_heat_(diff, now);
       if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
     } else {
@@ -2590,7 +2685,26 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
       bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
       bool past_setpoint = diff < -mode_switch_temp_offset_c_;
+      // Natural-off gate (incident 2026-08-05, see NATURAL_OFF_BIAS_EPS_C — incl. why never-OFF
+      // is the deliberate default for a parked room): full-off is reserved for a room falling
+      // below SP on its OWN — integral unwound (a wound bias marks the sub-SP room as
+      // self-inflicted integral lag; hold at idle while the τ=180 idle decay fades it) AND the
+      // room still actively falling (fresh drift; NaN/stale fails closed → stay idle). A negative
+      // bias (over-satisfied) also counts as unwound. imm_off and the user-tap-past-SP door above
+      // are deliberately NOT gated.
+      // HEAT_COOL handoff door (bug-check 2026-08-06 CRITICAL): 0→−1 is the ONLY road to the
+      // other mode (arbitrate_mode_ pins do_heat while cool_gear_ >= 0), so when the room has
+      // fallen into heat's engagement territory the bias/drift legs MUST NOT stand in the way —
+      // else cool idles for hours (bias decay) or forever (room plateaus sub-floor) while the
+      // room goes arbitrarily cold with heat locked out. NaN heat target compares false → door
+      // stays closed in degenerate states.
+      bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
+                            (room <= get_heat_target_() + mode_switch_temp_offset_c_);
+      bool bias_unwound = bias_c_ <= NATURAL_OFF_BIAS_EPS_C;
+      bool off_drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
+      bool room_falling = off_drift_fresh && (room_drift_cpm_ < -APPROACH_DRIFT_MIN_CPM);
       bool natural_off = idle_enough && event_ok && past_setpoint &&
+                         (handoff_demand || (bias_unwound && room_falling)) &&
                          !approach_predict_cool_(diff, now);
       if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
     } else {
@@ -2817,6 +2931,10 @@ void FurrionChillCube::set_test_mode(bool t) {
     user_changed_ = true;
     resume_from_test_ = true;   // land on the bias-justified gear (eff_diff pick), not a real-diff drop
     last_gear_run_ = 0;
+    // Test sequences move the room themselves (overcool steps) — that travel is machine-made, not
+    // free, so it must not arm the approach displacement gate on exit. Same rule as the sensor-NaN
+    // reset: never measure travel across a discontinuity. First fresh sample re-seeds the trough.
+    arm_ring_reset_();
     ESP_LOGI(TAG, "TEST mode OFF — resuming production controller (will re-anchor next pass)");
   } else if (!test_mode_ && t) {
     mode_resend_pending_ = false;  // drop a pending reinforcement — stale late resends never cross a test session

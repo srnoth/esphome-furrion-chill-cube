@@ -212,6 +212,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   // down). False when the feature is off, drift is stale/weak, or the retry cooldown is active.
   bool approach_predict_cool_(float diff, uint32_t now);
   bool approach_predict_heat_(float diff, uint32_t now);
+  // Displacement arming ring (incident 2026-08-05) — approach eligibility. See the member block
+  // + APPROACH_ARM_RISE_C in the .cpp.
+  void arm_ring_record_(float temp_c, uint32_t now);
+  void arm_ring_reset_();
+  float arm_rise_c_(uint32_t now);   // current − windowed trough (NAN until history exists)
+  float arm_fall_c_(uint32_t now);   // windowed peak − current (heat mirror)
   // Phase 2 adaptive (heat): mirror of the cool integral with inverted sign (heat demand = -diff).
   // Advances bias_h_ with anti-windup and returns eff_diff (real_diff - bias_h_); more-negative
   // eff selects a higher heat gear. Returns real_diff unchanged when adaptive is disabled. Must be
@@ -494,6 +500,20 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t approach_abort_at_{0};        // last abort (retry cooldown); 0 = none. Shared across
                                          // modes (a cool abort also cools heat retries) — benign:
                                          // the heat↔cool off-dwell dominates any real switch.
+  // Displacement arming ring (incident 2026-08-05): trailing ~60 min (12 × 5-min) of inside °C.
+  // Approach is ELIGIBLE only when the room has genuinely TRAVELED — cool: risen
+  // ≥ APPROACH_ARM_RISE_C above the windowed trough (heat: fallen that far below the peak).
+  // Quantization noise is zero-mean and cannot accumulate displacement, so this separates
+  // parked-room noise from the two real approach regimes (post-SP-raise recovery, natural sun
+  // ramp) categorically — unlike any instantaneous-drift floor (2026-08-05 replay: noise rate
+  // tail 0.077 °C/min overlaps the ~0.09 design regime, but noise displacement caps ~±0.2 °C).
+  // Not NVS-persisted (like the drift ring): a reboot re-arms only on fresh real travel.
+  static constexpr uint8_t ARM_RING_N = 12;
+  uint32_t arm_ring_at_[ARM_RING_N] = {0};
+  float    arm_ring_temp_[ARM_RING_N] = {0};
+  uint8_t  arm_ring_head_{0};            // next write slot
+  uint8_t  arm_ring_count_{0};           // valid samples currently in the ring
+  uint32_t arm_ring_last_sample_{0};     // millis() of last recorded sample (0 = none yet)
   // Room-drift estimator: ring buffer of recent (timestamp ms, inside °C) samples for the
   // trailing-window slope (see DRIFT_WINDOW_MS in the .cpp). Sized to hold ~6 min at normal cadence.
   static constexpr uint8_t DRIFT_BUF_N = 48;

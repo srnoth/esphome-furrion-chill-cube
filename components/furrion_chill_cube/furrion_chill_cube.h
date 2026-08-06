@@ -118,6 +118,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   // PREDICTED TIME-TO-CROSSING, not the SP-change event — storage mode (SP parked far away, no
   // approach in progress) stays fully off by construction.
   void set_approach_lead_ms(uint32_t ms) { approach_lead_ms_ = ms; }
+  // OFF-entry lead override (Stephen 2026-08-06): an OFF-fired approach IS a 305s clamp blast
+  // (there is no gentle cold start), so its lead should equal machine readiness (clamp duration +
+  // commit latency, ~6 min) — firing it at the idle-side comfort lead lands the blast far below
+  // the SP and arrests the climb occupant-noticeably (2026-08-06 12:54 live data: fired at 66.4°F
+  // on a 69°F SP). 0 = unset → approach_lead_ms_ governs both entry states. approach_lead stays
+  // the master enable: 0 there disables the feature regardless of this value.
+  void set_approach_lead_off_ms(uint32_t ms) { approach_lead_off_ms_ = ms; }
 
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
@@ -208,10 +215,16 @@ class FurrionChillCube : public climate::Climate, public Component {
   // upshift). Must be called once per cool pass so the integral advances/decays.
   float adaptive_cool_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear);
   // Approach-side prediction: true when a sustained fresh drift toward the setpoint predicts a
-  // crossing within approach_lead_ms_ (cool: room below SP drifting up; heat: above, drifting
-  // down). False when the feature is off, drift is stale/weak, or the retry cooldown is active.
-  bool approach_predict_cool_(float diff, uint32_t now);
-  bool approach_predict_heat_(float diff, uint32_t now);
+  // crossing within lead_ms (cool: room below SP drifting up; heat: above, drifting down). The
+  // caller passes the entry-state lead: approach_off_lead_ms_() from OFF, approach_lead_ms_ from
+  // idle (and the natural-off suppressor). False when the feature is off (approach_lead_ms_ == 0,
+  // regardless of lead_ms), drift is stale/weak, or the retry cooldown is active.
+  bool approach_predict_cool_(float diff, uint32_t now, uint32_t lead_ms);
+  bool approach_predict_heat_(float diff, uint32_t now, uint32_t lead_ms);
+  // Effective OFF-entry lead: the override when set, else the shared lead.
+  uint32_t approach_off_lead_ms_() const {
+    return approach_lead_off_ms_ != 0 ? approach_lead_off_ms_ : approach_lead_ms_;
+  }
   // Displacement arming ring (incident 2026-08-05) — approach eligibility. See the member block
   // + APPROACH_ARM_RISE_C in the .cpp.
   void arm_ring_record_(float temp_c, uint32_t now);
@@ -494,8 +507,14 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Approach-side predictive re-engagement state (see set_approach_lead_ms). Holds are transient
   // (not NVS-persisted; a reboot mid-approach just re-fires the prediction on fresh drift data).
   uint32_t approach_lead_ms_{0};         // 0 = feature disabled (default; bit-identical)
+  uint32_t approach_lead_off_ms_{0};     // OFF-entry lead override; 0 = unset → approach_lead_ms_
   bool approach_hold_cool_{false};       // gear-1 early-engagement hold active (cool approach)
   bool approach_hold_heat_{false};       // mirror (heat approach) — ⚠️ winter-unvalidated
+  // Atomic clamp commitment (Stephen 2026-08-06): true while the active hold was OFF-fired. Such a
+  // hold IS its OFF-entry clamp — it lives exactly as long as the maneuver (no maintenance exits)
+  // and releases without a retry cooldown when the clamp ends. Always freshly written by both
+  // engagement sites (true from OFF, false from idle), so a stale value is never read.
+  bool approach_hold_from_off_{false};
   uint32_t approach_started_at_{0};      // hold start (for the duration cap)
   uint32_t approach_abort_at_{0};        // last abort (retry cooldown); 0 = none. Shared across
                                          // modes (a cool abort also cools heat retries) — benign:

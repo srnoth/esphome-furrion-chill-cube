@@ -90,6 +90,10 @@ CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
 # Setpoint-transition preload (fix-setpoint-transition-integral, 2026-08-02)
 CONF_SP_PRELOAD_FACTOR = "sp_preload_factor"
 CONF_APPROACH_LEAD = "approach_lead"
+# OFF-entry lead override (2026-08-06): an OFF-fired approach rides the 305s clamped start, so its
+# lead should match machine readiness (clamp + latency), not the idle-side comfort lead. Unset =
+# approach_lead applies to both entry states. approach_lead stays the master enable.
+CONF_APPROACH_LEAD_OFF = "approach_lead_off"
 
 
 def validate_mode_switch_temp_offset(value):
@@ -431,6 +435,8 @@ CONFIG_SCHEMA = cv.All(
             # the unit's own CS modulation. Trigger is predicted time-to-crossing, NOT the SP
             # change, so storage mode (SP parked far away) stays fully off by construction.
             cv.Optional(CONF_APPROACH_LEAD, default="0s"): cv.positive_time_period_milliseconds,
+            # OFF-entry lead (see CONF_APPROACH_LEAD_OFF note above). Unset = use approach_lead.
+            cv.Optional(CONF_APPROACH_LEAD_OFF): cv.positive_time_period_milliseconds,
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -599,6 +605,8 @@ async def to_code(config):
     cg.add(var.set_fan_feedforward_gears(config[CONF_FAN_FEEDFORWARD_GEARS]))
     cg.add(var.set_sp_preload_factor(config[CONF_SP_PRELOAD_FACTOR]))
     cg.add(var.set_approach_lead_ms(config[CONF_APPROACH_LEAD].total_milliseconds))
+    if CONF_APPROACH_LEAD_OFF in config:
+        cg.add(var.set_approach_lead_off_ms(config[CONF_APPROACH_LEAD_OFF].total_milliseconds))
     if CONF_VENT_FAN in config:
         fan = await cg.get_variable(config[CONF_VENT_FAN])
         cg.add(var.set_vent_fan_sensor(fan))

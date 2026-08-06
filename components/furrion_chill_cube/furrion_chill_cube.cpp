@@ -209,16 +209,18 @@ static const uint32_t APPROACH_RETRY_MS = 600000;  // 10 min
 static const float APPROACH_ARM_RISE_C = 1.2f;
 static const uint32_t APPROACH_ARM_SAMPLE_MS = 300000;   // 5-min ring cadence (12 slots ≈ 60 min)
 static const uint32_t APPROACH_ARM_WINDOW_MS = 3900000;  // 65-min validity horizon per sample
-// Natural-off gate (incident 2026-08-05): idle→OFF is for a room falling below SP on its OWN.
-// A wound integral marks the sub-SP room as self-inflicted (integral lag) — hold at idle and let
-// it unwind rather than going OFF, whose only road back is a 305 s clamped cold start. Unwind at
-// gear 0 is the τ=180 min idle DECAY (the e<0 integration path only runs at active gears; a very
-// large bias ≳0.9 instead bleeds off fast through sub-SP gear-1 pulses via the eff-based 0→1
-// re-engage) — so the bias leg can hold idle for HOURS, and a room that then parks flat below SP
-// fails the drift leg too: **never-OFF is the deliberate default for a parked room** (bug-check
-// 2026-08-06, accepted — idle is quiet: compressor off, CS SP−5 heartbeat, no thermal risk). OFF
-// still fires for a genuine ambient-driven slide, on any user tap past SP, and through the
-// HEAT_COOL handoff door (opposite-mode demand bypasses both legs — see the gate blocks).
+// Natural-off gate (incident 2026-08-05, semantics settled by Stephen 2026-08-06): idle→OFF fires
+// once the integral has wound down near zero AND the room sits past SP by the mode-switch offset
+// (~1 °F) — a wound integral marks the sub-SP room as self-inflicted (integral lag): hold at idle
+// while it unwinds rather than going OFF, whose only road back is a 305 s clamped cold start. No
+// drift condition: a room PARKED below SP−1°F with an unwound bias goes properly OFF (an early
+// "still falling" leg made never-OFF the parked-room default — rejected). A room caught mid
+// warm-back goes OFF too and re-enters through the normal above-SP clamped start — the
+// pre-approach status quo, accepted. Unwind at gear 0 is the τ=180 min idle DECAY (the e<0
+// integration path only runs at active gears; a very large bias ≳0.9 instead bleeds off fast
+// through sub-SP gear-1 pulses via the eff-based 0→1 re-engage), so the hold can still last a
+// few hours after a heavy day regime. OFF also fires on any user tap past SP and through the
+// HEAT_COOL handoff door (opposite-mode demand bypasses the bias leg — see the gate blocks).
 // One NVS quantum (GEAR_PREF_BIAS_QUANTUM_C): a warm-reset-restored "effectively zero" bias
 // floors at 0.1, so a smaller eps would block OFF for ~2 h after every reboot.
 static const float NATURAL_OFF_BIAS_EPS_C = 0.1f;
@@ -2381,18 +2383,16 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
       bool past_setpoint = diff > mode_switch_temp_offset_c_;
       // Natural-off gate — sign-mirror of the cool block (see run_cool_mode_ + incident
-      // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): heat full-off only when the heat integral is
-      // unwound AND the room is still actively RISING on its own — EXCEPT through the HEAT_COOL
-      // handoff door (room risen into cool's engagement territory; this mirror bites in
-      // shoulder-season mornings: sun lifts the room while bias_h_ is still wound and heat idle
-      // would otherwise lock cool out). ⚠️ winter-unvalidated, structurally symmetric only.
+      // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): heat full-off waits for the heat integral to be
+      // unwound (no drift leg — Stephen 2026-08-06) — EXCEPT through the HEAT_COOL handoff door
+      // (room risen into cool's engagement territory; this mirror bites in shoulder-season
+      // mornings: sun lifts the room while bias_h_ is still wound and heat idle would otherwise
+      // lock cool out). ⚠️ winter-unvalidated, structurally symmetric only.
       bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
                             (room >= get_cool_target_() - mode_switch_temp_offset_c_);
       bool bias_unwound = bias_h_ <= NATURAL_OFF_BIAS_EPS_C;
-      bool off_drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
-      bool room_rising = off_drift_fresh && (room_drift_cpm_ > APPROACH_DRIFT_MIN_CPM);
       bool natural_off = idle_enough && event_ok && past_setpoint &&
-                         (handoff_demand || (bias_unwound && room_rising)) &&
+                         (handoff_demand || bias_unwound) &&
                          !approach_predict_heat_(diff, now);
       if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
     } else {
@@ -2685,13 +2685,12 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
       bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
       bool past_setpoint = diff < -mode_switch_temp_offset_c_;
-      // Natural-off gate (incident 2026-08-05, see NATURAL_OFF_BIAS_EPS_C — incl. why never-OFF
-      // is the deliberate default for a parked room): full-off is reserved for a room falling
-      // below SP on its OWN — integral unwound (a wound bias marks the sub-SP room as
-      // self-inflicted integral lag; hold at idle while the τ=180 idle decay fades it) AND the
-      // room still actively falling (fresh drift; NaN/stale fails closed → stay idle). A negative
-      // bias (over-satisfied) also counts as unwound. imm_off and the user-tap-past-SP door above
-      // are deliberately NOT gated.
+      // Natural-off gate (incident 2026-08-05, see NATURAL_OFF_BIAS_EPS_C): full-off waits for
+      // the integral to be unwound — a wound bias marks the sub-SP room as self-inflicted
+      // integral lag; hold at idle while the τ=180 idle decay fades it. No drift leg (Stephen
+      // 2026-08-06): a parked or even recovering room below SP−offset with an unwound bias goes
+      // properly OFF. A negative bias (over-satisfied) also counts as unwound. imm_off and the
+      // user-tap-past-SP door above are deliberately NOT gated.
       // HEAT_COOL handoff door (bug-check 2026-08-06 CRITICAL): 0→−1 is the ONLY road to the
       // other mode (arbitrate_mode_ pins do_heat while cool_gear_ >= 0), so when the room has
       // fallen into heat's engagement territory the bias/drift legs MUST NOT stand in the way —
@@ -2701,10 +2700,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
                             (room <= get_heat_target_() + mode_switch_temp_offset_c_);
       bool bias_unwound = bias_c_ <= NATURAL_OFF_BIAS_EPS_C;
-      bool off_drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
-      bool room_falling = off_drift_fresh && (room_drift_cpm_ < -APPROACH_DRIFT_MIN_CPM);
       bool natural_off = idle_enough && event_ok && past_setpoint &&
-                         (handoff_demand || (bias_unwound && room_falling)) &&
+                         (handoff_demand || bias_unwound) &&
                          !approach_predict_cool_(diff, now);
       if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
     } else {

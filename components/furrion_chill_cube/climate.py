@@ -94,6 +94,9 @@ CONF_APPROACH_LEAD = "approach_lead"
 # lead should match machine readiness (clamp + latency), not the idle-side comfort lead. Unset =
 # approach_lead applies to both entry states. approach_lead stays the master enable.
 CONF_APPROACH_LEAD_OFF = "approach_lead_off"
+# Crossing preload (2026-08-10): one-shot bias floor at approach-hold → ladder handover,
+# bias = max(bias, kd × drift_at_handover). Configure the DERATED gain (0.75 × k_d≈20 ⇒ 15).
+CONF_CROSSING_PRELOAD_KD = "crossing_preload_kd"
 
 
 def validate_mode_switch_temp_offset(value):
@@ -437,6 +440,14 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_APPROACH_LEAD, default="0s"): cv.positive_time_period_milliseconds,
             # OFF-entry lead (see CONF_APPROACH_LEAD_OFF note above). Unset = use approach_lead.
             cv.Optional(CONF_APPROACH_LEAD_OFF): cv.positive_time_period_milliseconds,
+            # Crossing preload (default 0 = OFF = bit-identical; needs adaptive_enable + an
+            # approach hold to ever fire). Bias floor gain in minutes: at the moment an approach
+            # hold hands the ladder over, bias = max(bias, kd × drift_at_handover). k_d ≈ 20
+            # across four measured regimes; configure the derated value (15 = 0.75 × 20) so the
+            # floor under-predicts and the integral tops up. max() never unwinds retained bias.
+            cv.Optional(CONF_CROSSING_PRELOAD_KD, default=0.0): cv.float_range(
+                min=0.0, max=60.0
+            ),
             # Diagnostic sensors (optional)
             cv.Optional(CONF_HEAT_GEAR): sensor.sensor_schema(
                 accuracy_decimals=0,
@@ -607,6 +618,7 @@ async def to_code(config):
     cg.add(var.set_approach_lead_ms(config[CONF_APPROACH_LEAD].total_milliseconds))
     if CONF_APPROACH_LEAD_OFF in config:
         cg.add(var.set_approach_lead_off_ms(config[CONF_APPROACH_LEAD_OFF].total_milliseconds))
+    cg.add(var.set_crossing_preload_kd(config[CONF_CROSSING_PRELOAD_KD]))
     if CONF_VENT_FAN in config:
         fan = await cg.get_variable(config[CONF_VENT_FAN])
         cg.add(var.set_vent_fan_sensor(fan))

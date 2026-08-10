@@ -197,6 +197,18 @@ static const float ADAPT_DECAY_TAU_MIN = 180.0f; // idle memory-fade; hours, not
 // hard-cap the hold at 3× lead (drift overestimated).
 static const float APPROACH_DRIFT_MIN_CPM = 0.02f;
 static const uint32_t APPROACH_RETRY_MS = 600000;  // 10 min
+// Crossing-preload guards (bug-check 2026-08-10). DRIFT_CAP: the 3-min drift window can catch a
+// door/cooking transient on the one handover pass — uncapped, 0.25 °C/min × kd 15 pegs the bias
+// at the full ±2.0 authority clamp on a mild day (~20-35 min gear-climb + 1.8-2.7 °F undershoot,
+// a small cousin of the 08-05 incident shape). The highest legitimately observed handover drift
+// across all measured regimes is 0.111 (trip 2026-08-08), so 0.12 costs nothing real and bounds
+// the worst floor at kd 15 × 0.12 = 1.8. MIN_HOLD: an OFF-fired hold on a config with NO matching
+// OFF-entry quirk releases on the very next pass, sampling ~engage-time drift — the deficit-
+// recovery flux that over-predicts ~2× (2026-08-05 midday-raise finding; the reason sampling is
+// at HANDOVER). A real clamp ride is 305s+, so 120s cleanly separates the two. Idle-fired holds
+// are exempt (near-SP engagement drift ≈ load drift — the deficit flux scales with the gap).
+static const float CROSSING_PRELOAD_DRIFT_CAP_CPM = 0.12f;
+static const uint32_t CROSSING_PRELOAD_MIN_HOLD_MS = 120000;  // 2 min
 // Displacement arming gate (incident 2026-08-05): approach may fire only after the room has
 // genuinely TRAVELED — risen ≥ APPROACH_ARM_RISE_C above its trailing-window trough (cool;
 // heat mirrors as fall-below-peak). Both real approach regimes clear it fast (the 08-05 midday
@@ -2223,6 +2235,37 @@ bool FurrionChillCube::approach_predict_heat_(float diff, uint32_t now, uint32_t
   return minutes_to_cross * 60000.0f <= (float) lead_ms;
 }
 
+// Crossing preload — one-shot bias floor at approach-hold → ladder handover (see the setter note
+// in the header). The cheap special case of the review-mpc-alignment P2 disturbance observer:
+// drift at the handover pass ∝ present load / thermal mass, and equilibrium bias is the same load
+// in ladder units, so needed_bias ≈ k_d × drift with the mass cancelling (k_d ≈ 20 min, ±15%
+// across four regimes; the 0.75 derate is folded into crossing_preload_kd_). The handover-pass
+// drift is gear-1/clamp-SUPPRESSED — used deliberately: the suppression encodes the running
+// stage's share, keeping the floor an under-estimate the integral tops up. The hold freezes the
+// integral, so bias here is exactly the retained value the hold entered with.
+// Returns the bias delta applied (0 on no-op) so the call site can patch its cached eff_diff —
+// eff was computed at the top of the pass, before the hold released, and the handover pass is
+// the "single decision point"; without the patch the decision runs on the pre-floor bias and a
+// spurious 1→0 stop there costs a compressor cycle + the 0→1 dwell gate (bug-check 2026-08-10).
+float FurrionChillCube::apply_crossing_preload_(bool is_heat, uint32_t now) {
+  if (!adaptive_enable_ || crossing_preload_kd_ <= 0.0f) return 0.0f;
+  bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
+  if (!drift_fresh || isnan(room_drift_cpm_)) return 0.0f;
+  // Demand-direction drift: cool = room rising toward the cool SP; heat = falling toward heat SP.
+  float toward = is_heat ? -room_drift_cpm_ : room_drift_cpm_;
+  if (!(toward > 0.0f)) return 0.0f;
+  if (toward > CROSSING_PRELOAD_DRIFT_CAP_CPM) toward = CROSSING_PRELOAD_DRIFT_CAP_CPM;
+  float floor_b = crossing_preload_kd_ * toward;
+  if (floor_b > ADAPT_BIAS_C_MAX) floor_b = ADAPT_BIAS_C_MAX;
+  float &bias = is_heat ? bias_h_ : bias_c_;
+  if (floor_b <= bias) return 0.0f;
+  float delta = floor_b - bias;
+  ESP_LOGI(TAG, "Crossing preload (%s): handover drift %.3f C/min -> bias %.2f -> %.2f",
+           is_heat ? "heat" : "cool", toward, bias, floor_b);
+  bias = floor_b;
+  return delta;
+}
+
 // HEATING mode pass. Returns true if it took an early (NaN-target) hold-return.
 bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input, bool from_test,
                                      float &gear_diff) {
@@ -2312,6 +2355,10 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       approach_hold_heat_ = false;
       approach_hold_from_off_ = false;
       ESP_LOGI(TAG, "Approach (heat): OFF-entry clamp complete — handing off to ladder");
+      // Handover preload — mirror of the cool site (MIN_HOLD gate + same-pass eff patch; heat
+      // eff = real − bias_h_, so a raised bias_h_ LOWERS eff_diff). ⚠️ winter-unvalidated.
+      if (now - approach_started_at_ >= CROSSING_PRELOAD_MIN_HOLD_MS)
+        eff_diff -= apply_crossing_preload_(true, now);
     }
   } else if (approach_hold_heat_) {
     bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
@@ -2321,6 +2368,8 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       // pong-pinned real-diff rail) so the release keeps the heat 1→0 semantics intact.
       approach_hold_heat_ = false;
       ESP_LOGI(TAG, "Approach (heat): reached ladder band — hold released, ladder takes over");
+      // Handover preload — mirror of the cool band-release site. ⚠️ winter-unvalidated.
+      eff_diff -= apply_crossing_preload_(true, now);
     } else if (!drift_fresh || !(room_drift_cpm_ < 0.0f) ||
                mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
                (now - approach_started_at_) / 3 >= approach_lead_ms_) {
@@ -2619,6 +2668,12 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       approach_hold_cool_ = false;
       approach_hold_from_off_ = false;
       ESP_LOGI(TAG, "Approach (cool): OFF-entry clamp complete — handing off to ladder");
+      // Handover preload, gated on a real clamp ride (MIN_HOLD: a no-OFF-quirk engagement
+      // releases next pass and would sample the ~2×-over engage-time flux). eff_diff is patched
+      // with the delta so THIS pass — the single decision point — selects on the floored bias
+      // (downshift/hold legs; up_diff untouched: upshifts wait a pass, dwell-gated anyway).
+      if (now - approach_started_at_ >= CROSSING_PRELOAD_MIN_HOLD_MS)
+        eff_diff += apply_crossing_preload_(false, now);
     }
   } else if (approach_hold_cool_) {
     bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
@@ -2630,6 +2685,10 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       // (bug-check round-1: releasing at the raw deadband dropped 1→0 whenever bias < ~0.3).
       approach_hold_cool_ = false;
       ESP_LOGI(TAG, "Approach (cool): reached ladder band — hold released, ladder takes over");
+      // Handover preload (no MIN_HOLD gate: idle holds may legitimately release within a pass,
+      // and near-SP engagement drift ≈ load drift — deficit flux scales with the gap). eff_diff
+      // patched for the same-pass decision; the release condition already fired on the old value.
+      eff_diff += apply_crossing_preload_(false, now);
     } else if (!drift_fresh || !(room_drift_cpm_ > 0.0f) ||
                mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
                (now - approach_started_at_) / 3 >= approach_lead_ms_) {

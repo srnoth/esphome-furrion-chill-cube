@@ -683,6 +683,21 @@ void FurrionChillCube::send_swing_off() {
   this->transmit_raw_6byte_(CMD);
 }
 
+void FurrionChillCube::send_probe_6byte(uint8_t code) {
+  const uint8_t cmd[] = {0xB9, 0x46, 0xF5, 0x0A, code, (uint8_t) ~code};
+  ESP_LOGI(TAG, "Probe TX: B9 46 F5 0A %02X %02X", cmd[4], cmd[5]);
+  this->transmit_raw_6byte_(cmd);
+}
+
+void FurrionChillCube::resync_ir_state() {
+  if (failsafe_active_) {
+    ESP_LOGI(TAG, "Resync: skipped (failsafe active — unit runs on its own sensor)");
+    return;
+  }
+  ESP_LOGI(TAG, "Resync: re-asserting CS/mode/CS bracket");
+  this->transmit_mode_with_cs_();
+}
+
 void FurrionChillCube::send_vane_step() {
   // Step is a manual-positioning tool: meaningless while the unit is off (the vane
   // re-homes on power-on anyway, wiping any step) and while swing oscillation owns

@@ -170,6 +170,15 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Manual uniform vane nudge: pulse the physical swing ON, then OFF after
   // vane_step_duration_ms_ (non-blocking). Each press = one fixed-size step.
   void send_vane_step();
+  // Code-space probe: transmit B9 46 F5 0A <code> <~code> — the Toshiba-family raw
+  // 6-byte frame the turbo/swing/display commands above belong to. Operator mapping
+  // tool; the unit ignores unknown codes.
+  void send_probe_6byte(uint8_t code);
+  // Re-assert the full current IR state (CS→MODE→CS bracket at the held mode/SP/fan/
+  // gear). Recovery endpoint when the UNIT power-cycles but this controller doesn't
+  // (split power domains): the unit reboots into its EEPROM state and any in-flight
+  // mode/fan frame is lost, while the controller's state stays authoritative.
+  void resync_ir_state();
 
   // ── Bench test harness hooks (active only when test_mode is set) ─────────────
   // While test_mode_ is set, loop() is INERT (no gear controller / kickstart / maneuver /

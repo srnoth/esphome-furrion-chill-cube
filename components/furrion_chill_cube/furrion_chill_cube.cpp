@@ -215,9 +215,10 @@ static const uint32_t APPROACH_RETRY_MS = 600000;  // 10 min
 static const float CROSSING_PRELOAD_DRIFT_CAP_CPM = 0.12f;
 // Raise-side bias freeze horizon (Stephen 2026-08-14). A comfort raise re-crosses in tens of
 // minutes (08-14 live: 5°F raise = 40 min at ~0.07 °C/min free rise) — freeze fully across it.
-// Past this cap the interlude is an away-raise: the load regime itself may have changed, and the
-// τ=180 min blind-idle decay (which this freeze suspends) is the designed behavior — release the
-// freeze and let it resume from the frozen value.
+// Past this cap the interlude is an away-raise: the measurement is stale AND demand never
+// returned — the horizon release DISCARDS the bias (round 5; a live bias at gear 0 sub-band is
+// the 0→1 pin); a late return re-enters via the approach + crossing preload, whose charter is
+// exactly the drained-bias entry.
 static const uint32_t RAISE_FREEZE_MAX_MS = 90UL * 60UL * 1000UL;  // 90 min
 // User-tap full-OFF threshold (Stephen 2026-08-14, after the 13:28 1°F-raise incident: a raise
 // leaving the room 0.8°F below the new SP full-OFF'd via the old C_IDLE door, the displacement
@@ -1430,7 +1431,7 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
     // A natural descent already unwound it via e<0; this only meaningfully bites a long blind idle,
     // and near-freezes a short one so a mid-load SP-nudge/off keeps its still-valid bias. See ADAPT_DECAY_TAU_MIN.
     // A raise-freeze suspends even this fade — the raise interlude is measured in minutes and the
-    // load is unchanged; the horizon release above restores the fade for genuine long parks.
+    // load is unchanged; the horizon release above discards the bias entirely for genuine long parks.
     if (dt_min > 0.0f && !raise_frozen) bias_c_ *= expf(-dt_min / ADAPT_DECAY_TAU_MIN);
   } else if (!freeze && dt_min > 0.0f) {
     bias_c_ += ADAPT_KI * e * dt_min;

@@ -557,7 +557,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   // re-lives that pass; (2) an approach HANDOVER — demand re-established, bias re-lives with a
   // full-bias eff patch and the preload floor suppressed (freeze-intact bias is the trusted
   // measurement); (3) the RAISE_FREEZE_MAX_MS horizon from the FIRST arm (re-raises don't
-  // restamp) — away-raise falls back to the τ idle decay. Arms only over a bias >
+  // restamp) — the horizon DISCARDS the stale bias (round 5); late returns re-enter via
+  // approach + crossing preload. Arms only over a bias >
   // NATURAL_OFF_BIAS_EPS_C: near-zero has nothing to protect, and a NEGATIVE bias must stay
   // live (blinding it would RAISE eff right after a demand-removing command). Deliberately NOT
   // gated on sp_preload_factor_ — the freeze is integral correctness, not preload magnitude

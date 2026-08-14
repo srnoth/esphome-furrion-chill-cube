@@ -165,6 +165,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_debug_room_drift_sensor(sensor::Sensor *s) { debug_room_drift_sensor_ = s; }
   void set_debug_fan_feedforward_sensor(sensor::Sensor *s) { debug_fan_feedforward_sensor_ = s; }
   void set_debug_effective_fan_sensor(sensor::Sensor *s) { debug_effective_fan_sensor_ = s; }
+  void set_debug_raise_freeze_sensor(sensor::Sensor *s) { debug_raise_freeze_sensor_ = s; }
 
   // IR commands (public for button access)
   void send_display_toggle();
@@ -252,13 +253,14 @@ class FurrionChillCube : public climate::Climate, public Component {
   // approach-hold → ladder handover sites (atomic-clamp complete + band release, cool and heat);
   // consumes approach_entry_drift_cpm_/_at_ (one-shot — reset on use). No-op unless adaptive
   // is on, the gain is set, the snapshot runs in the demand direction, and the snapshot is no
-  // older than 2× approach_lead (marathon idle holds: the integral is the safer authority); the
-  // sample is capped at CROSSING_PRELOAD_DRIFT_CAP_CPM (door-transient guard). Returns the
-  // applied bias delta (0 on no-op) so the call site patches its cached eff_diff — the handover
-  // pass must decide on the floored bias (bug-check 2026-08-10) — EXCEPT while a raise freeze is
-  // armed, where eff is bias-blind and the call site skips the patch (the delta then updates
-  // only the stored bias, which goes live at the crossing release).
-  float apply_crossing_preload_(bool is_heat, uint32_t now);
+  // older than 2× the larger approach lead (marathon idle holds: the integral is the safer
+  // authority); the sample is capped at CROSSING_PRELOAD_DRIFT_CAP_CPM (door-transient guard).
+  // freeze_intact (the handover found the raise freeze armed and released it): consume the
+  // snapshot but SKIP the floor — the freeze-preserved bias is a direct load measurement the
+  // cap-clipped estimator must not overwrite (bug-check round 2). Returns the applied bias
+  // delta (0 on no-op); the call site patches eff_diff with the delta — or with the FULL live
+  // bias when the pass's eff was computed bias-blind under the just-released freeze.
+  float apply_crossing_preload_(bool is_heat, uint32_t now, bool freeze_intact);
   // Effective OFF-entry lead: the override when set, else the shared lead.
   uint32_t approach_off_lead_ms_() const {
     return approach_lead_off_ms_ != 0 ? approach_lead_off_ms_ : approach_lead_ms_;
@@ -370,6 +372,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *debug_room_drift_sensor_{nullptr};
   sensor::Sensor *debug_fan_feedforward_sensor_{nullptr};
   sensor::Sensor *debug_effective_fan_sensor_{nullptr};   // last-transmitted fan (0 auto/1 low/2 med/3 high, -1 off)
+  sensor::Sensor *debug_raise_freeze_sensor_{nullptr};    // 0 = none, 1 = cool freeze armed, 2 = heat freeze armed
 
   // Phase 2 adaptive input
   binary_sensor::BinarySensor *vent_fan_sensor_{nullptr};
@@ -549,10 +552,17 @@ class FurrionChillCube : public climate::Climate, public Component {
   // resumes. While armed the bias is STORED, NOT LIVE (bug-check round 1): no idle decay, no
   // integration either direction, the ladder's eff runs bias-BLIND (else the eff-based cool 0→1
   // re-engage would hunt sub-SP on the frozen value with its unwind suspended), and the
-  // natural-off gate counts the frozen bias as unwound so the unit can go properly OFF. The
-  // crossing release re-lives the bias on the pass the room reaches the band. Time-capped at
-  // RAISE_FREEZE_MAX_MS from the FIRST arm (re-raises don't restamp) so an away-raise falls back
-  // to the τ idle decay. Cleared everywhere the SP-transition baselines die (mode switch,
+  // natural-off gate counts the frozen bias as unwound so the unit can go properly OFF.
+  // THREE release points (bug-check round 2): (1) the crossing — room back in the band, bias
+  // re-lives that pass; (2) an approach HANDOVER — demand re-established, bias re-lives with a
+  // full-bias eff patch and the preload floor suppressed (freeze-intact bias is the trusted
+  // measurement); (3) the RAISE_FREEZE_MAX_MS horizon from the FIRST arm (re-raises don't
+  // restamp) — away-raise falls back to the τ idle decay. Arms only over a bias >
+  // NATURAL_OFF_BIAS_EPS_C: near-zero has nothing to protect, and a NEGATIVE bias must stay
+  // live (blinding it would RAISE eff right after a demand-removing command). Deliberately NOT
+  // gated on sp_preload_factor_ — the freeze is integral correctness, not preload magnitude
+  // (a behavior change for adaptive configs with sp_preload unset — intended).
+  // Cleared everywhere the SP-transition baselines die (mode switch,
   // failsafe, test, !do_* pass clears). ⚠️ Structurally inert in HEAT_COOL: a demand-removing
   // raise routes to gear −1, deadband arbitration then drops do_cool, and the !do_cool clear
   // zeroes bias_c_ AND this freeze on the next pass (pre-existing bias contract, not a

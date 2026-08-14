@@ -140,6 +140,7 @@ CONF_DEBUG_ADAPTIVE_BIAS_C = "debug_adaptive_bias_c"
 CONF_DEBUG_ROOM_DRIFT = "debug_room_drift"
 CONF_DEBUG_FAN_FEEDFORWARD = "debug_fan_feedforward"
 CONF_DEBUG_EFFECTIVE_FAN = "debug_effective_fan"
+CONF_DEBUG_RAISE_FREEZE = "debug_raise_freeze"
 
 # (config_key, setter_name)
 DEBUG_SENSOR_MAP = [
@@ -158,6 +159,7 @@ DEBUG_SENSOR_MAP = [
     (CONF_DEBUG_ROOM_DRIFT, "set_debug_room_drift_sensor"),
     (CONF_DEBUG_FAN_FEEDFORWARD, "set_debug_fan_feedforward_sensor"),
     (CONF_DEBUG_EFFECTIVE_FAN, "set_debug_effective_fan_sensor"),
+    (CONF_DEBUG_RAISE_FREEZE, "set_debug_raise_freeze_sensor"),
 ]
 
 _DEBUG_SENSOR = sensor.sensor_schema(
@@ -196,6 +198,8 @@ _DEBUG_SCHEMAS = {
     CONF_DEBUG_ROOM_DRIFT: _DEBUG_SENSOR_DRIFT,
     CONF_DEBUG_FAN_FEEDFORWARD: _DEBUG_SENSOR,
     CONF_DEBUG_EFFECTIVE_FAN: _DEBUG_SENSOR,
+    # 0 = no raise freeze armed, 1 = cool freeze armed, 2 = heat freeze armed (2026-08-14)
+    CONF_DEBUG_RAISE_FREEZE: _DEBUG_SENSOR,
 }
 
 
@@ -487,6 +491,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_DEBUG_ROOM_DRIFT): _DEBUG_SENSOR_DRIFT,
             cv.Optional(CONF_DEBUG_FAN_FEEDFORWARD): _DEBUG_SENSOR,
             cv.Optional(CONF_DEBUG_EFFECTIVE_FAN): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_RAISE_FREEZE): _DEBUG_SENSOR,
             # Buttons (optional)
             cv.Optional(CONF_DISPLAY_TOGGLE): button.button_schema(
                 DisplayToggleButton,

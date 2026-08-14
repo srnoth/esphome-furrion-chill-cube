@@ -572,6 +572,16 @@ class FurrionChillCube : public climate::Climate, public Component {
   // restores the saved bias but resumes normal decay — conservative, self-correcting. 0 = inactive.
   uint32_t raise_freeze_c_at_{0};        // cool-side freeze armed at (cached-now ms)
   uint32_t raise_freeze_h_at_{0};        // heat mirror — ⚠️ winter-unvalidated
+  // User-OFF bias parking (Stephen 2026-08-14, pool incident 13:50→13:57: a 7-min user OFF
+  // zeroed a 1.5 bias into a max-load afternoon — gear 4 reached only at +3°F): climate mode
+  // OFF PARKS the biases (values kept, this stamp set) instead of zeroing; the first pass back
+  // in a mode applies the elapsed τ=ADAPT_DECAY_TAU_MIN blind-idle decay one-shot, so long
+  // absences converge to the old zero-restart naturally (3 h → ×0.37). Shared single stamp —
+  // consumed by whichever mode runs first; cross-clears zero the other bias regardless.
+  // Cleared wherever both biases are zeroed (failsafe, force-off, test). Not NVS-persisted:
+  // a reboot while OFF restores the saved bias undecayed — matches existing reboot semantics.
+  // 0 = not parked.
+  uint32_t bias_parked_at_{0};
   // Crossing-preload drift snapshot: room_drift_cpm_ captured at approach ENGAGEMENT (the
   // trailing 3-min free-rise slope — compressor-free load signal; gear 0 is fan-only and OFF is
   // off, so both entry states qualify), with its capture time in _at_ (0 = none; age-bounded at

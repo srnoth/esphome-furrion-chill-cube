@@ -219,6 +219,19 @@ static const float CROSSING_PRELOAD_DRIFT_CAP_CPM = 0.12f;
 // τ=180 min blind-idle decay (which this freeze suspends) is the designed behavior — release the
 // freeze and let it resume from the frozen value.
 static const uint32_t RAISE_FREEZE_MAX_MS = 90UL * 60UL * 1000UL;  // 90 min
+// User-tap full-OFF threshold (Stephen 2026-08-14, after the 13:28 1°F-raise incident: a raise
+// leaving the room 0.8°F below the new SP full-OFF'd via the old C_IDLE door, the displacement
+// gate then blocked the approach — 0.8°F travel < 1.2 °C — and the unit sat OFF through the
+// crossing to a naked +0.63°F kickstart, peaking +1.2°F). A user SP change goes full OFF only
+// when it leaves the room MORE than this past the new setpoint; anything closer parks at gear 0
+// on the normal ladder (fan on, 30 s idle re-engage at the crossing — with the raise freeze the
+// bias is preserved and re-lives there). 1.5 = largest single UI step (1.0 °C) + hunt-band depth
+// (~0.5 °C): a single-step adjustment can NEVER full-OFF the unit, in °F or °C. ⚠️ INVARIANT:
+// must stay ≥ APPROACH_ARM_RISE_C (1.2) — an OFF this deep guarantees ≥1.2 °C of return travel,
+// so the displacement gate always arms and every user-tap OFF is approach-covered. Full OFF for
+// extended parks is the natural-off gate's job, not this door's (Stephen: "off is for extended
+// periods, not a 1-step raise on a max-cooling afternoon").
+static const float USER_TAP_OFF_MIN_PAST_C = 1.5f;
 // Displacement arming gate (incident 2026-08-05): approach may fire only after the room has
 // genuinely TRAVELED — risen ≥ APPROACH_ARM_RISE_C above its trailing-window trough (cool;
 // heat mirrors as fall-below-peak). Both real approach regimes clear it fast (the 08-05 midday
@@ -1303,6 +1316,19 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
     return real_diff;
   }
 
+  // User-OFF bias parking resume (see bias_parked_at_): first cool pass after a mode-OFF gap
+  // applies the elapsed blind-idle decay one-shot — 7 min → ×0.96, 3 h → ×0.37, so long parks
+  // converge to the old zero-restart naturally. millis wrap beyond ~49.7 days under-decays;
+  // bounded by the real-diff entry pick + live e<0 unwind, accepted.
+  if (bias_parked_at_ != 0) {
+    float off_min = (now - bias_parked_at_) / 60000.0f;
+    float pre = bias_c_;
+    bias_c_ *= expf(-off_min / ADAPT_DECAY_TAU_MIN);
+    bias_parked_at_ = 0;
+    if (pre > NATURAL_OFF_BIAS_EPS_C)
+      ESP_LOGI(TAG, "Bias (cool) resumed after %.0f min OFF: %.2f -> %.2f", off_min, pre, bias_c_);
+  }
+
   // dt since last advance, clamped (first pass, stalls, mode gaps, millis wrap-after-reboot)
   float dt_min = 0.0f;
   if (adaptive_last_advance_ != 0) {
@@ -1433,6 +1459,18 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
     heat_adaptive_last_advance_ = now;  // keep dt fresh so a later enable doesn't see a huge gap
     heat_eff_up_diff_ = real_diff;      // no bias → upshift path is the static ladder (bit-identical)
     return real_diff;
+  }
+
+  // User-OFF bias parking resume — mirror of the cool block (the shared stamp is consumed by
+  // whichever mode runs first after the OFF; the cross-clears zero the other bias anyway).
+  // ⚠️ winter-unvalidated.
+  if (bias_parked_at_ != 0) {
+    float off_min = (now - bias_parked_at_) / 60000.0f;
+    float pre = bias_h_;
+    bias_h_ *= expf(-off_min / ADAPT_DECAY_TAU_MIN);
+    bias_parked_at_ = 0;
+    if (pre > NATURAL_OFF_BIAS_EPS_C)
+      ESP_LOGI(TAG, "Bias (heat) resumed after %.0f min OFF: %.2f -> %.2f", off_min, pre, bias_h_);
   }
 
   // dt since last advance, clamped (first pass, stalls, mode gaps, millis wrap-after-reboot)
@@ -1992,6 +2030,7 @@ void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
   last_committed_heat_target_c_ = NAN;
   raise_freeze_c_at_ = 0;
   raise_freeze_h_at_ = 0;
+  bias_parked_at_ = 0;   // biases zeroed above — nothing left to park
   approach_hold_cool_ = false;
   approach_hold_heat_ = false;
   approach_hold_from_off_ = false;
@@ -2064,17 +2103,31 @@ void FurrionChillCube::run_gear_controller_() {
   // mode's bias every pass so a mode switch (or a return from full-off) starts fresh rather than
   // inheriting a stale equilibrium. (Within-mode gear-0 idle is handled by the decay in
   // adaptive_*_eff_diff_, which still runs because do_cool/do_heat stays true at gear 0.)
+  // EXCEPTION — user-OFF bias PARKING (Stephen 2026-08-14, pool incident 13:50→13:57: a 7-min
+  // user OFF zeroed bias 1.5 and the max-load re-entry climbed from gear 1, hitting gear 4 only
+  // at +3°F): mode OFF is a SUSPENDED episode, not a new one — park the biases (keep values,
+  // stamp the time) and let the first pass back apply the elapsed blind-idle decay one-shot (see
+  // adaptive_*_eff_diff_). Heat↔cool cross-clears, HEAT_COOL deadband idle, failsafe and test
+  // keep zeroing as before — only a true mode-OFF parks.
   // Log a freeze wiped by mode exit (bug-check round 3): otherwise a HEAT_COOL raise logs an arm
   // with no matching release and reads as a freeze that vanished mid-flight in the watch data.
+  bool user_off = (this->mode == climate::CLIMATE_MODE_OFF);
+  if (user_off && bias_parked_at_ == 0 && (bias_c_ != 0.0f || bias_h_ != 0.0f)) {
+    bias_parked_at_ = (now != 0) ? now : 1;
+    ESP_LOGI(TAG, "Mode OFF: bias parked (cool %.2f / heat %.2f) — resumes with elapsed decay",
+             bias_c_, bias_h_);
+  }
   if (!do_cool) {
     if (raise_freeze_c_at_ != 0)
       ESP_LOGI(TAG, "Raise freeze (cool): mode left cool — freeze and bias cleared");
-    bias_c_ = 0.0f; last_committed_cool_target_c_ = NAN; approach_hold_cool_ = false; raise_freeze_c_at_ = 0;
+    if (!user_off) bias_c_ = 0.0f;
+    last_committed_cool_target_c_ = NAN; approach_hold_cool_ = false; raise_freeze_c_at_ = 0;
   }
   if (!do_heat) {
     if (raise_freeze_h_at_ != 0)
       ESP_LOGI(TAG, "Raise freeze (heat): mode left heat — freeze and bias cleared");
-    bias_h_ = 0.0f; last_committed_heat_target_c_ = NAN; approach_hold_heat_ = false; raise_freeze_h_at_ = 0;
+    if (!user_off) bias_h_ = 0.0f;
+    last_committed_heat_target_c_ = NAN; approach_hold_heat_ = false; raise_freeze_h_at_ = 0;
   }
 
   // Boot gate: first successful gear computation enables IR
@@ -2143,6 +2196,7 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     last_committed_heat_target_c_ = NAN;
     raise_freeze_c_at_ = 0;               // raise freezes die with them (zeroed bias, nothing to hold)
     raise_freeze_h_at_ = 0;
+    bias_parked_at_ = 0;                  // parked bias dies too (failsafe = hands off, learn fresh)
     approach_hold_cool_ = false;          // approach holds die with them (failsafe = hands off)
     approach_hold_heat_ = false;
     approach_entry_drift_cpm_ = NAN;
@@ -2604,8 +2658,8 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
                  new_gear);
       } else if (gear == -1) {
         new_gear = -1;                               // stays off
-      } else if (user_input && diff > H_IDLE) {
-        new_gear = -1;                               // user tap past setpoint → off
+      } else if (user_input && diff > USER_TAP_OFF_MIN_PAST_C) {
+        new_gear = -1;   // user tap FAR past setpoint → off (mirror; ⚠️ winter-unvalidated)
       } else {
         new_gear = 0;
       }
@@ -3010,8 +3064,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
                  new_gear);
       } else if (gear == -1) {
         new_gear = -1;                               // stays off
-      } else if (user_input && diff < C_IDLE) {
-        new_gear = -1;                               // user tap past setpoint → off
+      } else if (user_input && diff < -USER_TAP_OFF_MIN_PAST_C) {
+        new_gear = -1;   // user tap FAR past setpoint → off (approach-covered by construction)
       } else {
         new_gear = 0;
       }
@@ -3328,6 +3382,7 @@ void FurrionChillCube::set_test_mode(bool t) {
     last_committed_heat_target_c_ = NAN;
     raise_freeze_c_at_ = 0;   // raise freezes are SP-transition state — die with the baselines
     raise_freeze_h_at_ = 0;
+    bias_parked_at_ = 0;
     approach_hold_cool_ = false;
     approach_hold_heat_ = false;
     approach_hold_from_off_ = false;
@@ -3349,6 +3404,7 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   last_committed_heat_target_c_ = NAN;
   raise_freeze_c_at_ = 0;
   raise_freeze_h_at_ = 0;
+  bias_parked_at_ = 0;
   approach_hold_cool_ = false;
   approach_hold_heat_ = false;
   approach_hold_from_off_ = false;

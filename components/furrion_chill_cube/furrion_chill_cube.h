@@ -125,11 +125,16 @@ class FurrionChillCube : public climate::Climate, public Component {
   // on a 69°F SP). 0 = unset → approach_lead_ms_ governs both entry states. approach_lead stays
   // the master enable: 0 there disables the feature regardless of this value.
   void set_approach_lead_off_ms(uint32_t ms) { approach_lead_off_ms_ = ms; }
-  // Crossing preload (fix-setpoint-transition-integral §Deferred design 2, built 2026-08-10).
-  // One-shot bias floor at approach-hold → ladder handover: bias = max(bias, kd × drift), with
-  // drift sampled at the HANDOVER pass — NOT approach engage (engage-time drift measures the
-  // deficit-recovery flux and over-predicts ~2×; 2026-08-05 midday-raise finding). The configured
-  // value is the DERATED gain (0.75 × k_d≈20 ⇒ 15): under-predict, the integral tops up. max()
+  // Crossing preload (fix-setpoint-transition-integral §Deferred design 2, built 2026-08-10;
+  // sampling point REVERSED 2026-08-14). One-shot bias floor at approach-hold → ladder handover:
+  // bias = max(bias, kd × drift), with drift SNAPSHOTTED AT APPROACH ENGAGEMENT — the trailing
+  // 3-min free-rise slope, the cleanest compressor-free measure of the thermal load (Stephen
+  // 2026-08-14). The original build sampled the HANDOVER pass instead (2026-08-05 finding:
+  // engage-time drift "over-predicts ~2×"), but the first live payoff case (08-14 morning,
+  // SP 64→69 raise) showed the handover sample degenerates to ZERO whenever the OFF-entry clamp
+  // blast arrests the rise — the floor no-ops exactly when it's needed, while the over-read
+  // failure was already bounded by CROSSING_PRELOAD_DRIFT_CAP_CPM. The configured value is the
+  // DERATED gain (0.75 × k_d≈20 ⇒ 15): under-predict, the integral tops up. max()
   // ⇒ retained bias is never unwound (trip 08-08/08-09 backtest: near-no-op both mornings, by
   // design — the payoff case is the unwound-bias morning after a long park). Fires ONLY at hold
   // handover; natural 0→1 re-entries are EXCLUDED — a hunt re-engages every ~15-25 min and a
@@ -242,14 +247,15 @@ class FurrionChillCube : public climate::Climate, public Component {
   // regardless of lead_ms), drift is stale/weak, or the retry cooldown is active.
   bool approach_predict_cool_(float diff, uint32_t now, uint32_t lead_ms);
   bool approach_predict_heat_(float diff, uint32_t now, uint32_t lead_ms);
-  // Crossing preload: one-shot bias floor from handover-pass drift (see set_crossing_preload_kd).
-  // Called only at the four approach-hold → ladder handover sites (atomic-clamp complete + band
-  // release, cool and heat; atomic sites additionally gated on CROSSING_PRELOAD_MIN_HOLD_MS).
-  // No-op unless adaptive is on, the gain is set, and fresh drift runs in the demand direction;
-  // the sample is capped at CROSSING_PRELOAD_DRIFT_CAP_CPM (door-transient guard). Returns the
-  // applied bias delta (0 on no-op) so the call site patches its cached eff_diff — the handover
-  // pass must decide on the floored bias (bug-check 2026-08-10).
-  float apply_crossing_preload_(bool is_heat, uint32_t now);
+  // Crossing preload: one-shot bias floor from the ENGAGEMENT-snapshotted free-rise drift (see
+  // set_crossing_preload_kd — sampling point reversed 2026-08-14). Called only at the four
+  // approach-hold → ladder handover sites (atomic-clamp complete + band release, cool and heat);
+  // consumes approach_entry_drift_cpm_ (one-shot — reset to NAN on use). No-op unless adaptive
+  // is on, the gain is set, and the snapshot runs in the demand direction; the sample is capped
+  // at CROSSING_PRELOAD_DRIFT_CAP_CPM (door-transient guard). Returns the applied bias delta
+  // (0 on no-op) so the call site patches its cached eff_diff — the handover pass must decide
+  // on the floored bias (bug-check 2026-08-10).
+  float apply_crossing_preload_(bool is_heat);
   // Effective OFF-entry lead: the override when set, else the shared lead.
   uint32_t approach_off_lead_ms_() const {
     return approach_lead_off_ms_ != 0 ? approach_lead_off_ms_ : approach_lead_ms_;
@@ -533,6 +539,23 @@ class FurrionChillCube : public climate::Climate, public Component {
   float sp_preload_factor_{0.0f};        // 0 = preload disabled (default; bit-identical)
   float last_committed_cool_target_c_{NAN};
   float last_committed_heat_target_c_{NAN};
+  // Raise-side bias freeze (Stephen 2026-08-14): a committed demand-REMOVING setpoint change
+  // (cool raise / heat drop) with the room outside the deadband on the satisfied side parks the
+  // unit below (above) the new SP while the load is unchanged — the retained bias IS the load
+  // measurement, so freeze it (no idle decay, no engineered-e unwind) until the room re-crosses
+  // into the band, where normal integration resumes. Time-capped at RAISE_FREEZE_MAX_MS so an
+  // away-raise (hours-long park, load regime genuinely changes) falls back to the τ idle decay.
+  // Cleared everywhere the SP-transition baselines die (mode switch, failsafe, test, !do_* pass
+  // clears). Not NVS-persisted: a reboot mid-freeze restores the saved bias but resumes normal
+  // decay — conservative, self-correcting. 0 = inactive.
+  uint32_t raise_freeze_c_at_{0};        // cool-side freeze armed at (cached-now ms)
+  uint32_t raise_freeze_h_at_{0};        // heat mirror — ⚠️ winter-unvalidated
+  // Crossing-preload drift snapshot: room_drift_cpm_ captured at approach ENGAGEMENT (the
+  // trailing 3-min free-rise slope — compressor-free load signal; gear 0 is fan-only and OFF is
+  // off, so both entry states qualify). Consumed (reset to NAN) by apply_crossing_preload_ at
+  // handover; overwritten by every new engagement, so an aborted hold's stale value is never
+  // applied. NAN = no snapshot.
+  float approach_entry_drift_cpm_{NAN};
   // Approach-side predictive re-engagement state (see set_approach_lead_ms). Holds are transient
   // (not NVS-persisted; a reboot mid-approach just re-fires the prediction on fresh drift data).
   uint32_t approach_lead_ms_{0};         // 0 = feature disabled (default; bit-identical)

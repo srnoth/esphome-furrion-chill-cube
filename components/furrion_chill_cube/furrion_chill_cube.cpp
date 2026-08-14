@@ -2481,8 +2481,11 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         // bias until the room falls back to the band — sign-mirror of the cool raise freeze
         // (Stephen 2026-08-14). Positive-bias arm gate + first-arm time kept on re-drops (see
         // the cool site). ⚠️ winter-unvalidated.
-        // Expired-but-unreleased freeze counts as unarmed — mirror of the cool site.
+        // Expired-but-unreleased freeze counts as unarmed — mirror of the cool site, incl. the
+        // settle-the-suspended-decay-before-re-arm step (round 4).
         if (raise_freeze_h_at_ == 0 || (now - raise_freeze_h_at_) >= RAISE_FREEZE_MAX_MS) {
+          if (raise_freeze_h_at_ != 0)
+            bias_h_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
           raise_freeze_h_at_ = (now != 0) ? now : 1;
           ESP_LOGI(TAG, "Heat SP drop %.2fC: bias %.2f frozen until crossing (cap %lu min)",
                    -delta_c, bias_h_, (unsigned long)(RAISE_FREEZE_MAX_MS / 60000UL));
@@ -2837,7 +2840,11 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         // an unconditional restamp would let 1°F nudges extend the freeze indefinitely.
         // An EXPIRED-but-not-yet-released freeze counts as unarmed (bug-check round 3): the
         // release check runs later in this pass and would swallow the fresh raise otherwise.
+        // Settle the elapsed horizon's suspended decay before re-arming (round 4) — otherwise
+        // the restamp forgives it and the bias rides a second full horizon undecayed.
         if (raise_freeze_c_at_ == 0 || (now - raise_freeze_c_at_) >= RAISE_FREEZE_MAX_MS) {
+          if (raise_freeze_c_at_ != 0)
+            bias_c_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
           raise_freeze_c_at_ = (now != 0) ? now : 1;
           ESP_LOGI(TAG, "Cool SP raise %.2fC: bias %.2f frozen until crossing (cap %lu min)",
                    delta_c, bias_c_, (unsigned long)(RAISE_FREEZE_MAX_MS / 60000UL));
@@ -3348,6 +3355,7 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   approach_entry_drift_cpm_ = NAN;
   approach_entry_drift_at_ = 0;
   failsafe_active_ = false;
+  publish_debug_state_(NAN);  // bypasses set_test_mode() — publish the cleared state here too
   boot_ready_ = true;
   test_fan_ = fan;
   if (mode == 0) {

@@ -566,7 +566,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   // failsafe, test, !do_* pass clears). ⚠️ Usually short-circuited in HEAT_COOL: a raise big
   // enough to route to gear −1 hits deadband arbitration, whose !do_cool clear zeroes bias_c_
   // AND this freeze one pass later (pre-existing bias contract; logged since round 3). But a
-  // raise landing diff in [cool_idle_, −deadband) parks at gear 0, which PINS do_cool — that
+  // raise landing diff in [−USER_TAP_OFF_MIN_PAST_C, −deadband) parks at gear 0, which PINS
+  // do_cool (round-5 note: the 1.5 door widened this band ~5× vs the old C_IDLE door, so a
+  // HEAT_COOL cool-raise can hold heat locked out for the ≥10-min natural-off wait + fall time
+  // — bounded, shoulder-season only, watch item) — that
   // freeze runs its full course even in HEAT_COOL. Fully protective in pure COOL / pure HEAT.
   // Not NVS-persisted: a reboot mid-freeze
   // restores the saved bias but resumes normal decay — conservative, self-correcting. 0 = inactive.
@@ -578,9 +581,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   // in a mode applies the elapsed τ=ADAPT_DECAY_TAU_MIN blind-idle decay one-shot, so long
   // absences converge to the old zero-restart naturally (3 h → ×0.37). Shared single stamp —
   // consumed by whichever mode runs first; cross-clears zero the other bias regardless.
-  // Cleared wherever both biases are zeroed (failsafe, force-off, test). Not NVS-persisted:
-  // a reboot while OFF restores the saved bias undecayed — matches existing reboot semantics.
-  // 0 = not parked.
+  // Parks only a bias > NATURAL_OFF_BIAS_EPS_C (round 5): negative/near-zero biases keep the
+  // old zeroing — "it's cold in here" OFFs carry a negative bias, and resuming one sabotages
+  // the from-OFF cold start. Stamp cleared at failsafe + force-off (which also zero the biases),
+  // at the test teardowns (stamp only), and at any !do_* wipe with the mode not OFF. A reboot
+  // while OFF LOSES the parked bias (the OFF pass saved mode 0, so setup() skips the whole
+  // restore; ESP8266 persists nothing regardless) — same as the pre-parking zeroing, fail-safe
+  // direction. 0 = not parked.
   uint32_t bias_parked_at_{0};
   // Crossing-preload drift snapshot: room_drift_cpm_ captured at approach ENGAGEMENT (the
   // trailing 3-min free-rise slope — compressor-free load signal; gear 0 is fan-only and OFF is

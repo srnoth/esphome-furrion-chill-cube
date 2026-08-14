@@ -231,7 +231,7 @@ static const uint32_t RAISE_FREEZE_MAX_MS = 90UL * 60UL * 1000UL;  // 90 min
 // so the displacement gate always arms and every user-tap OFF is approach-covered. Full OFF for
 // extended parks is the natural-off gate's job, not this door's (Stephen: "off is for extended
 // periods, not a 1-step raise on a max-cooling afternoon").
-static const float USER_TAP_OFF_MIN_PAST_C = 1.5f;
+static constexpr float USER_TAP_OFF_MIN_PAST_C = 1.5f;
 // Displacement arming gate (incident 2026-08-05): approach may fire only after the room has
 // genuinely TRAVELED — risen ≥ APPROACH_ARM_RISE_C above its trailing-window trough (cool;
 // heat mirrors as fall-below-peak). Both real approach regimes clear it fast (the 08-05 midday
@@ -241,7 +241,15 @@ static const float USER_TAP_OFF_MIN_PAST_C = 1.5f;
 // design ~0.09 °C/min), displacement distributions do not. Replay 2026-08-05: blocks all 15
 // evening churn engagements AND the 4 off→blast cycles. 1.2 (not 1.0) so the ~1.03 °C warm-back
 // an OFF-entry blast manufactures for itself can never re-arm the loop that made it.
-static const float APPROACH_ARM_RISE_C = 1.2f;
+static constexpr float APPROACH_ARM_RISE_C = 1.2f;
+// Enforce the door/arm-gate coverage invariant (see USER_TAP_OFF_MIN_PAST_C). Caveat (round 5):
+// the arm gate measures rise above a SLIDING 65-min trough, so depth guarantees the distance,
+// not that it is traversed inside the window — at drift ≳ APPROACH_DRIFT_MIN_CPM the margin is
+// thin but positive (0.02 × 65 = 1.3 > 1.2); a stop-start return near the drift floor can still
+// miss displacement and take a naked (+C_UP_01) start — bounded, at that drift barely an
+// overshoot.
+static_assert(USER_TAP_OFF_MIN_PAST_C >= APPROACH_ARM_RISE_C,
+              "user-tap OFF must guarantee arm-gate travel (approach-covered OFFs)");
 static const uint32_t APPROACH_ARM_SAMPLE_MS = 300000;   // 5-min ring cadence (12 slots ≈ 60 min)
 static const uint32_t APPROACH_ARM_WINDOW_MS = 3900000;  // 65-min validity horizon per sample
 // Natural-off gate (incident 2026-08-05, semantics settled by Stephen 2026-08-06): idle→OFF fires
@@ -1325,6 +1333,7 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
     float pre = bias_c_;
     bias_c_ *= expf(-off_min / ADAPT_DECAY_TAU_MIN);
     bias_parked_at_ = 0;
+    adaptive_last_advance_ = now;  // the one-shot covered the whole gap — don't decay it twice
     if (pre > NATURAL_OFF_BIAS_EPS_C)
       ESP_LOGI(TAG, "Bias (cool) resumed after %.0f min OFF: %.2f -> %.2f", off_min, pre, bias_c_);
   }
@@ -1392,18 +1401,20 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // ladder acts on the bias below SP, the unwind is the anti-pin safety valve — if the gear
   // arrests the rise, the bias was oversized for the NEW setpoint and the drain is genuine
   // correction, not loss. The freeze protects only the no-compressor interlude, where drain is
-  // pure loss. Horizon release applies the decay the freeze suspended — parity with the
-  // no-freeze path (an away-raise would have τ-decayed through the interlude). Both checks run
-  // BEFORE the freeze is applied, so a released pass integrates/decays normally.
+  // pure loss. Horizon release DISCARDS the bias (round 5, superseding round 3's decay-parity):
+  // by construction the horizon only fires with the room still below the band (else the crossing
+  // release won), and any live bias at gear 0 there re-engages sub-SP via the eff-based 0→1 —
+  // the exact pin this freeze exists to prevent — while also blocking natural-off. Expired ⇒
+  // the measurement is stale AND demand never returned: zero it; a late return re-enters through
+  // the approach + crossing preload, whose charter is exactly the drained-bias entry. Both
+  // checks run BEFORE the freeze is applied, so a released pass integrates/decays normally.
   if (raise_freeze_c_at_ != 0) {
     if (real_diff >= -ADAPT_DEADBAND_C) {
       ESP_LOGI(TAG, "Raise freeze (cool): crossing reached — bias %.2f preserved", bias_c_);
       raise_freeze_c_at_ = 0;
     } else if ((now - raise_freeze_c_at_) >= RAISE_FREEZE_MAX_MS) {
-      float pre = bias_c_;
-      bias_c_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
-      ESP_LOGI(TAG, "Raise freeze (cool): horizon expired — bias %.2f -> %.2f (suspended decay applied), idle decay resumes",
-               pre, bias_c_);
+      ESP_LOGI(TAG, "Raise freeze (cool): horizon expired sub-band — stale bias %.2f discarded", bias_c_);
+      bias_c_ = 0.0f;
       raise_freeze_c_at_ = 0;
     }
   }
@@ -1469,6 +1480,7 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
     float pre = bias_h_;
     bias_h_ *= expf(-off_min / ADAPT_DECAY_TAU_MIN);
     bias_parked_at_ = 0;
+    heat_adaptive_last_advance_ = now;  // gap covered by the one-shot — no double decay
     if (pre > NATURAL_OFF_BIAS_EPS_C)
       ESP_LOGI(TAG, "Bias (heat) resumed after %.0f min OFF: %.2f -> %.2f", off_min, pre, bias_h_);
   }
@@ -1511,11 +1523,9 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
       ESP_LOGI(TAG, "Raise freeze (heat): crossing reached — bias %.2f preserved", bias_h_);
       raise_freeze_h_at_ = 0;
     } else if ((now - raise_freeze_h_at_) >= RAISE_FREEZE_MAX_MS) {
-      // Horizon release applies the suspended decay — parity with the no-freeze path (see cool).
-      float pre = bias_h_;
-      bias_h_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
-      ESP_LOGI(TAG, "Raise freeze (heat): horizon expired — bias %.2f -> %.2f (suspended decay applied), idle decay resumes",
-               pre, bias_h_);
+      // Horizon discards the stale bias — mirror of cool (round 5). ⚠️ winter-unvalidated.
+      ESP_LOGI(TAG, "Raise freeze (heat): horizon expired sub-band — stale bias %.2f discarded", bias_h_);
+      bias_h_ = 0.0f;
       raise_freeze_h_at_ = 0;
     }
   }
@@ -2112,23 +2122,35 @@ void FurrionChillCube::run_gear_controller_() {
   // Log a freeze wiped by mode exit (bug-check round 3): otherwise a HEAT_COOL raise logs an arm
   // with no matching release and reads as a freeze that vanished mid-flight in the watch data.
   bool user_off = (this->mode == climate::CLIMATE_MODE_OFF);
-  if (user_off && bias_parked_at_ == 0 && (bias_c_ != 0.0f || bias_h_ != 0.0f)) {
+  // Park only a bias worth preserving (bug-check round 5, mirror of the raise-freeze arm gate):
+  // "it's cold in here" is the most common user-OFF trigger — exactly when the bias is NEGATIVE
+  // — and resuming a negative bias sabotages the from-OFF cold start (eff drops below the gear-1
+  // stop rail one pass into the 305 s clamp). Negative/near-zero biases keep the old zeroing.
+  if (user_off && bias_parked_at_ == 0 &&
+      (bias_c_ > NATURAL_OFF_BIAS_EPS_C || bias_h_ > NATURAL_OFF_BIAS_EPS_C)) {
     bias_parked_at_ = (now != 0) ? now : 1;
     ESP_LOGI(TAG, "Mode OFF: bias parked (cool %.2f / heat %.2f) — resumes with elapsed decay",
              bias_c_, bias_h_);
   }
+  bool parked = user_off && (bias_parked_at_ != 0);
   if (!do_cool) {
     if (raise_freeze_c_at_ != 0)
-      ESP_LOGI(TAG, "Raise freeze (cool): mode left cool — freeze and bias cleared");
-    if (!user_off) bias_c_ = 0.0f;
+      ESP_LOGI(TAG, "Raise freeze (cool): mode left cool — freeze cleared, bias %s",
+               parked ? "parked" : "cleared");
+    if (!parked) bias_c_ = 0.0f;
     last_committed_cool_target_c_ = NAN; approach_hold_cool_ = false; raise_freeze_c_at_ = 0;
   }
   if (!do_heat) {
     if (raise_freeze_h_at_ != 0)
-      ESP_LOGI(TAG, "Raise freeze (heat): mode left heat — freeze and bias cleared");
-    if (!user_off) bias_h_ = 0.0f;
+      ESP_LOGI(TAG, "Raise freeze (heat): mode left heat — freeze cleared, bias %s",
+               parked ? "parked" : "cleared");
+    if (!parked) bias_h_ = 0.0f;
     last_committed_heat_target_c_ = NAN; approach_hold_heat_ = false; raise_freeze_h_at_ = 0;
   }
+  // Fifth stamp-clear site (round 5): a HEAT_COOL deadband wipe (user_off false) zeroes the
+  // biases above — a surviving stamp would be consumed later against a zeroed bias (harmless
+  // today, but only by coincidence of ordering; make it structural).
+  if (!user_off) bias_parked_at_ = 0;
 
   // Boot gate: first successful gear computation enables IR
   if (!boot_ready_) {
@@ -2535,11 +2557,14 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         // bias until the room falls back to the band — sign-mirror of the cool raise freeze
         // (Stephen 2026-08-14). Positive-bias arm gate + first-arm time kept on re-drops (see
         // the cool site). ⚠️ winter-unvalidated.
-        // Expired-but-unreleased freeze counts as unarmed — mirror of the cool site, incl. the
-        // settle-the-suspended-decay-before-re-arm step (round 4).
-        if (raise_freeze_h_at_ == 0 || (now - raise_freeze_h_at_) >= RAISE_FREEZE_MAX_MS) {
-          if (raise_freeze_h_at_ != 0)
-            bias_h_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
+        // Expired-but-unreleased freeze settled inline — mirror of the cool site (rounds 3-5):
+        // stale bias discarded, no re-arm over the zeroed value.
+        if (raise_freeze_h_at_ != 0 && (now - raise_freeze_h_at_) >= RAISE_FREEZE_MAX_MS) {
+          ESP_LOGI(TAG, "Heat SP drop %.2fC at expired freeze — stale bias %.2f discarded",
+                   -delta_c, bias_h_);
+          bias_h_ = 0.0f;
+          raise_freeze_h_at_ = 0;
+        } else if (raise_freeze_h_at_ == 0) {
           raise_freeze_h_at_ = (now != 0) ? now : 1;
           ESP_LOGI(TAG, "Heat SP drop %.2fC: bias %.2f frozen until crossing (cap %lu min)",
                    -delta_c, bias_h_, (unsigned long)(RAISE_FREEZE_MAX_MS / 60000UL));
@@ -2892,13 +2917,16 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         // Keep the FIRST arm time on a re-raise mid-freeze (bug-check round 1): the horizon
         // bounds the age of the frozen bias MEASUREMENT, which repeated raises don't refresh —
         // an unconditional restamp would let 1°F nudges extend the freeze indefinitely.
-        // An EXPIRED-but-not-yet-released freeze counts as unarmed (bug-check round 3): the
-        // release check runs later in this pass and would swallow the fresh raise otherwise.
-        // Settle the elapsed horizon's suspended decay before re-arming (round 4) — otherwise
-        // the restamp forgives it and the bias rides a second full horizon undecayed.
-        if (raise_freeze_c_at_ == 0 || (now - raise_freeze_c_at_) >= RAISE_FREEZE_MAX_MS) {
-          if (raise_freeze_c_at_ != 0)
-            bias_c_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
+        // An EXPIRED-but-not-yet-released freeze is settled inline (rounds 3-5): the horizon
+        // release runs later in this pass and would swallow the fresh raise otherwise. Expired ⇒
+        // stale measurement — discard it (mirror of the horizon release) and DON'T re-arm over
+        // the zeroed bias; the outer gate's already-armed leg no longer applies.
+        if (raise_freeze_c_at_ != 0 && (now - raise_freeze_c_at_) >= RAISE_FREEZE_MAX_MS) {
+          ESP_LOGI(TAG, "Cool SP raise %.2fC at expired freeze — stale bias %.2f discarded",
+                   delta_c, bias_c_);
+          bias_c_ = 0.0f;
+          raise_freeze_c_at_ = 0;
+        } else if (raise_freeze_c_at_ == 0) {
           raise_freeze_c_at_ = (now != 0) ? now : 1;
           ESP_LOGI(TAG, "Cool SP raise %.2fC: bias %.2f frozen until crossing (cap %lu min)",
                    delta_c, bias_c_, (unsigned long)(RAISE_FREEZE_MAX_MS / 60000UL));
@@ -3325,8 +3353,13 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   // Phase 2 adaptive observability
   // Publish the ACTIVE mode's adaptive bias (the inactive mode's is held at 0). During heat this
   // shows bias_h_; during cool, bias_c_ — so the one debug sensor tracks whichever loop is live.
+  // While OFF, fall back to the LAST active mode so a parked heat bias stays visible (round 5;
+  // a parked cool bias was already visible via the else-branch default).
   pub(debug_adaptive_bias_c_sensor_,
-      (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? bias_h_ : bias_c_);
+      (active_ir_mode_ == climate::CLIMATE_MODE_HEAT ||
+       (active_ir_mode_ == climate::CLIMATE_MODE_OFF && last_active_mode_ == MODE_HEAT))
+          ? bias_h_
+          : bias_c_);
   pub(debug_room_drift_sensor_, room_drift_cpm_);
   // Raise-freeze liveness (2026-08-14): while armed the bias sensor above shows the STORED value
   // but the ladder runs bias-blind — this sensor is the only HA-visible arm/release signal.

@@ -250,12 +250,15 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Crossing preload: one-shot bias floor from the ENGAGEMENT-snapshotted free-rise drift (see
   // set_crossing_preload_kd — sampling point reversed 2026-08-14). Called only at the four
   // approach-hold → ladder handover sites (atomic-clamp complete + band release, cool and heat);
-  // consumes approach_entry_drift_cpm_ (one-shot — reset to NAN on use). No-op unless adaptive
-  // is on, the gain is set, and the snapshot runs in the demand direction; the sample is capped
-  // at CROSSING_PRELOAD_DRIFT_CAP_CPM (door-transient guard). Returns the applied bias delta
-  // (0 on no-op) so the call site patches its cached eff_diff — the handover pass must decide
-  // on the floored bias (bug-check 2026-08-10).
-  float apply_crossing_preload_(bool is_heat);
+  // consumes approach_entry_drift_cpm_/_at_ (one-shot — reset on use). No-op unless adaptive
+  // is on, the gain is set, the snapshot runs in the demand direction, and the snapshot is no
+  // older than 2× approach_lead (marathon idle holds: the integral is the safer authority); the
+  // sample is capped at CROSSING_PRELOAD_DRIFT_CAP_CPM (door-transient guard). Returns the
+  // applied bias delta (0 on no-op) so the call site patches its cached eff_diff — the handover
+  // pass must decide on the floored bias (bug-check 2026-08-10) — EXCEPT while a raise freeze is
+  // armed, where eff is bias-blind and the call site skips the patch (the delta then updates
+  // only the stored bias, which goes live at the crossing release).
+  float apply_crossing_preload_(bool is_heat, uint32_t now);
   // Effective OFF-entry lead: the override when set, else the shared lead.
   uint32_t approach_off_lead_ms_() const {
     return approach_lead_off_ms_ != 0 ? approach_lead_off_ms_ : approach_lead_ms_;
@@ -542,20 +545,33 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Raise-side bias freeze (Stephen 2026-08-14): a committed demand-REMOVING setpoint change
   // (cool raise / heat drop) with the room outside the deadband on the satisfied side parks the
   // unit below (above) the new SP while the load is unchanged — the retained bias IS the load
-  // measurement, so freeze it (no idle decay, no engineered-e unwind) until the room re-crosses
-  // into the band, where normal integration resumes. Time-capped at RAISE_FREEZE_MAX_MS so an
-  // away-raise (hours-long park, load regime genuinely changes) falls back to the τ idle decay.
-  // Cleared everywhere the SP-transition baselines die (mode switch, failsafe, test, !do_* pass
-  // clears). Not NVS-persisted: a reboot mid-freeze restores the saved bias but resumes normal
-  // decay — conservative, self-correcting. 0 = inactive.
+  // measurement, so freeze it until the room re-crosses into the band, where normal integration
+  // resumes. While armed the bias is STORED, NOT LIVE (bug-check round 1): no idle decay, no
+  // integration either direction, the ladder's eff runs bias-BLIND (else the eff-based cool 0→1
+  // re-engage would hunt sub-SP on the frozen value with its unwind suspended), and the
+  // natural-off gate counts the frozen bias as unwound so the unit can go properly OFF. The
+  // crossing release re-lives the bias on the pass the room reaches the band. Time-capped at
+  // RAISE_FREEZE_MAX_MS from the FIRST arm (re-raises don't restamp) so an away-raise falls back
+  // to the τ idle decay. Cleared everywhere the SP-transition baselines die (mode switch,
+  // failsafe, test, !do_* pass clears). ⚠️ Structurally inert in HEAT_COOL: a demand-removing
+  // raise routes to gear −1, deadband arbitration then drops do_cool, and the !do_cool clear
+  // zeroes bias_c_ AND this freeze on the next pass (pre-existing bias contract, not a
+  // regression) — protects pure COOL / pure HEAT only. Not NVS-persisted: a reboot mid-freeze
+  // restores the saved bias but resumes normal decay — conservative, self-correcting. 0 = inactive.
   uint32_t raise_freeze_c_at_{0};        // cool-side freeze armed at (cached-now ms)
   uint32_t raise_freeze_h_at_{0};        // heat mirror — ⚠️ winter-unvalidated
   // Crossing-preload drift snapshot: room_drift_cpm_ captured at approach ENGAGEMENT (the
   // trailing 3-min free-rise slope — compressor-free load signal; gear 0 is fan-only and OFF is
-  // off, so both entry states qualify). Consumed (reset to NAN) by apply_crossing_preload_ at
-  // handover; overwritten by every new engagement, so an aborted hold's stale value is never
-  // applied. NAN = no snapshot.
+  // off, so both entry states qualify), with its capture time in _at_ (0 = none; age-bounded at
+  // consumption). SHARED between cool and heat (single value, unlike approach_hold_*_) and
+  // deliberately NOT cleared at the !do_*/cross-mode pass clears — clearing it there would wipe
+  // an ACTIVE opposite-mode hold's snapshot. Stale-consumption safety rests on two legs
+  // (bug-check round 1 — preserve BOTH if adding an engagement path): (a) every site that sets
+  // approach_hold_*_ = true writes this snapshot in the same block, and (b) the handover
+  // (consume) check precedes the engagement block within a pass. Consumed one-shot by
+  // apply_crossing_preload_; also cleared at force_off/failsafe/test teardowns.
   float approach_entry_drift_cpm_{NAN};
+  uint32_t approach_entry_drift_at_{0};  // capture time of the snapshot (cached-now ms; 0 = none)
   // Approach-side predictive re-engagement state (see set_approach_lead_ms). Holds are transient
   // (not NVS-persisted; a reboot mid-approach just re-fires the prediction on fresh drift data).
   uint32_t approach_lead_ms_{0};         // 0 = feature disabled (default; bit-identical)

@@ -14,3 +14,4 @@ tests/config_reproduction_test
 
 # gear engine v2 selection test binary
 tests/gear_selection_generalization_test
+.claude/

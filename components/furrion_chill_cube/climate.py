@@ -94,8 +94,10 @@ CONF_APPROACH_LEAD = "approach_lead"
 # lead should match machine readiness (clamp + latency), not the idle-side comfort lead. Unset =
 # approach_lead applies to both entry states. approach_lead stays the master enable.
 CONF_APPROACH_LEAD_OFF = "approach_lead_off"
-# Crossing preload (2026-08-10): one-shot bias floor at approach-hold → ladder handover,
-# bias = max(bias, kd × drift_at_handover). Configure the DERATED gain (0.75 × k_d≈20 ⇒ 15).
+# Crossing preload (2026-08-10; sampling reversed 2026-08-14): one-shot bias floor at
+# approach-hold → ladder handover, bias = max(bias, kd × drift_at_approach_engagement) — the
+# trailing 3-min compressor-free slope captured when the approach hold fires. Configure the
+# DERATED gain (0.75 × k_d≈20 ⇒ 15).
 CONF_CROSSING_PRELOAD_KD = "crossing_preload_kd"
 
 
@@ -442,7 +444,8 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_APPROACH_LEAD_OFF): cv.positive_time_period_milliseconds,
             # Crossing preload (default 0 = OFF = bit-identical; needs adaptive_enable + an
             # approach hold to ever fire). Bias floor gain in minutes: at the moment an approach
-            # hold hands the ladder over, bias = max(bias, kd × drift_at_handover). k_d ≈ 20
+            # hold hands the ladder over, bias = max(bias, kd × drift_at_approach_engagement
+            # — the trailing 3-min compressor-free slope captured at hold-fire). k_d ≈ 20
             # across four measured regimes; configure the derated value (15 = 0.75 × 20) so the
             # floor under-predicts and the integral tops up. max() never unwinds retained bias.
             cv.Optional(CONF_CROSSING_PRELOAD_KD, default=0.0): cv.float_range(

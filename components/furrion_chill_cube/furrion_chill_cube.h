@@ -563,10 +563,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   // gated on sp_preload_factor_ — the freeze is integral correctness, not preload magnitude
   // (a behavior change for adaptive configs with sp_preload unset — intended).
   // Cleared everywhere the SP-transition baselines die (mode switch,
-  // failsafe, test, !do_* pass clears). ⚠️ Structurally inert in HEAT_COOL: a demand-removing
-  // raise routes to gear −1, deadband arbitration then drops do_cool, and the !do_cool clear
-  // zeroes bias_c_ AND this freeze on the next pass (pre-existing bias contract, not a
-  // regression) — protects pure COOL / pure HEAT only. Not NVS-persisted: a reboot mid-freeze
+  // failsafe, test, !do_* pass clears). ⚠️ Usually short-circuited in HEAT_COOL: a raise big
+  // enough to route to gear −1 hits deadband arbitration, whose !do_cool clear zeroes bias_c_
+  // AND this freeze one pass later (pre-existing bias contract; logged since round 3). But a
+  // raise landing diff in [cool_idle_, −deadband) parks at gear 0, which PINS do_cool — that
+  // freeze runs its full course even in HEAT_COOL. Fully protective in pure COOL / pure HEAT.
+  // Not NVS-persisted: a reboot mid-freeze
   // restores the saved bias but resumes normal decay — conservative, self-correcting. 0 = inactive.
   uint32_t raise_freeze_c_at_{0};        // cool-side freeze armed at (cached-now ms)
   uint32_t raise_freeze_h_at_{0};        // heat mirror — ⚠️ winter-unvalidated

@@ -1358,18 +1358,26 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // fix: it supplies the bias this freeze was starving, and the freeze then correctly prevents
   // the double-count. Do not re-add a windup exemption without a rate cap + non-arrival close.
   bool block_up = (e > 0.0f) && (cool_gear_ >= cool_max_gear_ || upshift_held);
-  // Raise-side bias freeze maintenance (Stephen 2026-08-14, see the member note): released at
-  // the CROSSING (room back inside the deadband from below) — not at re-engagement — because the
-  // post-clamp gear-1 stretch below SP is engineered sub-SP running, same rationale as the
-  // approach-hold freeze (08-14 live: it ate 0.19 C of bias between handover and crossing). The
-  // horizon release hands a long park back to the normal blind-idle decay. Both checks run
+  // Raise-side bias freeze maintenance (Stephen 2026-08-14, see the member note). THREE release
+  // points: (1) here at the CROSSING (room back in the band from below); (2) an approach
+  // HANDOVER (in the hold-maintenance blocks — demand re-established, bias re-lives with a
+  // full-bias eff patch); (3) here at the horizon. Post-handover the e<0 unwind is deliberately
+  // LIVE while the compressor runs on the re-lived bias (bug-check round 3, settled): once the
+  // ladder acts on the bias below SP, the unwind is the anti-pin safety valve — if the gear
+  // arrests the rise, the bias was oversized for the NEW setpoint and the drain is genuine
+  // correction, not loss. The freeze protects only the no-compressor interlude, where drain is
+  // pure loss. Horizon release applies the decay the freeze suspended — parity with the
+  // no-freeze path (an away-raise would have τ-decayed through the interlude). Both checks run
   // BEFORE the freeze is applied, so a released pass integrates/decays normally.
   if (raise_freeze_c_at_ != 0) {
     if (real_diff >= -ADAPT_DEADBAND_C) {
       ESP_LOGI(TAG, "Raise freeze (cool): crossing reached — bias %.2f preserved", bias_c_);
       raise_freeze_c_at_ = 0;
     } else if ((now - raise_freeze_c_at_) >= RAISE_FREEZE_MAX_MS) {
-      ESP_LOGI(TAG, "Raise freeze (cool): horizon expired at bias %.2f — idle decay resumes", bias_c_);
+      float pre = bias_c_;
+      bias_c_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
+      ESP_LOGI(TAG, "Raise freeze (cool): horizon expired — bias %.2f -> %.2f (suspended decay applied), idle decay resumes",
+               pre, bias_c_);
       raise_freeze_c_at_ = 0;
     }
   }
@@ -1456,7 +1464,8 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
   // applied here too — same reasoning, sign-mirrored. The SP-raise preload replaces it.
   bool block_up = (e > 0.0f) && (heat_gear_ >= heat_max_gear_ || upshift_held || !cooling);
   // Raise-side bias freeze maintenance — SIGN-MIRROR of the cool block (armed by a heat SP DROP
-  // that removes demand; released when the room falls back into the band from above, or at the
+  // that removes demand; released when the room falls back into the band from above, at an
+  // approach handover (see the hold-maintenance blocks), or at the
   // horizon). ⚠️ winter-unvalidated. e for heat is -real_diff, so "inside the band from the
   // satisfied side" is e >= -ADAPT_DEADBAND_C, i.e. real_diff <= ADAPT_DEADBAND_C.
   if (raise_freeze_h_at_ != 0) {
@@ -1464,7 +1473,11 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
       ESP_LOGI(TAG, "Raise freeze (heat): crossing reached — bias %.2f preserved", bias_h_);
       raise_freeze_h_at_ = 0;
     } else if ((now - raise_freeze_h_at_) >= RAISE_FREEZE_MAX_MS) {
-      ESP_LOGI(TAG, "Raise freeze (heat): horizon expired at bias %.2f — idle decay resumes", bias_h_);
+      // Horizon release applies the suspended decay — parity with the no-freeze path (see cool).
+      float pre = bias_h_;
+      bias_h_ *= expf(-((float) RAISE_FREEZE_MAX_MS / 60000.0f) / ADAPT_DECAY_TAU_MIN);
+      ESP_LOGI(TAG, "Raise freeze (heat): horizon expired — bias %.2f -> %.2f (suspended decay applied), idle decay resumes",
+               pre, bias_h_);
       raise_freeze_h_at_ = 0;
     }
   }
@@ -1990,6 +2003,9 @@ void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
   if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
   if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
   update_action_();
+  // Both callers return immediately after this teardown, skipping the pass-end debug publish —
+  // publish here so the freeze/bias clears above are HA-visible this pass (bug-check round 3).
+  publish_debug_state_(NAN);
 }
 
 // ============================================================
@@ -2048,8 +2064,18 @@ void FurrionChillCube::run_gear_controller_() {
   // mode's bias every pass so a mode switch (or a return from full-off) starts fresh rather than
   // inheriting a stale equilibrium. (Within-mode gear-0 idle is handled by the decay in
   // adaptive_*_eff_diff_, which still runs because do_cool/do_heat stays true at gear 0.)
-  if (!do_cool) { bias_c_ = 0.0f; last_committed_cool_target_c_ = NAN; approach_hold_cool_ = false; raise_freeze_c_at_ = 0; }
-  if (!do_heat) { bias_h_ = 0.0f; last_committed_heat_target_c_ = NAN; approach_hold_heat_ = false; raise_freeze_h_at_ = 0; }
+  // Log a freeze wiped by mode exit (bug-check round 3): otherwise a HEAT_COOL raise logs an arm
+  // with no matching release and reads as a freeze that vanished mid-flight in the watch data.
+  if (!do_cool) {
+    if (raise_freeze_c_at_ != 0)
+      ESP_LOGI(TAG, "Raise freeze (cool): mode left cool — freeze and bias cleared");
+    bias_c_ = 0.0f; last_committed_cool_target_c_ = NAN; approach_hold_cool_ = false; raise_freeze_c_at_ = 0;
+  }
+  if (!do_heat) {
+    if (raise_freeze_h_at_ != 0)
+      ESP_LOGI(TAG, "Raise freeze (heat): mode left heat — freeze and bias cleared");
+    bias_h_ = 0.0f; last_committed_heat_target_c_ = NAN; approach_hold_heat_ = false; raise_freeze_h_at_ = 0;
+  }
 
   // Boot gate: first successful gear computation enables IR
   if (!boot_ready_) {
@@ -2156,6 +2182,11 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     failsafe_active_ = true;
     boot_ready_ = true;
     update_action_();
+    // Publish from the post-teardown state (bug-check round 3): without this the debug sensors
+    // freeze at their pre-failsafe values for the whole episode — debug_raise_freeze would show
+    // a phantom armed freeze, and debug_failsafe_active could never publish 1 at all (set above,
+    // cleared before the next publish-reaching pass).
+    publish_debug_state_(NAN);
     return true;
   }
 
@@ -2341,18 +2372,6 @@ float FurrionChillCube::apply_crossing_preload_(bool is_heat, uint32_t now, bool
   approach_entry_drift_at_ = 0;
   if (!adaptive_enable_ || crossing_preload_kd_ <= 0.0f) return 0.0f;
   if (isnan(snap) || snap_at == 0) return 0.0f;
-  // Freeze-intact suppression (bug-check round 2): the floor's charter is the DRAINED-bias entry
-  // (long park, unwound morning). A handover that found the raise freeze armed carries the bias
-  // the freeze preserved — a direct measurement of this load — and the cap-clipped estimator
-  // (kd × 0.12 = 1.8 on any fast rise) must not overwrite it via max(). Consume the snapshot,
-  // skip the floor. (Residual accepted: a clamp landing 1+ pass AFTER the crossing release sees
-  // freeze_intact=false and floors a still-intact bias — bounded at ~+0.3 °C, self-corrects via
-  // the post-release e<0/e>0 integration.)
-  if (freeze_intact) {
-    ESP_LOGI(TAG, "Crossing preload (%s): skipped — freeze-preserved bias is the trusted measurement",
-             is_heat ? "heat" : "cool");
-    return 0.0f;
-  }
   // Age bound (bug-check round 1; lead corrected round 2): an idle-fired hold can legally run to
   // its 3×-lead hard cap (~45 min at the 15-min lead) before the band release — a snapshot that
   // old is a stale load estimate. Bound on the LARGER of the two leads (an OFF-fired hold engages
@@ -2369,6 +2388,20 @@ float FurrionChillCube::apply_crossing_preload_(bool is_heat, uint32_t now, bool
   float floor_b = crossing_preload_kd_ * toward;
   if (floor_b > ADAPT_BIAS_C_MAX) floor_b = ADAPT_BIAS_C_MAX;
   float &bias = is_heat ? bias_h_ : bias_c_;
+  // Freeze-intact suppression (bug-check round 2; log placed AFTER the viability gates round 3
+  // so it never claims the freeze blocked a floor that was stale/wrong-direction anyway): the
+  // floor's charter is the DRAINED-bias entry (long park, unwound morning). A handover that
+  // found the raise freeze armed carries the bias the freeze preserved — a direct measurement
+  // of this load — and the cap-clipped estimator must not overwrite it via max(). Consume the
+  // snapshot, skip the floor. (Residual accepted: a clamp landing 1+ pass AFTER the crossing
+  // release sees freeze_intact=false and floors the still-intact bias — worst case
+  // kd × cap − preserved ≈ 1.7 over a barely-armed 0.1 bias, ~0.3 in the 1.5 payoff shape;
+  // self-corrects via the post-release e<0/e>0 integration.)
+  if (freeze_intact) {
+    ESP_LOGI(TAG, "Crossing preload (%s): floor %.2f skipped — freeze-preserved bias %.2f is the trusted measurement",
+             is_heat ? "heat" : "cool", floor_b, bias);
+    return 0.0f;
+  }
   if (floor_b <= bias) return 0.0f;
   float delta = floor_b - bias;
   ESP_LOGI(TAG, "Crossing preload (%s): entry drift %.3f C/min -> bias %.2f -> %.2f",
@@ -2448,7 +2481,8 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         // bias until the room falls back to the band — sign-mirror of the cool raise freeze
         // (Stephen 2026-08-14). Positive-bias arm gate + first-arm time kept on re-drops (see
         // the cool site). ⚠️ winter-unvalidated.
-        if (raise_freeze_h_at_ == 0) {
+        // Expired-but-unreleased freeze counts as unarmed — mirror of the cool site.
+        if (raise_freeze_h_at_ == 0 || (now - raise_freeze_h_at_) >= RAISE_FREEZE_MAX_MS) {
           raise_freeze_h_at_ = (now != 0) ? now : 1;
           ESP_LOGI(TAG, "Heat SP drop %.2fC: bias %.2f frozen until crossing (cap %lu min)",
                    -delta_c, bias_h_, (unsigned long)(RAISE_FREEZE_MAX_MS / 60000UL));
@@ -2771,9 +2805,10 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // nothing — normal integration continues uninterrupted.
   // Accepted (bounded) edge: separately-committed drop→raise→drop re-preloads each drop (raises
   // never unload), so an oops-toggle can double a kick — clamped at ±ADAPT_BIAS_C_MAX and unwound
-  // by the never-frozen e<0 path (a PRELOADING drop mid-freeze also releases the freeze on the
-  // same pass — its demand gate diff > +deadband implies the crossing test; only a sub-deadband
-  // drop leaves the freeze armed against the new target). NOTE: in HEAT_COOL, a both-gears-off
+  // by the never-frozen e<0 path (a DEMAND-RESTORING drop mid-freeze — room above the new target
+  // past the deadband — releases the freeze the same pass via the crossing test, whether or not
+  // it preloads; a drop that leaves the room still below the new target keeps the freeze armed
+  // against the new target, original arm time). NOTE: in HEAT_COOL, a both-gears-off
   // deadband idle wipes this baseline each pass (!do_cool clear), so a drop issued across such a
   // gap records-only; drops during an engaged cool episode preload normally, as in pure COOL.
   if (!setpoint_pending_) {
@@ -2800,7 +2835,9 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         // Keep the FIRST arm time on a re-raise mid-freeze (bug-check round 1): the horizon
         // bounds the age of the frozen bias MEASUREMENT, which repeated raises don't refresh —
         // an unconditional restamp would let 1°F nudges extend the freeze indefinitely.
-        if (raise_freeze_c_at_ == 0) {
+        // An EXPIRED-but-not-yet-released freeze counts as unarmed (bug-check round 3): the
+        // release check runs later in this pass and would swallow the fresh raise otherwise.
+        if (raise_freeze_c_at_ == 0 || (now - raise_freeze_c_at_) >= RAISE_FREEZE_MAX_MS) {
           raise_freeze_c_at_ = (now != 0) ? now : 1;
           ESP_LOGI(TAG, "Cool SP raise %.2fC: bias %.2f frozen until crossing (cap %lu min)",
                    delta_c, bias_c_, (unsigned long)(RAISE_FREEZE_MAX_MS / 60000UL));
@@ -2881,9 +2918,10 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       ESP_LOGI(TAG, "Approach (cool): reached ladder band — hold released, ladder takes over");
       // Handover preload from the engagement drift snapshot (2026-08-14). eff_diff patched for
       // the same-pass decision; the release condition already fired on the old value. Handover
-      // releases an armed freeze, mirroring the atomic site (in practice the crossing release
-      // fires first at this band-release site — the guard is defensive for custom ladders whose
-      // C_DN_10 sits below the crossing threshold).
+      // releases an armed freeze, mirroring the atomic site. The was_frozen leg is LIVE here
+      // whenever the vent-fan feedforward exceeds C_DN_10 + deadband (blind eff = real + ff
+      // reaches the band release before the crossing release) — stock ff 0.25 keeps it dormant,
+      // fan_feedforward_gears: 2 or a retuned gear_step_c makes it real (bug-check round 3).
       {
         bool was_frozen = (raise_freeze_c_at_ != 0);
         if (was_frozen) {
@@ -3288,6 +3326,9 @@ void FurrionChillCube::set_test_mode(bool t) {
     approach_hold_from_off_ = false;
     approach_entry_drift_cpm_ = NAN;
     approach_entry_drift_at_ = 0;
+    // Gear passes stop while test_mode_ is set — publish the cleared freeze/holds now so the
+    // debug sensors don't show phantom state for the whole bench session (bug-check round 3).
+    publish_debug_state_(NAN);
     ESP_LOGI(TAG, "TEST mode ON — production controller suspended");
   }
   test_mode_ = t;

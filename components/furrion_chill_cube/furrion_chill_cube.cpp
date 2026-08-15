@@ -323,14 +323,25 @@ static const float ADAPT_UPSHIFT_DRIFT_MIN_CPM = 0.0f;
 // exactly cancels the load holds the room flat above SP (drift ≈ 0 → gate shut → upshift never
 // fires → indefinite sub-gear stall; live case: g2+turbo held 66.0°F over SP 64 with bias at cap,
 // eff ≈ 3.0, for 9 min until a user tap broke it — it would have lasted all night). Escape: while
-// the room sits ABOVE the band and is NOT measurably falling, the biased upshift is allowed — in
-// that regime the bias is not "stale climb data", it is a live measurement of exactly the load
-// that is holding the room off SP. A room genuinely DESCENDING above the band keeps the gate
-// closed (the anti-overshoot derivative damping this gate exists for), and everything at/below
-// the band is untouched (the 2026-07-02 stale-bias top-gear grab lives there). Falling means
-// drift ≤ -this; the value sits just above the drift quantization floor (0.1°F over a ~3-min
-// window ≈ 0.018 C/min) so plateau noise can't masquerade as a descent.
+// the room sits ABOVE the band (cool; below, heat) and is NOT closing on SP — sustained for
+// ADAPT_STALL_DWELL_MS — the biased upshift is allowed: in that regime the bias is not "stale
+// climb data", it is a live measurement of exactly the load holding the room off SP.
+// ADAPT_STALL_FALL_CPM: "closing" means moving toward SP faster than this (cool: drift ≤ -0.02;
+// heat mirror: drift ≥ +0.02). 0.02 C/min = 2.2°F/h — the 08-15 livelock crept at ~0.013 C/min
+// (87 min to close), which must count as stalled; genuine descents (the 06-30 hot-day windup
+// case ran ≥0.05) stay gated by the anti-overshoot damping. Drift quantization is 0.06°F over
+// the 3-6 min baseline ≈ 0.006-0.011 C/min, so 0.02 is ~2 quanta — a deliberate "too slow to
+// matter" line, not a noise floor.
+// ADAPT_STALL_DWELL_MS: the stall must PERSIST before the escape opens (bug-check 2026-08-15:
+// hunt-cycle swing tops park the 3-min windowed slope inside ±0.02 for ~2 min every cycle — a
+// dwell-free escape re-admitted the wound bias at exactly the moment the 06-30 gate was built
+// for, reproducing the ungated top-gear pathology under tight ladder geometry, and could add a
+// 1→2 upshift to mild-night hunts at bias ≳0.6). 6 min = 2× the drift window: transients can't
+// accumulate it; the live livelock (9+ min) clears it with time to spare. The stamp resets the
+// moment the room starts genuinely closing or drops into the band. Everything at/below the band
+// is untouched (the 2026-07-02 stale-bias top-gear grab lives there).
 static const float ADAPT_STALL_FALL_CPM = 0.02f;
+static const uint32_t ADAPT_STALL_DWELL_MS = 360000;  // 6 min sustained stall before the escape opens
 
 // Mode-switching protection lives in the 0→-1 gate and -1→active gate
 // (see mode_switch_idle_ms_, mode_switch_event_ms_, mode_switch_temp_offset_c_, mode_switch_off_ms_)
@@ -1463,16 +1474,31 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // band, so the ladder regains it exactly when demand returns.
   float live_bias = raise_frozen ? 0.0f : bias_c_;
   float eff = real_diff + live_bias + ff_c;
-  // Upshift decisions see the learned bias while warming OR while stalled above the band (room
-  // above SP+deadband and not measurably falling — see ADAPT_STALL_FALL_CPM: equilibrium above
-  // the band is the gate's premise failure, incident 2026-08-15). Otherwise fall back to the
-  // unbiased diff (+ the fast fan feedforward, which is anticipatory and must still act). fminf
-  // guarantees the gate can only ever SUPPRESS an upshift, never enable one: a stale NEGATIVE bias
-  // (eff < real_diff) keeps eff, so the gate never makes an upshift easier than the static ladder.
-  // stalled_above requires a FRESH drift sample: a quiet buffer (no recent temp updates) proves
-  // nothing about a plateau, and NaN drift already routes through warming's permissive leg.
-  bool stalled_above = (real_diff > ADAPT_DEADBAND_C) && drift_fresh &&
-                       !isnan(room_drift_cpm_) && (room_drift_cpm_ > -ADAPT_STALL_FALL_CPM);
+  // Upshift decisions see the learned bias while warming OR while PERSISTENTLY stalled above the
+  // band (room above SP+deadband, fresh drift, not closing on SP, sustained ADAPT_STALL_DWELL_MS
+  // — equilibrium above the band is the gate's premise failure, incident 2026-08-15; the dwell
+  // keeps hunt-cycle swing tops from re-opening the gate, bug-check 2026-08-15). Otherwise fall
+  // back to the unbiased diff (+ the fast fan feedforward, which is anticipatory and must still
+  // act) — on that fallback leg, fminf guarantees the gate can only ever SUPPRESS an upshift,
+  // never enable one: a stale NEGATIVE bias (eff < real_diff) keeps eff, so the fallback never
+  // makes an upshift easier than the static ladder. stalled_above requires a FRESH drift sample:
+  // a quiet buffer proves nothing about a plateau, and NaN drift already routes through
+  // warming's permissive leg.
+  bool stall_cond = (real_diff > ADAPT_DEADBAND_C) && drift_fresh &&
+                    !isnan(room_drift_cpm_) && (room_drift_cpm_ > -ADAPT_STALL_FALL_CPM);
+  if (stall_cond) {
+    if (stall_above_since_c_ == 0) stall_above_since_c_ = (now != 0) ? now : 1;
+  } else {
+    stall_above_since_c_ = 0;
+    stall_logged_c_ = false;
+  }
+  bool stalled_above = (stall_above_since_c_ != 0) &&
+                       (now - stall_above_since_c_ >= ADAPT_STALL_DWELL_MS);
+  if (stalled_above && !stall_logged_c_) {
+    stall_logged_c_ = true;
+    ESP_LOGI(TAG, "Rate gate (cool): stalled above band %lu min (diff %.2f, drift %.3f C/min) — biased upshift enabled",
+             (unsigned long)((now - stall_above_since_c_) / 60000UL), real_diff, room_drift_cpm_);
+  }
   cool_eff_up_diff_ = (warming || stalled_above) ? eff : fminf(eff, real_diff + ff_c);
   return eff;
 }
@@ -1572,13 +1598,31 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
   // legs DO select on eff and must not act on a stored bias). ⚠️ winter-unvalidated.
   float live_bias = raise_frozen ? 0.0f : bias_h_;
   float eff = real_diff - live_bias;  // bias_h_ > 0 (cold demand) → more negative → higher heat gear
-  // Upshift decisions see the learned bias while cooling OR while stalled below the band (room
-  // below SP−deadband and not measurably rising — sign-mirror of cool's stalled_above; see
-  // ADAPT_STALL_FALL_CPM). Otherwise fall back to the unbiased diff. fmaxf (mirror of cool's
+  // Upshift decisions see the learned bias while cooling OR while PERSISTENTLY stalled below the
+  // band (sign-mirror of cool's stalled_above; see ADAPT_STALL_FALL_CPM / ADAPT_STALL_DWELL_MS).
+  // Otherwise fall back to the unbiased diff — on that fallback leg, fmaxf (mirror of cool's
   // fminf) guarantees the gate can only SUPPRESS an upshift, never enable one: a stale POSITIVE
-  // bias (eff < real_diff) is clamped up to real_diff. ⚠️ winter-unvalidated.
-  bool stalled_below = (real_diff < -ADAPT_DEADBAND_C) && drift_fresh &&
-                       !isnan(room_drift_cpm_) && (room_drift_cpm_ < ADAPT_STALL_FALL_CPM);
+  // bias (eff < real_diff) is clamped up to real_diff. ⚠️ winter-unvalidated. HONEST ASYMMETRY
+  // (bug-check 2026-08-15): heat's block_up above still carries the `!cooling` clause that cool
+  // dropped on 2026-07-20, so during the very stall this escape targets the heat integral is
+  // FROZEN — the escape can only release a bias wound during an earlier falling phase, not grow
+  // one at the stall. Deliberately left as-is (winter-unvalidated side; revisit with real heat
+  // cycles before making it a true mirror).
+  bool stall_cond = (real_diff < -ADAPT_DEADBAND_C) && drift_fresh &&
+                    !isnan(room_drift_cpm_) && (room_drift_cpm_ < ADAPT_STALL_FALL_CPM);
+  if (stall_cond) {
+    if (stall_below_since_h_ == 0) stall_below_since_h_ = (now != 0) ? now : 1;
+  } else {
+    stall_below_since_h_ = 0;
+    stall_logged_h_ = false;
+  }
+  bool stalled_below = (stall_below_since_h_ != 0) &&
+                       (now - stall_below_since_h_ >= ADAPT_STALL_DWELL_MS);
+  if (stalled_below && !stall_logged_h_) {
+    stall_logged_h_ = true;
+    ESP_LOGI(TAG, "Rate gate (heat): stalled below band %lu min (diff %.2f, drift %.3f C/min) — biased upshift enabled",
+             (unsigned long)((now - stall_below_since_h_) / 60000UL), real_diff, room_drift_cpm_);
+  }
   heat_eff_up_diff_ = (cooling || stalled_below) ? eff : fmaxf(eff, real_diff);
   return eff;
 }
@@ -2676,24 +2720,36 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     return 0;
   };
 
+  // Selection basis — sign-mirror of the cool block (see the cool basis note for the full
+  // rationale: positive live bias only, demand-gated, ff/handover-patch/frozen-bias excluded,
+  // negative bias floors at the static ladder). For heat, demand = room BELOW the band and the
+  // bias SUBTRACTS (more negative = more heat). The demand gate also keeps the pong-critical
+  // 1→0 STOP untouched on user events: at/above SP−deadband the basis IS the real diff, so
+  // bias_h_ cannot hold gear 1 past the real stop (bug-check 2026-08-15). ⚠️ winter-unvalidated.
+  float pick_bias = (adaptive_enable_ && raise_freeze_h_at_ == 0) ? fmaxf(0.0f, bias_h_) : 0.0f;
+  float pick_basis = (diff < -ADAPT_DEADBAND_C) ? (diff - pick_bias) : diff;
+  float sel_basis = from_test ? eff_diff : pick_basis;
+
   if (gear == -1 || user_input) {
     // Fresh start from -1 requires the 1-min off lockout (hardware wind-down); no bypass.
     bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
     if (gear == -1 && !off_long_enough) {
       new_gear = -1;  // still in 1-min wind-down period
-    } else if (user_input && gear >= 0 &&
-               gear_in_band_heat_(gear, fminf(diff, eff_diff))) {
-      // User event but the current gear is still valid for the POSITIVE-BIAS-AWARE diff (same
-      // basis as pick_diff below) — preserve hunting state. Sign-mirror of cool. ⚠️ winter-unvalidated.
+    } else if (user_input && gear >= 0 && gear_in_band_heat_(gear, sel_basis)) {
+      // User event but the current gear is still valid for the selection basis — preserve
+      // hunting state. Sign-mirror of cool. ⚠️ winter-unvalidated.
       new_gear = gear;
     } else {
       // From -1: floor at the derived cold-start floor (heat default 1 → no-op); never gear 0.
-      // Positive-bias-aware pick (2026-08-15, sign-mirror of cool — see the cool block for the
-      // full rationale): fminf(diff, eff_diff) floors the demand at the real diff, so a NEGATIVE
-      // heat bias (eff > diff = less heat) can never collapse gears below the static ladder, and
-      // bias = 0 stays bit-identical. Test-exit keeps the pure-eff pick. ⚠️ winter-unvalidated.
-      float pick_diff = from_test ? eff_diff : fminf(diff, eff_diff);
-      int picked = pick_from_below(pick_diff);
+      // Positive-bias-aware pick on sel_basis (2026-08-15, sign-mirror of cool — see the cool
+      // basis note for what is deliberately excluded). ⚠️ winter-unvalidated.
+      int picked = pick_from_below(sel_basis);
+      // OFF entries honor the OFF→gear quirk hard rule — mirror of cool (walk down to the
+      // highest quirk-covered target; the dwell-gated ladder climbs the rest).
+      if (gear == -1) {
+        while (picked > heat_cold_start_floor_ && find_quirk_(true, -1, picked) == nullptr)
+          picked--;
+      }
       if (picked >= 1) {
         new_gear = picked;
         if (gear == -1 && new_gear < heat_cold_start_floor_) new_gear = heat_cold_start_floor_;
@@ -2723,9 +2779,10 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   } else {
     if (gear == 0) {
       // First compute post-restore: jump straight to the correct gear (skip the HOLD_MS ladder).
-      // Positive-bias-aware (2026-08-15, sign-mirror of cool). ⚠️ winter-unvalidated.
+      // Positive-bias-aware via pick_basis (2026-08-15, sign-mirror of cool: demand-gated, so a
+      // restored idle at/above SP−deadband stays a no-op). ⚠️ winter-unvalidated.
       if (last_gear_change_ == 0) {
-        new_gear = pick_from_below(fminf(diff, eff_diff));
+        new_gear = pick_from_below(pick_basis);
       } else if (can_upshift_to(1) && diff < H_UP_01) {
         new_gear = 1;
       } else if (can_upshift_to(1) && approach_predict_heat_(diff, now, approach_lead_ms_)) {
@@ -3080,34 +3137,57 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     return 0;
   };
 
+  // Selection basis for the user/fresh-start block (2026-08-15, hardened in the same session's
+  // bug-check): real diff PLUS the positive LIVE bias, and only under REAL DEMAND (diff above
+  // the deadband). Built from bias_c_ directly — NOT from eff_diff — so it deliberately excludes:
+  // (a) the vent-fan feedforward (bias==0 stays bit-identical to the static ladder — with ff in
+  //     the basis, ff alone could start the unit from OFF while the off-side gates stay real-diff);
+  // (b) the approach-handover eff patch (a user event landing on the handover pass must not
+  //     one-shot pick_from_below a patched value — "the gear-3/4-grade burst the atomic-clamp
+  //     rule exists to prevent");
+  // (c) a raise-FROZEN bias (stored-not-live) and any bias while adaptive is disabled (stale
+  //     in-memory value after a mid-run toggle).
+  // The demand gate (diff > deadband) keeps every at/below-SP decision on the real diff: the
+  // freeze-release pass can't restart a below-SP unit off its just-released bias (stays OFF until
+  // real demand), a user tap deep below SP still reaches the tap-OFF door (pre-2026-08-15
+  // semantics exactly), and the restore pick stays a no-op at idle. A NEGATIVE bias never enters
+  // (fmaxf 0) — the 2026-06-03 round-3 gear-collapse case stays structurally impossible.
+  float pick_bias = (adaptive_enable_ && raise_freeze_c_at_ == 0) ? fmaxf(0.0f, bias_c_) : 0.0f;
+  float pick_basis = (diff > ADAPT_DEADBAND_C) ? (diff + pick_bias) : diff;
+  // Test-exit keeps the pure-eff pick (2026-07-20 semantics) on BOTH the in-band preserve check
+  // and the pick, so the two can't shadow each other with different bases.
+  float sel_basis = from_test ? eff_diff : pick_basis;
+
   if (gear == -1 || user_input) {
     // Fresh start from -1 requires the 1-min off lockout (hardware wind-down); no bypass.
     bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
     if (gear == -1 && !off_long_enough) {
       new_gear = -1;  // still in 1-min wind-down period
-    } else if (user_input && gear >= 0 &&
-               gear_in_band_cool_(gear, fmaxf(diff, eff_diff))) {
-      // User event but the current gear is still valid for the POSITIVE-BIAS-AWARE diff (see
-      // pick_diff below — same basis, so "preserve" and "re-pick" can't disagree) — preserve
-      // hunting state. Live case 2026-08-15 04:56: g4 with real 0.99 / eff 3.0 now STAYS g4
-      // instead of collapsing to the real-diff pick.
+    } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, sel_basis)) {
+      // User event but the current gear is still valid for the selection basis — preserve
+      // hunting state. (The preserve band [stop, next-up] is wider than the pick's entry
+      // threshold by the start/stop hysteresis — that gap is deliberate.) Live case 2026-08-15
+      // 04:56: g4 with real 0.99 / bias 2.0 now STAYS g4 instead of collapsing to the
+      // real-diff pick.
       new_gear = gear;
     } else {
       // From -1: floor at the derived cold-start floor (compressor can't cold-start below it) and
       // never gear 0 (only reachable by downshift from 1). Running (user_input, gear>=0): no floor.
       // Positive-bias-aware pick (2026-08-15, Stephen: "bias is the load — it should position the
-      // ladder, through upshifts AND through SP changes"): user events and OFF entries select on
-      // real diff PLUS the positive live component — fmaxf(diff, eff_diff) floors the pick basis
-      // at the real diff, so a NEGATIVE bias can never collapse gears below the static ladder
-      // (the 2026-06-03 round-3 revert case stays structurally impossible) and bias = 0 stays
-      // bit-identical to the non-adaptive ladder (failover invariant). A raise-FROZEN bias is
-      // already excluded (eff is computed bias-blind while frozen), and the vent-fan feedforward
-      // rides along exactly as it does in the steady-state ladder. Test-exit keeps the pure-eff
-      // pick (2026-07-20 semantics: even a negative bias positions a test-exit re-anchor).
+      // ladder, through upshifts AND through SP changes") on sel_basis — see the basis note above
+      // for what is deliberately excluded (ff, handover patch, frozen bias, no-demand states).
       // Live case 2026-08-15 04:42: OFF re-entry at real 0.79 / bias 2.0 picked g1 and crawled;
       // this pick lands the load-justified gear (cold-start floor still applies as a MINIMUM).
-      float pick_diff = from_test ? eff_diff : fmaxf(diff, eff_diff);
-      int picked = pick_from_below(pick_diff);
+      int picked = pick_from_below(sel_basis);
+      // OFF entries honor the 2026-08-03 HARD RULE (kickstart quirks REQUIRED for all OFF→gear
+      // changes): walk the pick down to the highest target that HAS an OFF-entry quirk — the
+      // dwell-gated ladder (rate-gate escape included) climbs the rest. Also applies to a
+      // large-real-diff pick, which could previously land -1→3/4 quirkless (latent, near-
+      // unreachable pre-2026-08-15; the bias-aware pick made it routine, so close it for both).
+      if (gear == -1) {
+        while (picked > cool_cold_start_floor_ && find_quirk_(false, -1, picked) == nullptr)
+          picked--;
+      }
       if (picked >= 1) {
         new_gear = picked;
         if (gear == -1 && new_gear < cool_cold_start_floor_) new_gear = cool_cold_start_floor_;
@@ -3145,17 +3225,20 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     }
     // NOTE (history): this block used REAL diff only from 2026-06-03 (round-3 revert of a
     // bias-aware restructure — 3 bugs incl. negative-bias gear collapse) until 2026-08-15. The
-    // fmaxf pick above re-admits the POSITIVE bias as a value-only change: the June collapse
-    // (negative bias) remains impossible by construction, the block structure is untouched, and
-    // the off/tap-off/approach decisions in this chain still run on REAL diff.
+    // demand-gated positive-bias basis above re-admits the bias as a value-only change: the June
+    // collapse (negative bias) remains impossible by construction, the block structure is
+    // untouched, and the off/tap-off/approach decisions in this chain still run on REAL diff —
+    // and stay REACHABLE, because every at/below-deadband state collapses sel_basis to the real
+    // diff (a tap deep below SP hits the door exactly as it did pre-change).
   } else {
     if (gear == 0) {
       // First compute post-restore: jump straight to the correct gear (skip the HOLD_MS ladder).
-      // Positive-bias-aware (2026-08-15, same pattern as the user/OFF pick): the NVS-restored
-      // bias is already trusted by the steady-state ladder one pass later (boot drift is NaN →
-      // rate gate permissive), so the restore pick using it merely lands there a pass sooner.
+      // Positive-bias-aware via pick_basis (2026-08-15): demand-gated, so a restored gear-0 with
+      // a wound NVS bias stays a no-op at/below SP (pre-change semantics) and only positions up
+      // under real demand. Note this branch re-fires every pass until the first gear change
+      // stamps last_gear_change_ (pre-existing).
       if (last_gear_change_ == 0) {
-        new_gear = pick_from_below(fmaxf(diff, eff_diff));
+        new_gear = pick_from_below(pick_basis);
       } else if (can_upshift_to(1) && eff_diff > C_UP_01) {
         // iter-1 #2 (2026-07-20): re-engage 0→1 on eff_diff (real + bias), not real diff, so the
         // integral shifts the WHOLE ladder together — the 1→2 upshift already trips on eff_diff, so

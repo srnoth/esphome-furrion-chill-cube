@@ -576,6 +576,17 @@ class FurrionChillCube : public climate::Climate, public Component {
   // restores the saved bias but resumes normal decay — conservative, self-correcting. 0 = inactive.
   uint32_t raise_freeze_c_at_{0};        // cool-side freeze armed at (cached-now ms)
   uint32_t raise_freeze_h_at_{0};        // heat mirror — ⚠️ winter-unvalidated
+  // Stalled-above/below-band rate-gate escape (2026-08-15, see ADAPT_STALL_FALL_CPM /
+  // ADAPT_STALL_DWELL_MS in the .cpp): stamp = when the persistent-stall condition began
+  // (0 = not stalling); logged flag = rising-edge LOGI latch. Not NVS-persisted — a reboot
+  // restarts the dwell, which is the conservative direction. Accepted edge: the stamp is NOT
+  // cleared on mode teardown, so a mode gap that returns with the stall condition still true
+  // opens the escape without a fresh 6-min dwell (the condition itself must hold NOW — fresh
+  // drift, above band); bounded by HOLD_MS pacing + eff-based downshifts.
+  uint32_t stall_above_since_c_{0};
+  uint32_t stall_below_since_h_{0};
+  bool stall_logged_c_{false};
+  bool stall_logged_h_{false};
   // User-OFF bias parking (Stephen 2026-08-14, pool incident 13:50→13:57: a 7-min user OFF
   // zeroed a 1.5 bias into a max-load afternoon — gear 4 reached only at +3°F): climate mode
   // OFF PARKS the biases (values kept, this stamp set) instead of zeroing; the first pass back

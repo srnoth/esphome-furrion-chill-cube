@@ -1484,8 +1484,13 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
   // makes an upshift easier than the static ladder. stalled_above requires a FRESH drift sample:
   // a quiet buffer proves nothing about a plateau, and NaN drift already routes through
   // warming's permissive leg.
+  // PLATEAU only (|drift| < threshold, verifier 2026-08-15): a live RISE must not pre-charge the
+  // dwell — rising is the warming leg's job, and a rise-charged stamp latched the escape with
+  // ~0 min of demonstrated stall right as the drift window lagged through engagement (the exact
+  // mild-night 1→2 the dwell exists to prevent).
   bool stall_cond = (real_diff > ADAPT_DEADBAND_C) && drift_fresh &&
-                    !isnan(room_drift_cpm_) && (room_drift_cpm_ > -ADAPT_STALL_FALL_CPM);
+                    !isnan(room_drift_cpm_) && (room_drift_cpm_ > -ADAPT_STALL_FALL_CPM) &&
+                    (room_drift_cpm_ < ADAPT_STALL_FALL_CPM);
   if (stall_cond) {
     if (stall_above_since_c_ == 0) stall_above_since_c_ = (now != 0) ? now : 1;
   } else {
@@ -1608,8 +1613,10 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
   // FROZEN — the escape can only release a bias wound during an earlier falling phase, not grow
   // one at the stall. Deliberately left as-is (winter-unvalidated side; revisit with real heat
   // cycles before making it a true mirror).
+  // PLATEAU only (|drift| < threshold) — mirror of cool; a live FALL is the cooling leg's job.
   bool stall_cond = (real_diff < -ADAPT_DEADBAND_C) && drift_fresh &&
-                    !isnan(room_drift_cpm_) && (room_drift_cpm_ < ADAPT_STALL_FALL_CPM);
+                    !isnan(room_drift_cpm_) && (room_drift_cpm_ < ADAPT_STALL_FALL_CPM) &&
+                    (room_drift_cpm_ > -ADAPT_STALL_FALL_CPM);
   if (stall_cond) {
     if (stall_below_since_h_ == 0) stall_below_since_h_ = (now != 0) ? now : 1;
   } else {
@@ -2209,6 +2216,7 @@ void FurrionChillCube::run_gear_controller_() {
                parked ? "parked" : "cleared");
     if (!parked) bias_c_ = 0.0f;
     last_committed_cool_target_c_ = NAN; approach_hold_cool_ = false; raise_freeze_c_at_ = 0;
+    stall_above_since_c_ = 0; stall_logged_c_ = false;  // stall dwell dies with the episode
   }
   if (!do_heat) {
     if (raise_freeze_h_at_ != 0)
@@ -2216,6 +2224,7 @@ void FurrionChillCube::run_gear_controller_() {
                parked ? "parked" : "cleared");
     if (!parked) bias_h_ = 0.0f;
     last_committed_heat_target_c_ = NAN; approach_hold_heat_ = false; raise_freeze_h_at_ = 0;
+    stall_below_since_h_ = 0; stall_logged_h_ = false;  // stall dwell dies with the episode
   }
   // Fifth stamp-clear site (round 5): a HEAT_COOL deadband wipe (user_off false) zeroes the
   // biases above — a surviving stamp would be consumed later against a zeroed bias (harmless
@@ -2288,6 +2297,8 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     last_committed_heat_target_c_ = NAN;
     raise_freeze_c_at_ = 0;               // raise freezes die with them (zeroed bias, nothing to hold)
     raise_freeze_h_at_ = 0;
+    stall_above_since_c_ = 0; stall_logged_c_ = false;  // stall dwells die too (learn fresh)
+    stall_below_since_h_ = 0; stall_logged_h_ = false;
     bias_parked_at_ = 0;                  // parked bias dies too (failsafe = hands off, learn fresh)
     approach_hold_cool_ = false;          // approach holds die with them (failsafe = hands off)
     approach_hold_heat_ = false;
@@ -3142,11 +3153,14 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // the deadband). Built from bias_c_ directly — NOT from eff_diff — so it deliberately excludes:
   // (a) the vent-fan feedforward (bias==0 stays bit-identical to the static ladder — with ff in
   //     the basis, ff alone could start the unit from OFF while the off-side gates stay real-diff);
-  // (b) the approach-handover eff patch (a user event landing on the handover pass must not
-  //     one-shot pick_from_below a patched value — "the gear-3/4-grade burst the atomic-clamp
-  //     rule exists to prevent");
-  // (c) a raise-FROZEN bias (stored-not-live) and any bias while adaptive is disabled (stale
-  //     in-memory value after a mid-run toggle).
+  // (b) the approach-handover eff PATCH (a local eff_diff adjustment — never in this basis).
+  //     Handover SIDE EFFECTS do reach it, deliberately: this basis is computed after the
+  //     handover blocks, so a freeze released there is live here, and a crossing-preload floor
+  //     written into bias_c_ is included. Reachable only on a late-clamp handover coinciding
+  //     with a same-pass user event, and the demand gate covers the at/below-SP outcomes;
+  //     the resulting pick is the load-justified gear (verifier 2026-08-15, accepted);
+  // (c) a raise-frozen bias while STILL armed (stored-not-live) and any bias while adaptive is
+  //     disabled (stale in-memory value after a mid-run toggle).
   // The demand gate (diff > deadband) keeps every at/below-SP decision on the real diff: the
   // freeze-release pass can't restart a below-SP unit off its just-released bias (stays OFF until
   // real demand), a user tap deep below SP still reaches the tap-OFF door (pre-2026-08-15

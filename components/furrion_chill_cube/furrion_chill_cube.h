@@ -196,7 +196,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_test_mode(bool t);
   bool is_test_mode() const { return test_mode_; }   // single source of truth for the sequencer
   // Send one full test frame: mode (0=OFF,1=COOL,2=HEAT), °C setpoint, raw CS byte, fan
-  // (0=AUTO,1=LOW,2=MED,3=HIGH). Sets state + transmits the CS→MODE→CS bracket (or OFF).
+  // (0=AUTO,1=LOW,2=MED,3=HIGH — OR a raw Midea fan percent 20/40/60/80/100; the board has
+  // five speeds, the enum reaches three [40/60/100]; captured 2026-09-02). Sets state +
+  // transmits the CS→MODE→CS bracket (or OFF).
   void test_frame(int mode, int setpoint_c, int cs, int fan);
   // Re-assert the current CS only (keep-alive tick; no-op when the held mode is OFF).
   void test_resend_cs();
@@ -515,6 +517,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool failsafe_active_{false};
   bool test_mode_{false};   // bench test harness: loop() inert, unit driven only by test_* hooks
   int test_fan_{-1};        // fan override for test frames (-1 = none; 0=AUTO,1=LOW,2=MED,3=HIGH)
+  int test_fan_pct_{0};     // TEST-ONLY raw Midea fan percent (0 = off; 20/40/60/80/100) — overrides the
+                            // fan bytes of the mode frame while test_mode_ is set. Never touches production.
   bool user_changed_{false};
   bool resume_from_test_{false};  // set on test-exit → gear re-pick uses eff_diff (bias-aware), not real diff
   bool temp_dirty_{false};

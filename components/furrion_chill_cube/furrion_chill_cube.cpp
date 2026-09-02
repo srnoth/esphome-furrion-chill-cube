@@ -558,6 +558,20 @@ bool FurrionChillCube::transmit_mode_command_() {
         message[7] = 0x66;
         break;
     }
+    // Bench-test raw fan percent override (test mode ONLY). The Midea board has FIVE fan speeds
+    // (20/40/60/80/100 — captured from a Midea U-shape remote 2026-09-02) but the CLIMATE_FAN_*
+    // enum above reaches three (40/60/100). msg[7] is the literal percent; msg[2] is coarse and
+    // 80/100 share 0x3F. The production mapping above is untouched — this only fires for test
+    // frames sent with fan >= 20 (see test_frame). Cleared on set_test_mode(false).
+    if (test_mode_ && test_fan_pct_ > 0) {
+      switch (test_fan_pct_) {
+        case 20:  message[2] = 0xFF; message[7] = 0x14; break;
+        case 40:  message[2] = 0x9F; message[7] = 0x28; break;
+        case 60:  message[2] = 0x5F; message[7] = 0x3C; break;
+        case 80:  message[2] = 0x3F; message[7] = 0x50; break;
+        default:  message[2] = 0x3F; message[7] = 0x64; break;  // 100
+      }
+    }
   }
   message[3] = ~message[2];
 
@@ -614,8 +628,8 @@ bool FurrionChillCube::transmit_mode_command_() {
     swing_tx.perform();
   }
 
-  ESP_LOGD(TAG, "IR mode=%d fan=%d swing=%d",
-           (int)active_ir_mode_, (int)fan, (int)this->swing_mode);
+  ESP_LOGD(TAG, "IR mode=%d fan=%d pct=%d swing=%d",
+           (int)active_ir_mode_, (int)fan, (test_mode_ ? test_fan_pct_ : 0), (int)this->swing_mode);
 
   // Track the fan actually put on the wire (v2): every mode frame funnels through here (including
   // transmit_mode_with_cs_), so this is the single point that keeps last_tx_fan_ current — which
@@ -3543,6 +3557,7 @@ void FurrionChillCube::set_test_mode(bool t) {
     // Resuming production: clear the fan override and force a gear pass next loop so the unit's
     // setpoint/CS re-anchor to the real HA target (failover restored — project_failover_invariant).
     test_fan_ = -1;
+    test_fan_pct_ = 0;
     user_changed_ = true;
     resume_from_test_ = true;   // land on the bias-justified gear (eff_diff pick), not a real-diff drop
     last_gear_run_ = 0;
@@ -3576,7 +3591,8 @@ void FurrionChillCube::set_test_mode(bool t) {
   test_mode_ = t;
 }
 
-// Send one full test frame. mode 0=OFF, 1=COOL, 2=HEAT; fan 0=AUTO,1=LOW,2=MED,3=HIGH (-1=AUTO).
+// Send one full test frame. mode 0=OFF, 1=COOL, 2=HEAT; fan 0=AUTO,1=LOW,2=MED,3=HIGH (-1=AUTO)
+// or a raw Midea fan percent 20/40/60/80/100 (test-only 5-speed access).
 void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   test_mode_ = true;          // a test frame always implies test mode
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
@@ -3593,7 +3609,15 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   failsafe_active_ = false;
   publish_debug_state_(NAN);  // bypasses set_test_mode() — publish the cleared state here too
   boot_ready_ = true;
-  test_fan_ = fan;
+  if (fan >= 20) {
+    // Raw Midea fan percent (20/40/60/80/100). The enum slot carries HIGH as a placeholder so the
+    // effective-fan / last_tx_fan_ plumbing stays well-formed; the frame bytes come from the pct.
+    test_fan_pct_ = fan;
+    test_fan_ = 3;
+  } else {
+    test_fan_pct_ = 0;
+    test_fan_ = fan;
+  }
   if (mode == 0) {
     active_ir_mode_ = climate::CLIMATE_MODE_OFF;
   } else if (mode == 2) {

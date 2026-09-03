@@ -513,8 +513,8 @@ bool FurrionChillCube::transmit_mode_command_() {
   // regardless of which path runs here — the only difference is what gets
   // shown on the unit's panel and which protocol the byte rides on.
   uint8_t temp_code;
-  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
-    temp_code = 0x0E;  // OFF special value (same for both protocols)
+  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF || active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
+    temp_code = 0x0E;  // OFF / FAN-ONLY special value (RAC_PT1411HWRU_TEMPERATURE_FAN_ONLY; same for both protocols)
   } else if (use_fahrenheit_) {
     // target_c is guaranteed non-NaN — the gate at the top of this function
     // returns early for an active mode without a valid setpoint.
@@ -580,6 +580,9 @@ bool FurrionChillCube::transmit_mode_command_() {
   switch (active_ir_mode_) {
     case climate::CLIMATE_MODE_HEAT:
       message[4] |= 0x0C;
+      break;
+    case climate::CLIMATE_MODE_FAN_ONLY:
+      message[4] |= 0x04;  // RAC_PT1411HWRU_MODE_FAN (test harness only)
       break;
     case climate::CLIMATE_MODE_COOL:
     case climate::CLIMATE_MODE_OFF:
@@ -650,6 +653,7 @@ bool FurrionChillCube::transmit_mode_command_() {
 
 void FurrionChillCube::transmit_cs_update_() {
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) return;
+  if (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY) return;  // no CS demand in fan-only (test harness)
   // Don't broadcast a CS demand on incomplete info: the gear-CS signal needs
   // both a valid inside temperature and a valid setpoint. On a transient gap
   // the unit just coasts; on a gap longer than its ~7-min CS-mode timeout it
@@ -3620,6 +3624,8 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   }
   if (mode == 0) {
     active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+  } else if (mode == 3) {
+    active_ir_mode_ = climate::CLIMATE_MODE_FAN_ONLY;   // fan-only: compressor off, fan at the requested speed
   } else if (mode == 2) {
     active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
     furrion_setpoint_c_ = setpoint_c;
@@ -3630,8 +3636,8 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
     this->target_temperature_high = (float) setpoint_c;
   }
   current_cs_ = cs;
-  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
-    transmit_mode_command_();
+  if (active_ir_mode_ == climate::CLIMATE_MODE_OFF || active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
+    transmit_mode_command_();   // no CS bracket for OFF / fan-only
   } else {
     transmit_mode_with_cs_();   // CS → MODE/setpoint → CS bracket
   }

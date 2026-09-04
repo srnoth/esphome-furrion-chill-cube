@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import climate, sensor, binary_sensor, button, remote_transmitter
+from esphome.components import climate, sensor, binary_sensor, button, remote_transmitter, text_sensor
 from esphome.const import (
     CONF_ID,
     CONF_NAME,
@@ -12,7 +12,7 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["remote_transmitter"]
-AUTO_LOAD = ["sensor", "binary_sensor", "button"]
+AUTO_LOAD = ["sensor", "binary_sensor", "button", "text_sensor"]
 CODEOWNERS = ["@srnoth"]
 
 fcc_ns = cg.esphome_ns.namespace("furrion_chill_cube")
@@ -141,6 +141,9 @@ CONF_DEBUG_ROOM_DRIFT = "debug_room_drift"
 CONF_DEBUG_FAN_FEEDFORWARD = "debug_fan_feedforward"
 CONF_DEBUG_EFFECTIVE_FAN = "debug_effective_fan"
 CONF_DEBUG_RAISE_FREEZE = "debug_raise_freeze"
+# Engine regime label (2026-09-04): text sensor, one word per controller state — see the
+# priority list in publish_debug_state_(). Populated by debug: true like the numeric sensors.
+CONF_DEBUG_REGIME = "debug_regime"
 
 # (config_key, setter_name)
 DEBUG_SENSOR_MAP = [
@@ -182,6 +185,10 @@ _DEBUG_SENSOR_DRIFT = sensor.sensor_schema(
     entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
 )
 
+_DEBUG_TEXT = text_sensor.text_sensor_schema(
+    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+)
+
 _DEBUG_SCHEMAS = {
     CONF_DEBUG_ACTIVE_IR_MODE: _DEBUG_SENSOR,
     CONF_DEBUG_LAST_ACTIVE_MODE: _DEBUG_SENSOR,
@@ -217,6 +224,10 @@ def _auto_debug_sensors(config):
                     "disabled_by_default": False,
                 }
                 config[key] = schema(base)
+        if CONF_DEBUG_REGIME not in config:
+            config[CONF_DEBUG_REGIME] = _DEBUG_TEXT(
+                {"name": "Debug Regime", "disabled_by_default": False}
+            )
     return config
 
 
@@ -492,6 +503,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_DEBUG_FAN_FEEDFORWARD): _DEBUG_SENSOR,
             cv.Optional(CONF_DEBUG_EFFECTIVE_FAN): _DEBUG_SENSOR,
             cv.Optional(CONF_DEBUG_RAISE_FREEZE): _DEBUG_SENSOR,
+            cv.Optional(CONF_DEBUG_REGIME): _DEBUG_TEXT,
             # Buttons (optional)
             cv.Optional(CONF_DISPLAY_TOGGLE): button.button_schema(
                 DisplayToggleButton,
@@ -660,3 +672,6 @@ async def to_code(config):
         if key in config:
             s = await sensor.new_sensor(config[key])
             cg.add(getattr(var, setter)(s))
+    if CONF_DEBUG_REGIME in config:
+        t = await text_sensor.new_text_sensor(config[CONF_DEBUG_REGIME])
+        cg.add(var.set_debug_regime_sensor(t))

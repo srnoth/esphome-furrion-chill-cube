@@ -3541,6 +3541,29 @@ void FurrionChillCube::publish_debug_state_(float diff) {
     default:                          eff_fan = -1.0f; break;   // -1 (OFF) or an unmapped mode
   }
   pub(debug_effective_fan_sensor_, eff_fan);
+
+  // Engine regime label (2026-09-04, Phase 2 data labelling): one word per controller state so
+  // recorder samples can be bucketed offline without reconstructing the state machine from the
+  // timer sensors. Priority order is deliberate: harness/failsafe overlays first, then the
+  // climate mode, then the engine's own phases. An approach hold outranks its own entry
+  // maneuver (the OFF-fired hold IS its clamp — without this it would never read "approach";
+  // kick_phase still shows the clamp). "unit_off" = a mode is selected but the unit is OFF
+  // (natural-off park, or not yet started); "idle" = gear 0 in-mode (fan only); "running" =
+  // gear >= 1 under the ladder/bias with no approach hold or maneuver in progress.
+  if (debug_regime_sensor_) {
+    const char *regime;
+    int g = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? heat_gear_ : cool_gear_;
+    if (test_mode_)                                          regime = "test";
+    else if (failsafe_active_)                               regime = "failsafe";
+    else if (this->mode == climate::CLIMATE_MODE_OFF)        regime = "off";
+    else if (approach_hold_cool_ || approach_hold_heat_)     regime = "approach";
+    else if (maneuver_phase_ != ManeuverPhase::IDLE)         regime = "maneuver";
+    else if (active_ir_mode_ == climate::CLIMATE_MODE_OFF)   regime = "unit_off";
+    else if (g <= 0)                                         regime = "idle";
+    else                                                     regime = "running";
+    if (!debug_regime_sensor_->has_state() || debug_regime_sensor_->state != regime)
+      debug_regime_sensor_->publish_state(regime);
+  }
 }
 
 // ============================================================

@@ -6,6 +6,7 @@
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/button/button.h"
 #include "esphome/core/preferences.h"
 
@@ -166,6 +167,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_debug_fan_feedforward_sensor(sensor::Sensor *s) { debug_fan_feedforward_sensor_ = s; }
   void set_debug_effective_fan_sensor(sensor::Sensor *s) { debug_effective_fan_sensor_ = s; }
   void set_debug_raise_freeze_sensor(sensor::Sensor *s) { debug_raise_freeze_sensor_ = s; }
+  void set_debug_regime_sensor(text_sensor::TextSensor *s) { debug_regime_sensor_ = s; }
 
   // IR commands (public for button access)
   void send_display_toggle();
@@ -375,6 +377,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *debug_fan_feedforward_sensor_{nullptr};
   sensor::Sensor *debug_effective_fan_sensor_{nullptr};   // last-transmitted fan (0 auto/1 low/2 med/3 high, -1 off)
   sensor::Sensor *debug_raise_freeze_sensor_{nullptr};    // 0 = none, 1 = cool freeze armed, 2 = heat freeze armed
+  text_sensor::TextSensor *debug_regime_sensor_{nullptr}; // engine regime word (see publish_debug_state_)
 
   // Phase 2 adaptive input
   binary_sensor::BinarySensor *vent_fan_sensor_{nullptr};

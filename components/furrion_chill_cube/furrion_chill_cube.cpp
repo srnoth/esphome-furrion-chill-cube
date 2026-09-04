@@ -2773,12 +2773,8 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       // Positive-bias-aware pick on sel_basis (2026-08-15, sign-mirror of cool — see the cool
       // basis note for what is deliberately excluded). ⚠️ winter-unvalidated.
       int picked = pick_from_below(sel_basis);
-      // OFF entries honor the OFF→gear quirk hard rule — mirror of cool (walk down to the
-      // highest quirk-covered target; the dwell-gated ladder climbs the rest).
-      if (gear == -1) {
-        while (picked > heat_cold_start_floor_ && find_quirk_(true, -1, picked) == nullptr)
-          picked--;
-      }
+      // OFF-entry rules — mirror of cool (2026-09-04): any active gear, quirk row applied if the
+      // YAML has one, else bare; never idle directly from OFF. ⚠️ winter-unvalidated.
       if (picked >= 1) {
         new_gear = picked;
         if (gear == -1 && new_gear < heat_cold_start_floor_) new_gear = heat_cold_start_floor_;
@@ -3211,15 +3207,14 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       // Live case 2026-08-15 04:42: OFF re-entry at real 0.79 / bias 2.0 picked g1 and crawled;
       // this pick lands the load-justified gear (cold-start floor still applies as a MINIMUM).
       int picked = pick_from_below(sel_basis);
-      // OFF entries honor the 2026-08-03 HARD RULE (kickstart quirks REQUIRED for all OFF→gear
-      // changes): walk the pick down to the highest target that HAS an OFF-entry quirk — the
-      // dwell-gated ladder (rate-gate escape included) climbs the rest. Also applies to a
-      // large-real-diff pick, which could previously land -1→3/4 quirkless (latent, near-
-      // unreachable pre-2026-08-15; the bias-aware pick made it routine, so close it for both).
-      if (gear == -1) {
-        while (picked > cool_cold_start_floor_ && find_quirk_(false, -1, picked) == nullptr)
-          picked--;
-      }
+      // OFF-entry rules (Stephen, 2026-09-04): (1) OFF may enter ANY active gear the pick lands on;
+      // the CS/maneuver block below looks up the (-1 → gear) quirk row like any other transition —
+      // apply it if the YAML has one, else the gear's CS goes out bare. Which OFF entries need a
+      // clamped start is a HARDWARE fact and lives in the quirk table (this unit: g1/g2 rows, since
+      // from-OFF start needs CS >= SP+1); the engine must not encode it — a unit that cold-starts
+      // bare simply has no OFF rows. (2) OFF never enters idle directly: OFF→ON only when the pick
+      // calls for a compressor gear (the `picked >= 1` / "stays off" branches below).
+      // (Replaces the 08-15 row-coverage walk-down and the 08-16 identity rows it forced.)
       if (picked >= 1) {
         new_gear = picked;
         if (gear == -1 && new_gear < cool_cold_start_floor_) new_gear = cool_cold_start_floor_;

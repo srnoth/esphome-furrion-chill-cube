@@ -3967,8 +3967,8 @@ void FurrionChillCube::set_script_gear(int gear, int mode) {
   if (!was) enter_script_mode_();
   user_changed_ = true;                   // apply on the next loop pass, not the next 60 s interval
   last_gear_run_ = 0;
-  if (this->mode == climate::CLIMATE_MODE_OFF)
-    ESP_LOGW(TAG, "Script gear %d set while HA mode is OFF — inert until a mode is selected", gear);
+  if (mode == 0 && this->mode == climate::CLIMATE_MODE_OFF)
+    ESP_LOGW(TAG, "Script gear %d set while HA mode is OFF (follow-HA) — inert until a mode is selected or bound", gear);
   ESP_LOGI(TAG, "Script gear -> %d (mode %s)", gear, mode == 1 ? "COOL" : mode == 2 ? "HEAT" : "follow-HA");
 }
 

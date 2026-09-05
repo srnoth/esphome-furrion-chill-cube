@@ -552,8 +552,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool resume_from_test_{false};  // set on test-exit → gear re-pick uses eff_diff (bias-aware), not real diff
   int script_gear_{SCRIPT_NONE};     // gear-script mode: SCRIPT_NONE = production; -1 OFF, 0 idle, 1..max
   uint32_t script_set_at_{0};        // millis() of the last set_script_gear (expiry clock; callback-armed → self-clocked)
-  uint32_t script_timeout_ms_{900000}; // script gear expires this long after its last (re)assert; 0 = never
-  bool script_off_logged_{false};    // one LOGW per scripted OFF→idle refusal
+  uint32_t script_timeout_ms_{900000}; // script gear expires this long after its last (re)assert (schema min 60 s)
+  bool script_off_logged_{false};    // one LOGW per scripted OFF→idle refusal (per scripted gear)
+  bool script_idle_logged_{false};   // one LOGW per script for "armed but no mode active" (run_idle_mode_)
   bool temp_dirty_{false};
   bool heater_locked_out_{false};
   // Setpoint debounce (see SETPOINT_SETTLE_MS): a temp change arms this; loop() commits it

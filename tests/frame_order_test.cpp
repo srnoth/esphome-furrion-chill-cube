@@ -60,7 +60,9 @@ static int script_pick(const Ctl &c, int script_gear, int gear, uint32_t now) {
 int main() {
   printf("apply_gear_frames_ — one ordering rule for bare changes, quirk entries, quirk exits\n");
   {
-    // Production cool table: g1 SP-1 auto, g2 SP+0 auto, g3 SP+3 med, g4 SP+3 high; via low/SP+3.
+    // Cool tables exercised: the 09-03 set (g1 SP-1 auto, g2 SP+0 auto, g3 SP+3 med, g4 SP+3 high, via
+    // low/SP+3) AND the 09-05 live set (g2 = low/SP+3 fixed: 1->2 bare = the "quirk 1->2 entry" row below,
+    // 2->1 bare = the "quirk exit low/SP+3 -> auto" sandwich row, 2->3 = low->med CS same = MAIN only).
     Wire w{19, AUTO, true, false};
     check(apply_gear_frames(w, 20, AUTO) == "CS", "bare 1->2 (fan same): CS only");
     w = {20, AUTO, true, false};

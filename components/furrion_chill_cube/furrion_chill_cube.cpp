@@ -963,7 +963,7 @@ void FurrionChillCube::loop() {
   // 1a. Gear-script expiry: a scripted gear dies script_timeout_ms_ after its last (re)assert so a
   // dead sequencer / HA link can never park the unit on a scripted gear. Self-clocked on millis()
   // (script_set_at_ is stamped from a callback — reference_furrion_millis_now_footgun).
-  if (script_gear_ != SCRIPT_NONE && script_timeout_ms_ > 0 &&
+  if (script_gear_ != SCRIPT_NONE && script_timeout_ms_ > 0 &&   // (>0 is belt-and-braces: schema min 60 s)
       (millis() - script_set_at_) >= script_timeout_ms_) {
     ESP_LOGW(TAG, "Script gear %d expired (%lu min without re-assert) — back to production",
              script_gear_, (unsigned long) (script_timeout_ms_ / 60000UL));
@@ -2028,9 +2028,14 @@ void FurrionChillCube::advance_maneuver_(uint32_t now) {
       // while a setpoint change is debouncing, and maybe_apply_gear_fan_ is inert during a maneuver
       // — bug-check R1): if the wire fan still isn't the hold's fan, send it now, BEFORE the CS
       // re-assert (fan cap first, then drive — the same order entry would have used).
-      if (!setpoint_pending_ && (int) get_effective_fan_mode_() != last_tx_fan_) {
-        transmit_mode_command_();
-        ESP_LOGI(TAG, "Maneuver: deferred via_fan sent on reinforce (fan=%d)", last_tx_fan_);
+      // Scoped to the hold's OWN via_fan (a via_fan-unset row must not push the ladder's / HA's fan
+      // mid-hold — control() deliberately withholds those until release) and gated like the other
+      // two transmit doors (setpoint_pending_ AND user_changed_, the settled-but-unconsumed commit a
+      // NaN-room grace hold can pin) — bug-check R2.
+      if (maneuver_via_fan_ >= 0 && !setpoint_pending_ && !user_changed_ &&
+          (int) fan_int_to_mode_(maneuver_via_fan_) != last_tx_fan_) {
+        if (transmit_mode_command_())
+          ESP_LOGI(TAG, "Maneuver: deferred via_fan sent on reinforce (fan=%d)", last_tx_fan_);
       }
       transmit_cs_update_();
       last_cs_heartbeat_ = now;
@@ -3536,12 +3541,19 @@ void FurrionChillCube::run_idle_mode_(uint32_t now) {
   // A gear script is inert here (HA mode OFF, or HEAT_COOL with both gears -1 and the room inside the
   // deadband so arbitrate_mode_ picked neither) — say so once per script rather than silently holding
   // the unit OFF for the run (bug-check R1; HEAT_COOL script semantics = open design item).
-  if (is_script_mode() && !script_off_logged_) {
-    script_off_logged_ = true;
+  if (is_script_mode() && !script_idle_logged_) {
+    script_idle_logged_ = true;
     ESP_LOGW(TAG, "Script gear %d armed but no mode active (HA mode %d, HEAT_COOL deadband?) — unit stays OFF",
              script_gear_, (int) this->mode);
   }
-  // Ensure HVAC is OFF
+  // Ensure HVAC is OFF. A PRE_CS maneuver (unit not yet on) is dropped too — otherwise
+  // advance_maneuver_ would turn the unit on against this pass (e.g. a heat OFF→1 start armed
+  // moments before the outdoor lockout tripped — bug-check R2).
+  if (maneuver_phase_ == ManeuverPhase::PRE_CS) {
+    maneuver_phase_ = ManeuverPhase::IDLE;
+    maneuver_start_ = 0;
+    ESP_LOGI(TAG, "Maneuver PRE_CS dropped — neither mode active");
+  }
   if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
     transmit_mode_command_();
@@ -3835,6 +3847,7 @@ void FurrionChillCube::enter_script_mode_() {
   stall_logged_c_ = false;
   stall_logged_h_ = false;
   script_off_logged_ = false;
+  script_idle_logged_ = false;
   publish_debug_state_(NAN);             // clear phantom hold/freeze state on the debug sensors now
   ESP_LOGI(TAG, "SCRIPT mode ON — scripted gears replace the logic ladder; control ladder live");
 }

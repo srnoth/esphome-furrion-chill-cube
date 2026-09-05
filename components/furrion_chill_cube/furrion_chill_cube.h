@@ -238,7 +238,14 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool transmit_mode_command_();  // false = suppressed by the no-valid-setpoint gate (nothing sent)
   void transmit_mode_with_cs_();
   void transmit_cs_update_();
-  void transmit_raw_6byte_(const uint8_t *msg);
+  void transmit_raw_6byte_(const uint8_t *msg, const char *label = "RAW");
+  // Wire log (2026-09-05): one INFO line per IR frame, emitted just before transmit.perform().
+  // Transmits are blocking + sequential, so log order == wire order; t= is millis() at emit.
+  // Consumed by HA's ESPHome "Subscribe to logs from the device" option -> home-assistant.log.
+  void log_frame_(const char *kind, const uint8_t *msg, uint8_t len, const char *decoded);
+  static const char *mode_name_(climate::ClimateMode m);
+  static const char *fan_name_(climate::ClimateFanMode f);
+  uint32_t tx_seq_{0};  // wire-log frame counter (wraps; only used to make lines distinct)
 
   // Gear controller
   void run_gear_controller_();

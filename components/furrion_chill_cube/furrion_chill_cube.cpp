@@ -1,6 +1,7 @@
 #include "furrion_chill_cube.h"
 #include "esphome/core/log.h"
 #include <cmath>  // expf, isnan (adaptive integral decay)
+#include <cstdio>  // snprintf (wire log)
 
 #ifdef USE_API
 #include "esphome/components/api/api_server.h"
@@ -484,6 +485,40 @@ void FurrionChillCube::encode_(remote_base::RemoteTransmitData *data,
 // IR Transmission Methods
 // ============================================================
 
+// ============================================================
+// Wire log — one line per IR frame, in wire order. Format:
+//   TX #<seq> t=<millis> <KIND> <hex bytes> | <decoded>
+// KIND: MAIN (B2 mode/fan/SP frame, 6 or 12 bytes), SWING (B9 trailer sent with every MAIN),
+// CS (BA Comfort-Sense frame), or the raw-command label (DISPLAY/TURBO_ON/.../PROBE).
+// ============================================================
+const char *FurrionChillCube::mode_name_(climate::ClimateMode m) {
+  switch (m) {
+    case climate::CLIMATE_MODE_OFF: return "off";
+    case climate::CLIMATE_MODE_COOL: return "cool";
+    case climate::CLIMATE_MODE_HEAT: return "heat";
+    case climate::CLIMATE_MODE_FAN_ONLY: return "fan_only";
+    case climate::CLIMATE_MODE_HEAT_COOL: return "heat_cool";
+    default: return "?";
+  }
+}
+const char *FurrionChillCube::fan_name_(climate::ClimateFanMode f) {
+  switch (f) {
+    case climate::CLIMATE_FAN_AUTO: return "auto";
+    case climate::CLIMATE_FAN_LOW: return "low";
+    case climate::CLIMATE_FAN_MEDIUM: return "med";
+    case climate::CLIMATE_FAN_HIGH: return "high";
+    default: return "?";
+  }
+}
+void FurrionChillCube::log_frame_(const char *kind, const uint8_t *msg, uint8_t len, const char *decoded) {
+  char hex[3 * 12 + 1] = {0};  // frames are 6 or 12 bytes
+  if (len > 12) len = 12;
+  for (uint8_t i = 0; i < len; i++) {
+    snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02X%s", msg[i], (i + 1 < len) ? " " : "");
+  }
+  ESP_LOGI(TAG, "TX #%u t=%u %s %s | %s", (unsigned) ++tx_seq_, (unsigned) millis(), kind, hex, decoded);
+}
+
 bool FurrionChillCube::transmit_mode_command_() {
   // Don't broadcast a mode/setpoint command for an active mode without a valid
   // setpoint — incomplete info. The OFF command carries no setpoint and is
@@ -610,6 +645,19 @@ bool FurrionChillCube::transmit_mode_command_() {
   if (send_packet2) {
     this->encode_(data, &message[6], 6, 0);
   }
+  {
+    char dec[64];
+    if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
+      snprintf(dec, sizeof(dec), "mode=off");
+    } else if (use_fahrenheit_) {
+      snprintf(dec, sizeof(dec), "mode=%s fan=%s pct=%d sp=%dF%s", mode_name_(active_ir_mode_), fan_name_(fan),
+               (test_mode_ ? test_fan_pct_ : 0), last_tx_target_f_, test_mode_ ? " test" : "");
+    } else {
+      snprintf(dec, sizeof(dec), "mode=%s fan=%s pct=%d sp=%dC%s", mode_name_(active_ir_mode_), fan_name_(fan),
+               (test_mode_ ? test_fan_pct_ : 0), furrion_setpoint_c_, test_mode_ ? " test" : "");
+    }
+    log_frame_("MAIN", message, send_packet2 ? 12 : 6, dec);
+  }
   transmit.perform();
 
   // === Transmission 2: Swing (B9) — separate transmit call for clean state ===
@@ -623,9 +671,11 @@ bool FurrionChillCube::transmit_mode_command_() {
     if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
       static const uint8_t SWING_ON[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
       this->encode_(swing_data, SWING_ON, 6, 1);
+      log_frame_("SWING", SWING_ON, 6, "swing=on (main trailer)");
     } else {
       static const uint8_t SWING_OFF[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
       this->encode_(swing_data, SWING_OFF, 6, 1);
+      log_frame_("SWING", SWING_OFF, 6, "swing=off (main trailer)");
     }
     swing_data->space(IR_PACKET_SPACE);
     swing_tx.perform();
@@ -704,6 +754,11 @@ void FurrionChillCube::transmit_cs_update_() {
   message[5] = ~message[4];
 
   this->encode_(data, message, 6, 1);
+  {
+    char dec[48];
+    snprintf(dec, sizeof(dec), "cs=%d mode=%s%s", current_cs_, mode_name_(active_ir_mode_), test_mode_ ? " test" : "");
+    log_frame_("CS", message, 6, dec);
+  }
   transmit.perform();
 }
 
@@ -759,13 +814,14 @@ void FurrionChillCube::fire_mode_resend_() {
   }
 }
 
-void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg) {
+void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg, const char *label) {
   auto transmit = this->transmitter_->transmit();
   auto *data = transmit.get_data();
   // Inter-message guard idle so a raw command (swing/turbo/display) is never jammed
   // against an adjacent CS/mode frame. See IR_INTER_MSG_GAP.
   data->space(IR_INTER_MSG_GAP);
   this->encode_(data, msg, 6, 1);
+  log_frame_(label, msg, 6, "raw 6-byte command");
   transmit.perform();
 }
 
@@ -775,29 +831,29 @@ void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg) {
 
 void FurrionChillCube::send_display_toggle() {
   static const uint8_t CMD[] = {0xB9, 0x46, 0xF5, 0x0A, 0x09, 0xF6};
-  this->transmit_raw_6byte_(CMD);
+  this->transmit_raw_6byte_(CMD, "DISPLAY");
 }
 void FurrionChillCube::send_turbo_on() {
   static const uint8_t CMD[] = {0xB9, 0x46, 0xF5, 0x0A, 0x01, 0xFE};
-  this->transmit_raw_6byte_(CMD);
+  this->transmit_raw_6byte_(CMD, "TURBO_ON");
 }
 void FurrionChillCube::send_turbo_off() {
   static const uint8_t CMD[] = {0xB9, 0x46, 0xF5, 0x0A, 0x02, 0xFD};
-  this->transmit_raw_6byte_(CMD);
+  this->transmit_raw_6byte_(CMD, "TURBO_OFF");
 }
 void FurrionChillCube::send_swing_on() {
   static const uint8_t CMD[] = {0xB9, 0x46, 0xF5, 0x0A, 0x04, 0xFB};
-  this->transmit_raw_6byte_(CMD);
+  this->transmit_raw_6byte_(CMD, "SWING_ON");
 }
 void FurrionChillCube::send_swing_off() {
   static const uint8_t CMD[] = {0xB9, 0x46, 0xF5, 0x0A, 0x05, 0xFA};
-  this->transmit_raw_6byte_(CMD);
+  this->transmit_raw_6byte_(CMD, "SWING_OFF");
 }
 
 void FurrionChillCube::send_probe_6byte(uint8_t code) {
   const uint8_t cmd[] = {0xB9, 0x46, 0xF5, 0x0A, code, (uint8_t) ~code};
   ESP_LOGI(TAG, "Probe TX: B9 46 F5 0A %02X %02X", cmd[4], cmd[5]);
-  this->transmit_raw_6byte_(cmd);
+  this->transmit_raw_6byte_(cmd, "PROBE");
 }
 
 void FurrionChillCube::resync_ir_state() {

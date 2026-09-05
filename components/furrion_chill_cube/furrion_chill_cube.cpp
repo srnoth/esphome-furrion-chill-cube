@@ -1998,7 +1998,8 @@ void FurrionChillCube::advance_maneuver_(uint32_t now) {
     // Mode-on waits for a valid room reading: a NaN-room grace return skips the gear pass but not this
     // engine, and waking the unit while every CS frame is suppressed (isnan gate) would leave it running
     // blind with no CS behind it (bug-check R3). The lead simply extends; failsafe clears the phase.
-    if ((now - maneuver_phase_start_) >= 500 && (test_mode_ || !isnan(inside_temp_c_))) enter_maneuver_hold_(now);
+    if ((now - maneuver_phase_start_) >= 500 && !isnan(inside_temp_c_) && !isnan(get_active_ir_target_()))
+      enter_maneuver_hold_(now);   // both gates transmit_cs_update_/transmit_mode_command_ need (R4)
     return;
   }
   if (maneuver_phase_ != ManeuverPhase::HOLD) return;
@@ -2690,10 +2691,16 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     force_off_for_mode_switch_(now);
     return true;  // hold; heat re-engages from -1 after the dwell (OFF→ON homes the vane)
   }
-  // Defensive: clear a stale cool gear (unit already OFF via the natural path).
+  // Defensive: clear a stale cool gear (unit already OFF via the natural path) — and a COOL maneuver
+  // still pending with it (mirror of the cool pass; bug-check R4).
   if (cool_gear_ != -1) {
     cool_gear_ = -1;
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+  }
+  if (maneuver_phase_ != ManeuverPhase::IDLE && !maneuver_is_heat_) {
+    maneuver_phase_ = ManeuverPhase::IDLE;
+    maneuver_start_ = 0;
+    ESP_LOGI(TAG, "Maneuver (cool) dropped — heat pass active");
   }
 
   // Pinned ladder trips (start/stop/idle). Grid trips (gear n↔n+1) are read directly from
@@ -3057,10 +3064,17 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     force_off_for_mode_switch_(now);
     return true;  // hold; cool re-engages from -1 after the dwell (OFF→ON homes the vane)
   }
-  // Defensive: clear a stale heat gear (unit already OFF via the natural path).
+  // Defensive: clear a stale heat gear (unit already OFF via the natural path) — and a HEAT maneuver
+  // still pending with it (a heat OFF→1 PRE_CS whose lead outlived a NaN grace / outdoor lockout would
+  // otherwise wake the unit in HEAT from loop step 3 while this pass runs cool — bug-check R4).
   if (heat_gear_ != -1) {
     heat_gear_ = -1;
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+  }
+  if (maneuver_phase_ != ManeuverPhase::IDLE && maneuver_is_heat_) {
+    maneuver_phase_ = ManeuverPhase::IDLE;
+    maneuver_start_ = 0;
+    ESP_LOGI(TAG, "Maneuver (heat) dropped — cool pass active");
   }
   // Cool pass: heat is not the active mode → drop its integral so a later cool→heat switch starts
   // from bias_h_ = 0 (mirror of the bias_c_ = 0 at the top of run_heat_mode_).
@@ -3745,6 +3759,8 @@ void FurrionChillCube::set_test_mode(bool t) {
     ESP_LOGI(TAG, "TEST mode OFF — resuming production controller (will re-anchor next pass)");
   } else if (!test_mode_ && t) {
     script_gear_ = SCRIPT_NONE;    // regimes are exclusive — the frame harness wins when set last
+    maneuver_phase_ = ManeuverPhase::IDLE;   // a maneuver frozen through a bench session must not fire on exit (R4)
+    maneuver_start_ = 0;
     mode_resend_pending_ = false;  // drop a pending reinforcement — stale late resends never cross a test session
     // test_frame rewrites target_temperature_high/low; a surviving baseline would read the
     // test-vs-real difference as a user SP change on exit and spuriously preload. Reset both
@@ -3777,6 +3793,8 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
     script_gear_ = SCRIPT_NONE;
     publish_debug_state_(NAN);        // gear passes stop in test mode — don't leave the regime on "script"
   }
+  maneuver_phase_ = ManeuverPhase::IDLE;   // the harness owns the wire now; no maneuver may fire on exit (R4)
+  maneuver_start_ = 0;
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
   last_committed_cool_target_c_ = NAN;  // bypasses set_test_mode() — reset SP-transition state here too
   last_committed_heat_target_c_ = NAN;
@@ -3836,6 +3854,8 @@ void FurrionChillCube::test_off() {
     script_gear_ = SCRIPT_NONE;
     publish_debug_state_(NAN);
   }
+  maneuver_phase_ = ManeuverPhase::IDLE;   // (R4) see test_frame
+  maneuver_start_ = 0;
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
   active_ir_mode_ = climate::CLIMATE_MODE_OFF;
   transmit_mode_command_();

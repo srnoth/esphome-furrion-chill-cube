@@ -219,7 +219,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   // script_timeout_ms_ after the last set_script_gear() (re-asserting the same gear restamps)
   // so a dead sequencer/HA link can never park the unit. Requires an active HA mode (inert
   // under HA mode OFF / failsafe). See design-gear-script-mode-2026-09-05.
-  void set_script_gear(int gear);   // -1 = OFF, 0 = idle, 1..max gear; (re)arms the expiry
+  // mode: 0 = follow the HA mode (arbitration as production), 1 = COOL, 2 = HEAT — a bound mode makes
+  // the script own the mode for the run (HA mode ignored until exit; cool↔heat goes through the normal
+  // forced-OFF + dwell). Stephen 2026-09-05. (Fan-only = future work: the component has no fan-only regime.)
+  void set_script_gear(int gear, int mode = 0);   // -1 = OFF, 0 = idle, 1..max gear; (re)arms the expiry
   void clear_script_gear();         // back to production (bias-justified re-pick next pass)
   bool is_script_mode() const { return script_gear_ != SCRIPT_NONE; }
   int script_gear() const { return script_gear_; }
@@ -540,6 +543,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t mode_resend_armed_at_{0};   // millis() stamp of the arming frame (self-clocked timer)
   bool mode_resend_pending_{false};
   bool mode_resending_{false};         // reinforcement in flight — suppresses re-arm in transmit_mode_command_
+  // The reinforcement REPLAYS the original command sequence (Stephen 2026-09-05): shape recorded at arming.
+  enum class MainShape : uint8_t { MAIN, MAIN_CS, CS_MAIN_CS };
+  MainShape mode_resend_shape_{MainShape::MAIN};
+  void fire_mode_resend_();
 
   // Flags
   bool boot_ready_{false};
@@ -551,6 +558,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool user_changed_{false};
   bool resume_from_test_{false};  // set on test-exit → gear re-pick uses eff_diff (bias-aware), not real diff
   int script_gear_{SCRIPT_NONE};     // gear-script mode: SCRIPT_NONE = production; -1 OFF, 0 idle, 1..max
+  int script_mode_{0};               // 0 follow HA, 1 COOL, 2 HEAT (see set_script_gear)
+  bool resync_on_resume_{false};     // test/script exit: fire a full CS→Main→CS for the evaluated gear on the first pass
+  bool bracket_sent_this_pass_{false};   // transmit_mode_with_cs_ ran during the current gear pass
   uint32_t script_set_at_{0};        // millis() of the last set_script_gear (expiry clock; callback-armed → self-clocked)
   uint32_t script_timeout_ms_{900000}; // script gear expires this long after its last (re)assert (schema min 60 s)
   bool script_off_logged_{false};    // one LOGW per scripted OFF→idle refusal (per scripted gear)

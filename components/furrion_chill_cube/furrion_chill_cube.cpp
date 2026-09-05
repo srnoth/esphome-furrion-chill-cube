@@ -518,7 +518,7 @@ bool FurrionChillCube::transmit_mode_command_() {
   } else if (use_fahrenheit_) {
     // target_c is guaranteed non-NaN — the gate at the top of this function
     // returns early for an active mode without a valid setpoint.
-    float target_c = get_active_ir_target_();
+    float target_c = test_mode_ ? (float) furrion_setpoint_c_ : get_active_ir_target_();   // bench frames carry the bench SP
     int target_f = (int)roundf(target_c * 1.8f + 32.0f);
     target_f = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, target_f));
     temp_code = TEMP_F_TABLE[target_f - FURRION_MIN_TEMP_F];
@@ -647,6 +647,7 @@ bool FurrionChillCube::transmit_mode_command_() {
   if (mode_resend_delay_ms_ > 0 && !mode_resending_ && !test_mode_) {
     mode_resend_pending_ = true;
     mode_resend_armed_at_ = millis();
+    mode_resend_shape_ = MainShape::MAIN;   // wrappers that bracket this frame with CS override the shape
   }
   return true;
 }
@@ -722,7 +723,40 @@ void FurrionChillCube::transmit_mode_with_cs_() {
   transmit_cs_update_();
   transmit_mode_command_();
   transmit_cs_update_();
+  if (mode_resend_pending_) mode_resend_shape_ = MainShape::CS_MAIN_CS;   // replay the whole bracket
+  bracket_sent_this_pass_ = true;
   last_cs_heartbeat_ = millis();  // a CS just went out — restart the 30s heartbeat clock
+}
+
+// Fire the one-shot reinforcement as a REPLICA of the original command sequence (Stephen 2026-09-05):
+// the same CS/Main shape that went out at arming, re-read from current state. CS frames self-gate on
+// mode OFF / NaN, so an OFF frame's replay is Main only regardless of shape.
+void FurrionChillCube::fire_mode_resend_() {
+  mode_resending_ = true;
+  bool sent = false;
+  switch (mode_resend_shape_) {
+    case MainShape::CS_MAIN_CS:
+      transmit_cs_update_();
+      sent = transmit_mode_command_();
+      transmit_cs_update_();
+      break;
+    case MainShape::MAIN_CS:
+      sent = transmit_mode_command_();
+      transmit_cs_update_();
+      break;
+    default:
+      sent = transmit_mode_command_();
+      break;
+  }
+  mode_resending_ = false;
+  if (mode_resend_shape_ != MainShape::MAIN && active_ir_mode_ != climate::CLIMATE_MODE_OFF)
+    last_cs_heartbeat_ = millis();
+  if (sent) {
+    ESP_LOGI(TAG, "Mode frame reinforced (%s) mode=%d fan=%d",
+             mode_resend_shape_ == MainShape::CS_MAIN_CS ? "CS,MAIN,CS" :
+             mode_resend_shape_ == MainShape::MAIN_CS ? "MAIN,CS" : "MAIN",
+             (int) active_ir_mode_, last_tx_fan_);
+  }
 }
 
 void FurrionChillCube::transmit_raw_6byte_(const uint8_t *msg) {
@@ -1053,15 +1087,7 @@ void FurrionChillCube::loop() {
   if (mode_resend_pending_ && !setpoint_pending_ && !user_changed_ &&
       maneuver_phase_ != ManeuverPhase::PRE_CS && resend_elapsed >= mode_resend_delay_ms_) {
     mode_resend_pending_ = false;
-    if (boot_ready_ && !failsafe_active_) {
-      mode_resending_ = true;
-      bool sent = transmit_mode_command_();
-      mode_resending_ = false;
-      if (sent) {
-        ESP_LOGI(TAG, "Mode frame reinforced (+%lums actual) mode=%d fan=%d",
-                 (unsigned long) resend_elapsed, (int) active_ir_mode_, last_tx_fan_);
-      }
-    }
+    if (boot_ready_ && !failsafe_active_) fire_mode_resend_();   // replica of the original sequence
   }
 
   // 4. CS heartbeat every cs_transmit_interval_ms_ (default 10s; current_cs_ is the override CS
@@ -1860,15 +1886,17 @@ void FurrionChillCube::apply_gear_frames_(int new_cs, uint32_t now) {
         last_cs_heartbeat_ = now;
       }
     } else if (!cs_changed) {
-      transmit_mode_command_();
+      transmit_mode_command_();       // shape MAIN (default)
     } else if (new_fan == climate::CLIMATE_FAN_AUTO) {
       transmit_cs_update_();          // fixed → auto: CS, Main, CS
       transmit_mode_command_();
       transmit_cs_update_();
+      if (mode_resend_pending_) mode_resend_shape_ = MainShape::CS_MAIN_CS;
       last_cs_heartbeat_ = now;
     } else {
       transmit_mode_command_();       // auto/fixed → fixed: Main, CS
       transmit_cs_update_();
+      if (mode_resend_pending_) mode_resend_shape_ = MainShape::MAIN_CS;
       last_cs_heartbeat_ = now;
     }
     if (cs_changed || fan_changed)
@@ -1978,6 +2006,7 @@ void FurrionChillCube::enter_maneuver_hold_(uint32_t now) {
     set_active_ir_mode_(maneuver_is_heat_ ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
     transmit_mode_command_();   // carries via_fan; updates last_tx_fan_
     transmit_cs_update_();
+    if (mode_resend_pending_) mode_resend_shape_ = MainShape::MAIN_CS;
     last_cs_heartbeat_ = now;
     ESP_LOGI(TAG, "Maneuver HOLD (off-start): %s cs=%d fan=%d hold=%lus",
              maneuver_is_heat_ ? "HEAT" : "COOL", maneuver_via_cs_, (int) maneuver_via_fan_,
@@ -2040,6 +2069,7 @@ void FurrionChillCube::advance_maneuver_(uint32_t now) {
           (int) fan_int_to_mode_(maneuver_via_fan_) != last_tx_fan_) {
         if (transmit_mode_command_())
           ESP_LOGI(TAG, "Maneuver: deferred via_fan sent on reinforce (fan=%d)", last_tx_fan_);
+        if (mode_resend_pending_) mode_resend_shape_ = MainShape::MAIN_CS;
       }
       transmit_cs_update_();
       last_cs_heartbeat_ = now;
@@ -2254,6 +2284,7 @@ void FurrionChillCube::run_gear_controller_() {
     idle_since_ = now;
   }
 
+  bracket_sent_this_pass_ = false;
   bool user_input = user_changed_;
   if (user_input) user_changed_ = false;
   // Test-exit re-anchor: land the gear on the bias-justified value (eff_diff pick), not a real-diff
@@ -2270,6 +2301,13 @@ void FurrionChillCube::run_gear_controller_() {
 
   bool do_heat = false, do_cool = false;
   arbitrate_mode_(room, do_heat, do_cool);
+  // Gear-script with a BOUND mode owns the mode for the run (Stephen 2026-09-05): HA's mode is ignored
+  // until exit; the passes' own cool↔heat handling (forced OFF + dwell) still applies; the outdoor heat
+  // lockout still wins (→ idle pass, one-shot LOGW there).
+  if (is_script_mode() && script_mode_ != 0) {
+    do_cool = (script_mode_ == 1);
+    do_heat = (script_mode_ == 2) && !heater_locked_out_;
+  }
 
   // Dispatch to the active mode. run_heat/cool_mode_ return true if they took an
   // early (NaN-target) hold-return — propagate it so this pass stops cleanly.
@@ -3038,6 +3076,18 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided %s (unit stays OFF)", new_gear == 0 ? "idle" : "OFF");
   }
 
+  // Test/script exit (item 7, Stephen 2026-09-05): the unit has been driven by the harness/script, so once
+  // the production pick has landed, re-command it in full — CS→Main→CS for the evaluated gear, exactly as
+  // a setpoint change would — unless this pass already sent a bracket (HVAC-on / SP change) or a maneuver
+  // owns the wire (its own frames are authoritative; the bracket would carry the via CS).
+  if (resync_on_resume_) {
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_() && !bracket_sent_this_pass_) {
+      transmit_mode_with_cs_();
+      ESP_LOGI(TAG, "Resume from test/script: full CS/Main/CS re-command for heat gear %d", new_gear);
+    }
+    resync_on_resume_ = false;
+  }
+
   // Apply a per-gear commanded fan (heat gears carry none by default → no-op).
   maybe_apply_gear_fan_(now);
 
@@ -3557,6 +3607,15 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided %s (unit stays OFF)", new_gear == 0 ? "idle" : "OFF");
   }
 
+  // Test/script exit (item 7): see the heat pass — full CS→Main→CS re-command of the evaluated gear.
+  if (resync_on_resume_) {
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_() && !bracket_sent_this_pass_) {
+      transmit_mode_with_cs_();
+      ESP_LOGI(TAG, "Resume from test/script: full CS/Main/CS re-command for cool gear %d", new_gear);
+    }
+    resync_on_resume_ = false;
+  }
+
   // Apply a per-gear commanded fan (e.g. gear 3 = med → gear 4 = high, same CS): emit a mode frame
   // if the settled gear's fan differs from what's on the wire. No-op during a maneuver / when OFF /
   // in v1-style configs (no gear sets a fan). Runs after the mode-on above so a fresh start's fan
@@ -3574,9 +3633,10 @@ void FurrionChillCube::run_idle_mode_(uint32_t now) {
   // the unit OFF for the run (bug-check R1; HEAT_COOL script semantics = open design item).
   if (is_script_mode() && !script_idle_logged_) {
     script_idle_logged_ = true;
-    ESP_LOGW(TAG, "Script gear %d armed but no mode active (HA mode %d, HEAT_COOL deadband?) — unit stays OFF",
-             script_gear_, (int) this->mode);
+    ESP_LOGW(TAG, "Script gear %d armed but no mode active (HA mode %d, bound mode %d, heat lockout %d) — unit stays OFF",
+             script_gear_, (int) this->mode, script_mode_, (int) heater_locked_out_);
   }
+  resync_on_resume_ = false;   // HA says OFF: the OFF frame below IS the full re-command
   // Ensure HVAC is OFF. A PRE_CS maneuver (unit not yet on) is dropped too — otherwise
   // advance_maneuver_ would turn the unit on against this pass (e.g. a heat OFF→1 start armed
   // moments before the outdoor lockout tripped — bug-check R2).
@@ -3719,17 +3779,19 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   // (natural-off park, or not yet started); "idle" = gear 0 in-mode (fan only); "running" =
   // gear >= 1 under the ladder/bias with no approach hold or maneuver in progress.
   if (debug_regime_sensor_) {
-    const char *regime;
+    const char *sub;
     int g = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? heat_gear_ : cool_gear_;
-    if (test_mode_)                                          regime = "test";
-    else if (failsafe_active_)                               regime = "failsafe";
-    else if (is_script_mode())                               regime = "script";
-    else if (this->mode == climate::CLIMATE_MODE_OFF)        regime = "off";
-    else if (approach_hold_cool_ || approach_hold_heat_)     regime = "approach";
-    else if (maneuver_phase_ != ManeuverPhase::IDLE)         regime = "maneuver";
-    else if (active_ir_mode_ == climate::CLIMATE_MODE_OFF)   regime = "unit_off";
-    else if (g <= 0)                                         regime = "idle";
-    else                                                     regime = "running";
+    bool script = is_script_mode() && !test_mode_ && !failsafe_active_;
+    if (test_mode_)                                          sub = "test";
+    else if (failsafe_active_)                               sub = "failsafe";
+    else if (!script && this->mode == climate::CLIMATE_MODE_OFF) sub = "off";
+    else if (approach_hold_cool_ || approach_hold_heat_)     sub = "approach";
+    else if (maneuver_phase_ != ManeuverPhase::IDLE)         sub = "maneuver";
+    else if (active_ir_mode_ == climate::CLIMATE_MODE_OFF)   sub = "unit_off";
+    else if (g <= 0)                                         sub = "idle";
+    else                                                     sub = "running";
+    // Gear-script runs keep the engine substate visible: "script:<substate>" (Stephen 2026-09-05).
+    std::string regime = script ? std::string("script:") + sub : std::string(sub);
     if (!debug_regime_sensor_->has_state() || debug_regime_sensor_->state != regime)
       debug_regime_sensor_->publish_state(regime);
   }
@@ -3751,6 +3813,7 @@ void FurrionChillCube::set_test_mode(bool t) {
     test_fan_pct_ = 0;
     user_changed_ = true;
     resume_from_test_ = true;   // land on the bias-justified gear (eff_diff pick), not a real-diff drop
+    resync_on_resume_ = true;   // item 7: full CS→Main→CS re-command of the evaluated gear on the first pass
     last_gear_run_ = 0;
     // Test sequences move the room themselves (overcool steps) — that travel is machine-made, not
     // free, so it must not arm the approach displacement gate on exit. Same rule as the sensor-NaN
@@ -3824,12 +3887,10 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
     active_ir_mode_ = climate::CLIMATE_MODE_FAN_ONLY;   // fan-only: compressor off, fan at the requested speed
   } else if (mode == 2) {
     active_ir_mode_ = climate::CLIMATE_MODE_HEAT;
+    furrion_setpoint_c_ = setpoint_c;   // bench SP rides furrion_setpoint_c_ ONLY — the HA-facing targets stay
+  } else {                              // HA-live (attribute callbacks keep updating them during a test), so a
+    active_ir_mode_ = climate::CLIMATE_MODE_COOL;   // test exit re-evaluates from HA's real SP (Stephen 09-05)
     furrion_setpoint_c_ = setpoint_c;
-    this->target_temperature_low = (float) setpoint_c;   // keep the HA card consistent
-  } else {
-    active_ir_mode_ = climate::CLIMATE_MODE_COOL;
-    furrion_setpoint_c_ = setpoint_c;
-    this->target_temperature_high = (float) setpoint_c;
   }
   current_cs_ = cs;
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF || active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
@@ -3890,30 +3951,34 @@ void FurrionChillCube::enter_script_mode_() {
   ESP_LOGI(TAG, "SCRIPT mode ON — scripted gears replace the logic ladder; control ladder live");
 }
 
-void FurrionChillCube::set_script_gear(int gear) {
+void FurrionChillCube::set_script_gear(int gear, int mode) {
   if (gear < -1) {
     clear_script_gear();
     return;
   }
+  if (mode < 0 || mode > 2) mode = 0;
   if (test_mode_) set_test_mode(false);   // whichever regime is set last wins; leave the harness cleanly
   bool was = is_script_mode();
   script_set_at_ = millis();              // callback context → self-clocked expiry
-  if (was && gear == script_gear_) return;   // same gear: restamp only (sequencer keep-alive)
+  if (was && gear == script_gear_ && mode == script_mode_) return;   // same step: restamp only (keep-alive)
   script_gear_ = gear;                       // before enter_script_mode_ so its debug publish reads "script"
+  script_mode_ = mode;
   script_off_logged_ = false;
   if (!was) enter_script_mode_();
   user_changed_ = true;                   // apply on the next loop pass, not the next 60 s interval
   last_gear_run_ = 0;
   if (this->mode == climate::CLIMATE_MODE_OFF)
     ESP_LOGW(TAG, "Script gear %d set while HA mode is OFF — inert until a mode is selected", gear);
-  ESP_LOGI(TAG, "Script gear -> %d", gear);
+  ESP_LOGI(TAG, "Script gear -> %d (mode %s)", gear, mode == 1 ? "COOL" : mode == 2 ? "HEAT" : "follow-HA");
 }
 
 void FurrionChillCube::clear_script_gear() {
   if (!is_script_mode()) return;
   script_gear_ = SCRIPT_NONE;
+  script_mode_ = 0;
   user_changed_ = true;
   resume_from_test_ = true;   // land on the bias-justified gear (eff_diff pick), not a real-diff drop
+  resync_on_resume_ = true;   // item 7: re-evaluate from HA's live mode/SP and fire a full CS→Main→CS
   last_gear_run_ = 0;
   arm_ring_reset_();          // machine-made room travel must not arm the approach displacement gate
   ESP_LOGI(TAG, "SCRIPT mode OFF — production logic ladder resumes (bias-aware re-pick next pass)");

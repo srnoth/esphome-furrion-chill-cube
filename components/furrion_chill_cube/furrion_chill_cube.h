@@ -206,6 +206,25 @@ class FurrionChillCube : public climate::Climate, public Component {
   void test_resend_cs();
   void test_off();
 
+  // ── Gear-script mode (2026-09-05) ─────────────────────────────────────────────
+  // The middle regime between production and the frame-level harness above: a SCRIPTED gear
+  // replaces the LOGIC ladder's pick (demand signal, bias, approach, rate gate, natural-off
+  // gates) while the full production CONTROL ladder executes the move unchanged — quirk rows,
+  // maneuver holds/escape-up, frame ordering, CS heartbeat, mode reinforcement, HVAC on/off,
+  // the 1-min OFF wind-down and the cold-start floor. Lets prod gear moves be tested directly
+  // without engineering the room conditions that would make the ladder pick them.
+  // Logic-side state is FROZEN for the duration (bias held at its entry value, holds/stalls/
+  // freezes cleared); exit re-picks the gear bias-aware (resume_from_test_) like a test exit.
+  // Mutually exclusive with test_mode_ (whichever is set last wins). A scripted gear EXPIRES
+  // script_timeout_ms_ after the last set_script_gear() (re-asserting the same gear restamps)
+  // so a dead sequencer/HA link can never park the unit. Requires an active HA mode (inert
+  // under HA mode OFF / failsafe). See design-gear-script-mode-2026-09-05.
+  void set_script_gear(int gear);   // -1 = OFF, 0 = idle, 1..max gear; (re)arms the expiry
+  void clear_script_gear();         // back to production (bias-justified re-pick next pass)
+  bool is_script_mode() const { return script_gear_ != SCRIPT_NONE; }
+  int script_gear() const { return script_gear_; }
+  void set_script_timeout_ms(uint32_t ms) { script_timeout_ms_ = ms; }
+
  protected:
   // Climate interface
   climate::ClimateTraits traits() override;
@@ -343,6 +362,13 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Helpers
   void set_cs_value_(int cs, uint32_t now);
+  // Frame ORDER on a within-setpoint gear change (bare change, quirk entry, quirk exit — one rule
+  // for all; design-frame-ordering-2026-09-05). See the definition for the rule.
+  void apply_gear_frames_(int new_cs, uint32_t now);
+  // Gear-script mode internals (see the public API above).
+  static constexpr int SCRIPT_NONE = -2;
+  int script_gear_pick_(bool is_heat, int gear, uint32_t now);
+  void enter_script_mode_();
   void update_action_();
   void send_swing_state_();
   void set_active_ir_mode_(climate::ClimateMode mode);
@@ -524,6 +550,10 @@ class FurrionChillCube : public climate::Climate, public Component {
                             // fan bytes of the mode frame while test_mode_ is set. Never touches production.
   bool user_changed_{false};
   bool resume_from_test_{false};  // set on test-exit → gear re-pick uses eff_diff (bias-aware), not real diff
+  int script_gear_{SCRIPT_NONE};     // gear-script mode: SCRIPT_NONE = production; -1 OFF, 0 idle, 1..max
+  uint32_t script_set_at_{0};        // millis() of the last set_script_gear (expiry clock; callback-armed → self-clocked)
+  uint32_t script_timeout_ms_{900000}; // script gear expires this long after its last (re)assert; 0 = never
+  bool script_off_logged_{false};    // one LOGW per scripted OFF→idle refusal
   bool temp_dirty_{false};
   bool heater_locked_out_{false};
   // Setpoint debounce (see SETPOINT_SETTLE_MS): a temp change arms this; loop() commits it

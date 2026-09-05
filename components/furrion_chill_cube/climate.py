@@ -75,6 +75,7 @@ CONF_QUIRK_DURATION_DEFAULT = "quirk_duration"
 CONF_CS_TRANSMIT_INTERVAL = "cs_transmit_interval"
 CONF_QUIRK_TRANSMIT_INTERVAL = "quirk_transmit_interval"
 CONF_MODE_RESEND_DELAY = "mode_resend_delay"
+CONF_GEAR_SCRIPT_TIMEOUT = "gear_script_timeout"
 CONF_GEAR_STEP_C = "gear_step_c"
 # Timed vane positioning (per-mode delay + interval; ESPHome time format, no defaults)
 CONF_HEAT_VENT_MOVE_DELAY = "heat_vent_move_delay"
@@ -413,6 +414,10 @@ CONFIG_SCHEMA = cv.All(
             # One-shot reinforcement of every main mode frame (mode/setpoint/fan) this long after
             # transmit; 0s (default) = no resend. Mode frames have no heartbeat, unlike CS frames.
             cv.Optional(CONF_MODE_RESEND_DELAY, default="0s"): cv.positive_time_period_milliseconds,
+            # Gear-script mode (2026-09-05): a scripted gear (set_script_gear from YAML) replaces the
+            # logic ladder's pick while the production control ladder executes it. The scripted gear
+            # expires this long after its last (re)assert → production resumes. 0s = never expires.
+            cv.Optional(CONF_GEAR_SCRIPT_TIMEOUT, default="15min"): cv.positive_time_period_milliseconds,
             # Fan feedforward scale: °C of eff_diff per fan-gear (adaptive cool). NOTE:
             # historically tied to modulation spacing; left at 0.25 for behavior-parity.
             cv.Optional(CONF_GEAR_STEP_C, default=0.25): cv.float_range(min=0.0, max=2.0),
@@ -618,6 +623,7 @@ async def to_code(config):
     cg.add(var.set_cs_transmit_interval_ms(config[CONF_CS_TRANSMIT_INTERVAL].total_milliseconds))
     cg.add(var.set_quirk_transmit_interval_ms(config[CONF_QUIRK_TRANSMIT_INTERVAL].total_milliseconds))
     cg.add(var.set_mode_resend_delay_ms(config[CONF_MODE_RESEND_DELAY].total_milliseconds))
+    cg.add(var.set_script_timeout_ms(config[CONF_GEAR_SCRIPT_TIMEOUT].total_milliseconds))
     cg.add(var.set_gear_step_c(config[CONF_GEAR_STEP_C]))
 
     # Timed vane positioning (optional; only plumbed when set)

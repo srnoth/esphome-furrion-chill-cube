@@ -960,6 +960,16 @@ void FurrionChillCube::loop() {
   // test_* hooks (from the YAML sequencer). set_test_mode(false) re-anchors on the next pass.
   if (test_mode_) return;
 
+  // 1a. Gear-script expiry: a scripted gear dies script_timeout_ms_ after its last (re)assert so a
+  // dead sequencer / HA link can never park the unit on a scripted gear. Self-clocked on millis()
+  // (script_set_at_ is stamped from a callback — reference_furrion_millis_now_footgun).
+  if (script_gear_ != SCRIPT_NONE && script_timeout_ms_ > 0 &&
+      (millis() - script_set_at_) >= script_timeout_ms_) {
+    ESP_LOGW(TAG, "Script gear %d expired (%lu min without re-assert) — back to production",
+             script_gear_, (unsigned long) (script_timeout_ms_ / 60000UL));
+    clear_script_gear();
+  }
+
   // 1b. Commit a settled setpoint change (debounce). A temp change arms setpoint_pending_
   // in control() but does NOT transmit; once the user stops stepping (SETPOINT_SETTLE_MS of
   // no further change) we commit here by setting user_changed_, so the gear controller runs
@@ -1813,6 +1823,56 @@ void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
   if (cs_value_sensor_) cs_value_sensor_->publish_state(cs);
 }
 
+// Frame ORDER on a within-setpoint gear change — ONE rule for bare gear changes, quirk entries and
+// quirk exits (Stephen, 2026-09-05; design-frame-ordering-2026-09-05). Physics: a FIXED fan is what
+// governs the compressor (the g3↔g4 pair proves it — same CS, the fan setting alone moves ~4 A), so
+// a fixed fan must be on the wire BEFORE the CS changes; under AUTO the CS governs, so the new CS
+// must be established BEFORE the fan is released to pick its own speed.
+//   fan unchanged                     → CS only (if it changed; the heartbeat is the reinforcement)
+//   CS unchanged                      → Main only (fan-only shift, e.g. g3↔g4; + the 5 s reinforce)
+//   fixed → auto, CS changed          → CS, Main, CS  (new CS first; the trailing CS lands the
+//                                        release on the new value in case the Main frame resets it)
+//   auto → fixed / fixed → fixed, CS changed → Main, CS (the fan cap first, then the drive)
+// No exceptions: with fan and CS monotonic in gear (every table we have), no transition can need
+// the other order. Caller contract: the engine state that determines the NEW fan is already in
+// place (gear updated / maneuver phase set or cleared), so get_effective_fan_mode_() returns it;
+// `new_cs` is the CS to hold afterwards. No-op on the wire when neither changed. A Main frame is
+// DEFERRED (not sent) while a setpoint change is debouncing — same reason as
+// maybe_apply_gear_fan_, which then retries it — so in that ≤2.5 s window a CS may precede its
+// fan; the commit's own bracket follows immediately (accepted).
+void FurrionChillCube::apply_gear_frames_(int new_cs, uint32_t now) {
+  bool cs_changed = (new_cs != current_cs_);
+  current_cs_ = new_cs;
+  bool can_tx = boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF;
+  climate::ClimateFanMode new_fan = get_effective_fan_mode_();
+  bool fan_changed = can_tx && !setpoint_pending_ && ((int) new_fan != last_tx_fan_);
+  if (can_tx) {
+    if (!fan_changed) {
+      if (cs_changed) {
+        transmit_cs_update_();
+        last_cs_heartbeat_ = now;
+      }
+    } else if (!cs_changed) {
+      transmit_mode_command_();
+    } else if (new_fan == climate::CLIMATE_FAN_AUTO) {
+      transmit_cs_update_();          // fixed → auto: CS, Main, CS
+      transmit_mode_command_();
+      transmit_cs_update_();
+      last_cs_heartbeat_ = now;
+    } else {
+      transmit_mode_command_();       // auto/fixed → fixed: Main, CS
+      transmit_cs_update_();
+      last_cs_heartbeat_ = now;
+    }
+    if (cs_changed || fan_changed)
+      ESP_LOGD(TAG, "Gear frames: cs %s%d fan %s%d order=%s", cs_changed ? "->" : "=", new_cs,
+               fan_changed ? "->" : "=", (int) new_fan,
+               !fan_changed ? "CS" : !cs_changed ? "MAIN" :
+               (new_fan == climate::CLIMATE_FAN_AUTO) ? "CS,MAIN,CS" : "MAIN,CS");
+  }
+  if (cs_changed && cs_value_sensor_) cs_value_sensor_->publish_state(new_cs);
+}
+
 void FurrionChillCube::update_action_() {
   climate::ClimateAction action;
   if (this->mode == climate::CLIMATE_MODE_OFF) {
@@ -1879,11 +1939,11 @@ void FurrionChillCube::start_maneuver_(const QuirkDef *q, uint32_t now) {
   maneuver_escape_up_ = q->escape_up;
   maneuver_duration_ms_ = dur;
   maneuver_last_tx_ = now;
-  current_cs_ = via_cs;
 
   if (q->from_gear == -1) {
     // OFF→gear: pre-set the via CS ~500ms before mode-on (the unit ignores a CS before mode-on, but
     // this lead matches the v1 clamp's frame ordering). Mode-on happens when PRE_CS elapses.
+    current_cs_ = via_cs;
     maneuver_phase_ = ManeuverPhase::PRE_CS;
     maneuver_phase_start_ = now;
     if (boot_ready_ && !failsafe_active_) {
@@ -1904,8 +1964,8 @@ void FurrionChillCube::enter_maneuver_hold_(uint32_t now) {
   maneuver_phase_ = ManeuverPhase::HOLD;
   maneuver_start_ = now;
   maneuver_last_tx_ = now;
-  current_cs_ = maneuver_via_cs_;
   if (maneuver_from_gear_ == -1) {
+    current_cs_ = maneuver_via_cs_;
     // Mode ON with via_fan. maneuver_phase_ is HOLD, so get_effective_fan_mode_() returns via_fan
     // when transmit_mode_command_() builds the frame (v1 ordering: fan set BEFORE the frame).
     set_active_ir_mode_(maneuver_is_heat_ ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL);
@@ -1916,15 +1976,11 @@ void FurrionChillCube::enter_maneuver_hold_(uint32_t now) {
              maneuver_is_heat_ ? "HEAT" : "COOL", maneuver_via_cs_, (int) maneuver_via_fan_,
              (unsigned long) (maneuver_duration_ms_ / 1000));
   } else {
-    if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-      // If via_fan changes the effective fan, send a mode frame first (get_effective returns via_fan).
-      if (maneuver_via_fan_ >= 0 && (int) get_effective_fan_mode_() != last_tx_fan_) {
-        transmit_mode_command_();
-      }
-      transmit_cs_update_();
-      last_cs_heartbeat_ = now;
-    }
-    if (cs_value_sensor_) cs_value_sensor_->publish_state(maneuver_via_cs_);
+    // Running unit: the via fan/CS pair goes out in the order the fan direction dictates
+    // (apply_gear_frames_ — maneuver_phase_ is HOLD, so get_effective_fan_mode_() returns via_fan).
+    // A via CS equal to the current CS sends no CS frame here; the hold re-asserts it at
+    // quirk_transmit_interval anyway.
+    apply_gear_frames_(maneuver_via_cs_, now);
     ESP_LOGI(TAG, "Maneuver HOLD: %s via_cs=%d fan=%d hold=%lus", maneuver_is_heat_ ? "HEAT" : "COOL",
              maneuver_via_cs_, (int) maneuver_via_fan_, (unsigned long) (maneuver_duration_ms_ / 1000));
   }
@@ -1968,21 +2024,19 @@ void FurrionChillCube::advance_maneuver_(uint32_t now) {
   }
 }
 
-// Release the maneuver → restore the CS of whatever gear the controller now holds ("evaluate the
-// correct gear when done"), then re-send the mode frame (refreshes the display AND restores the
-// settled gear's fan after a via_fan clamp). maneuver_phase_ is cleared BEFORE the resend so
-// get_effective_fan_mode_() returns the gear's fan, not the maneuver's via_fan. Also serves as the
-// teardown for the run_*_mode_ OFF paths (mode already OFF → the resend + gear CS set both no-op).
+// Release the maneuver → land on the CS + fan of whatever gear the controller now holds ("evaluate
+// the correct gear when done"), frames ordered by apply_gear_frames_ (a via_fan clamp releasing to
+// auto = CS, Main, CS; a release that changes nothing sends nothing — the old unconditional Main
+// re-send is gone, 2026-09-05). maneuver_phase_ is cleared BEFORE so get_effective_fan_mode_()
+// returns the gear's fan, not the maneuver's via_fan. Also serves as the teardown for the
+// run_*_mode_ OFF paths (mode already OFF → the helper transmits nothing).
 void FurrionChillCube::end_maneuver_(uint32_t now) {
   bool is_heat = maneuver_is_heat_;
   maneuver_phase_ = ManeuverPhase::IDLE;
   maneuver_start_ = 0;
   int gear = is_heat ? heat_gear_ : cool_gear_;
   if (gear >= 0) {
-    set_cs_value_(compute_gear_cs_(is_heat, gear), now);
-  }
-  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    transmit_mode_command_();   // restores the settled gear's fan (via_fan no longer applies)
+    apply_gear_frames_(compute_gear_cs_(is_heat, gear), now);
   }
   ESP_LOGI(TAG, "Maneuver released: cs=%d gear=%d", current_cs_, gear);
 }
@@ -2637,7 +2691,7 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   // fraction of the raise, gated on real heating demand (room below the NEW target by more than
   // the deadband). A demand-removing DROP freezes the bias until the crossing (see below).
   // ⚠️ WINTER-UNVALIDATED like the rest of the heat adaptive path — structurally symmetric only.
-  if (!setpoint_pending_) {
+  if (!setpoint_pending_ && !is_script_mode()) {   // script: bias frozen → no preload / raise freeze
     if (isnan(last_committed_heat_target_c_)) {
       last_committed_heat_target_c_ = target;
     } else if (target != last_committed_heat_target_c_) {
@@ -2678,191 +2732,205 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   // Phase 2 adaptive (heat): advance the integral and get the effective diff for the active-gear
   // switch cases. Mirror of the cool call. Re-engage/idle/mode-switch AND the pong-critical 1→0
   // STOP decision stay on real diff. Called every heat pass so the integral advances/decays.
-  float eff_diff = adaptive_heat_eff_diff_(diff, now, time_in_gear);
-  // Upshift comparisons use the rate-gated diff (bias removed while the room isn't cooling).
-  float up_diff = heat_eff_up_diff_;
+  float eff_diff, up_diff;
+  if (is_script_mode()) {
+    // Gear-script: heat integral FROZEN (mirror of the cool block).
+    heat_adaptive_last_advance_ = now;
+    eff_diff = diff;
+    up_diff = diff;
+  } else {
+    eff_diff = adaptive_heat_eff_diff_(diff, now, time_in_gear);
+    // Upshift comparisons use the rate-gated diff (bias removed while the room isn't cooling).
+    up_diff = heat_eff_up_diff_;
+  }
   int gear = heat_gear_;
   int new_gear = gear;
 
   bool approach_engaged_this_pass = false;  // set by the two engagement sites below
 
-  // Approach-hold maintenance — sign-mirror of the cool block (see run_cool_mode_ for the full
-  // rationale; ⚠️ winter-unvalidated). Release = the heat ladder's own gear-1 band.
-  if (approach_hold_heat_ && approach_hold_from_off_) {
-    // Atomic clamp commitment — sign-mirror of the cool block (see run_cool_mode_ for the full
-    // rationale; ⚠️ winter-unvalidated): an OFF-fired heat approach rides its full OFF-entry clamp,
-    // then releases without a retry cooldown on the next pass as the single decision point.
-    if (!kickstart_active_()) {
-      approach_hold_heat_ = false;
-      approach_hold_from_off_ = false;
-      ESP_LOGI(TAG, "Approach (heat): OFF-entry clamp complete — handing off to ladder");
-      // Handover preload from the engagement drift snapshot — mirror of the cool site (same-pass
-      // eff patch; heat eff = real − bias_h_, so a raised bias_h_ LOWERS eff_diff). Handover
-      // releases an armed freeze; full-bias patch while it was frozen. ⚠️ winter-unvalidated.
-      {
-        bool was_frozen = (raise_freeze_h_at_ != 0);
-        if (was_frozen) {
-          raise_freeze_h_at_ = 0;
-          ESP_LOGI(TAG, "Raise freeze (heat): released at approach handover — bias %.2f live", bias_h_);
-        }
-        float pd = apply_crossing_preload_(true, now, was_frozen);
-        eff_diff -= was_frozen ? bias_h_ : pd;
-      }
-    }
-  } else if (approach_hold_heat_) {
-    bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
-    float mins = (room_drift_cpm_ < 0.0f) ? diff / (-room_drift_cpm_) : 1e9f;
-    if (diff <= H_DN_10) {
-      // Release at the heat ladder's gear-1 hold boundary. Deliberately REAL-diff (H_DN_10 is the
-      // pong-pinned real-diff rail) so the release keeps the heat 1→0 semantics intact.
-      approach_hold_heat_ = false;
-      ESP_LOGI(TAG, "Approach (heat): reached ladder band — hold released, ladder takes over");
-      // Handover preload from the engagement drift snapshot — mirror of the cool band-release
-      // site (heat's band release is real-diff, so the freeze's crossing release always fires
-      // first and the was_frozen leg is defensive only). ⚠️ winter-unvalidated.
-      {
-        bool was_frozen = (raise_freeze_h_at_ != 0);
-        if (was_frozen) {
-          raise_freeze_h_at_ = 0;
-          ESP_LOGI(TAG, "Raise freeze (heat): released at approach handover — bias %.2f live", bias_h_);
-        }
-        float pd = apply_crossing_preload_(true, now, was_frozen);
-        eff_diff -= was_frozen ? bias_h_ : pd;
-      }
-    } else if (!drift_fresh || !(room_drift_cpm_ < 0.0f) ||
-               mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
-               (now - approach_started_at_) / 3 >= approach_lead_ms_) {
-      approach_hold_heat_ = false;
-      approach_abort_at_ = (now != 0) ? now : 1;  // 0 is the "no cooldown" sentinel
-      ESP_LOGI(TAG, "Approach (heat): aborted (drift died/receded or hold cap) — standing down");
-    }
-  }
-
-  // Generalized N-gear selection (sign-mirror of cool: diff negative = cold = higher heat gear).
-  // M = highest configured heat gear. Grid trips come from heat_up_[]/heat_dn_[]; the 0↔1 boundary +
-  // idle are the pinned H_UP_01/H_DN_10/H_IDLE.
-  int M = heat_max_gear_;
-  auto entry_thresh = [&](int g) -> float { return (g <= 1) ? H_UP_01 : heat_up_[g - 1]; };
-  // Highest gear whose from-below (colder) entry threshold `d` clears (0 = none).
-  auto pick_from_below = [&](float d) -> int {
-    for (int g = M; g >= 1; g--) if (d < entry_thresh(g)) return g;
-    return 0;
-  };
-
-  // Selection basis — sign-mirror of the cool block (see the cool basis note for the full
-  // rationale: positive live bias only, demand-gated, ff/handover-patch/frozen-bias excluded,
-  // negative bias floors at the static ladder). For heat, demand = room BELOW the band and the
-  // bias SUBTRACTS (more negative = more heat). The demand gate also keeps the pong-critical
-  // 1→0 STOP untouched on user events: at/above SP−deadband the basis IS the real diff, so
-  // bias_h_ cannot hold gear 1 past the real stop (bug-check 2026-08-15). ⚠️ winter-unvalidated.
-  float pick_bias = (adaptive_enable_ && raise_freeze_h_at_ == 0) ? fmaxf(0.0f, bias_h_) : 0.0f;
-  float pick_basis = (diff < -ADAPT_DEADBAND_C) ? (diff - pick_bias) : diff;
-  float sel_basis = from_test ? eff_diff : pick_basis;
-
-  if (gear == -1 || user_input) {
-    // Fresh start from -1 requires the 1-min off lockout (hardware wind-down); no bypass.
-    bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
-    if (gear == -1 && !off_long_enough) {
-      new_gear = -1;  // still in 1-min wind-down period
-    } else if (user_input && gear >= 0 && gear_in_band_heat_(gear, sel_basis)) {
-      // User event but the current gear is still valid for the selection basis — preserve
-      // hunting state. Sign-mirror of cool. ⚠️ winter-unvalidated.
-      new_gear = gear;
-    } else {
-      // From -1: floor at the derived cold-start floor (heat default 1 → no-op); never gear 0.
-      // Positive-bias-aware pick on sel_basis (2026-08-15, sign-mirror of cool — see the cool
-      // basis note for what is deliberately excluded). ⚠️ winter-unvalidated.
-      int picked = pick_from_below(sel_basis);
-      // OFF-entry rules — mirror of cool (2026-09-04): any active gear, quirk row applied if the
-      // YAML has one, else bare; never idle directly from OFF. ⚠️ winter-unvalidated.
-      if (picked >= 1) {
-        new_gear = picked;
-        if (gear == -1 && new_gear < heat_cold_start_floor_) new_gear = heat_cold_start_floor_;
-      } else if (gear == -1 && approach_predict_heat_(diff, now, approach_off_lead_ms_())) {
-        // Approach-side early engagement from OFF — through the normal heat OFF→1 clamp (mirror
-        // of cool: kickstart quirks are REQUIRED for all OFF entries; see the cool comment).
-        // OFF-entry lead is shared with cool (the heat OFF→1 clamp is also ~305s).
-        new_gear = heat_cold_start_floor_;
-        approach_hold_heat_ = true;
-        approach_hold_from_off_ = true;   // atomic clamp commitment — see hold maintenance
-        approach_engaged_this_pass = true;
-        approach_started_at_ = now;
-        // Snapshot the free-fall drift for the handover preload (mirror of cool; the clamp will
-        // suppress the live value from here). ⚠️ winter-unvalidated.
-        approach_entry_drift_cpm_ = room_drift_cpm_;
-        approach_entry_drift_at_ = (now != 0) ? now : 1;
-        ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — gear-%d engagement via clamp",
-                 new_gear);
-      } else if (gear == -1) {
-        new_gear = -1;                               // stays off
-      } else if (user_input && diff > USER_TAP_OFF_MIN_PAST_C) {
-        new_gear = -1;   // user tap FAR past setpoint → off (mirror; ⚠️ winter-unvalidated)
-      } else {
-        new_gear = 0;
-      }
-    }
+  if (is_script_mode()) {
+    // Gear-script mode: scripted gear replaces the LOGIC ladder (see run_cool_mode_).
+    new_gear = script_gear_pick_(true, gear, now);
   } else {
-    if (gear == 0) {
-      // First compute post-restore: jump straight to the correct gear (skip the HOLD_MS ladder).
-      // Positive-bias-aware via pick_basis (2026-08-15, sign-mirror of cool: demand-gated, so a
-      // restored idle at/above SP−deadband stays a no-op). ⚠️ winter-unvalidated.
-      if (last_gear_change_ == 0) {
-        new_gear = pick_from_below(pick_basis);
-      } else if (can_upshift_to(1) && diff < H_UP_01) {
-        new_gear = 1;
-      } else if (can_upshift_to(1) && approach_predict_heat_(diff, now, approach_lead_ms_)) {
-        // Approach-side early engagement from idle (mirror of cool; idle quirk not bypassed).
-        new_gear = 1;
-        approach_hold_heat_ = true;
-        approach_hold_from_off_ = false;  // idle-fired hold — normal 4-exit maintenance
-        approach_engaged_this_pass = true;
-        approach_started_at_ = now;
-        // Snapshot the free-fall drift for the handover preload (mirror of cool idle site).
-        approach_entry_drift_cpm_ = room_drift_cpm_;
-        approach_entry_drift_at_ = (now != 0) ? now : 1;
-        ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — early gear-1 from idle");
+    // Approach-hold maintenance — sign-mirror of the cool block (see run_cool_mode_ for the full
+    // rationale; ⚠️ winter-unvalidated). Release = the heat ladder's own gear-1 band.
+    if (approach_hold_heat_ && approach_hold_from_off_) {
+      // Atomic clamp commitment — sign-mirror of the cool block (see run_cool_mode_ for the full
+      // rationale; ⚠️ winter-unvalidated): an OFF-fired heat approach rides its full OFF-entry clamp,
+      // then releases without a retry cooldown on the next pass as the single decision point.
+      if (!kickstart_active_()) {
+        approach_hold_heat_ = false;
+        approach_hold_from_off_ = false;
+        ESP_LOGI(TAG, "Approach (heat): OFF-entry clamp complete — handing off to ladder");
+        // Handover preload from the engagement drift snapshot — mirror of the cool site (same-pass
+        // eff patch; heat eff = real − bias_h_, so a raised bias_h_ LOWERS eff_diff). Handover
+        // releases an armed freeze; full-bias patch while it was frozen. ⚠️ winter-unvalidated.
+        {
+          bool was_frozen = (raise_freeze_h_at_ != 0);
+          if (was_frozen) {
+            raise_freeze_h_at_ = 0;
+            ESP_LOGI(TAG, "Raise freeze (heat): released at approach handover — bias %.2f live", bias_h_);
+          }
+          float pd = apply_crossing_preload_(true, now, was_frozen);
+          eff_diff -= was_frozen ? bias_h_ : pd;
+        }
       }
-      // 0→-1 gate (natural path only — user_input handled above). A predicted approach suppresses
-      // the natural full-off (mirror of cool); imm_off is NOT suppressible.
-      bool imm_off = !boot_ready_;
-      bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
-      bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
-      bool past_setpoint = diff > mode_switch_temp_offset_c_;
-      // Natural-off gate — sign-mirror of the cool block (see run_cool_mode_ + incident
-      // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): heat full-off waits for the heat integral to be
-      // unwound (no drift leg — Stephen 2026-08-06) — EXCEPT through the HEAT_COOL handoff door
-      // (room risen into cool's engagement territory; this mirror bites in shoulder-season
-      // mornings: sun lifts the room while bias_h_ is still wound and heat idle would otherwise
-      // lock cool out). ⚠️ winter-unvalidated, structurally symmetric only.
-      bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
-                            (room >= get_cool_target_() - mode_switch_temp_offset_c_);
-      // Frozen heat bias counts as unwound — mirror of the cool gate. ⚠️ winter-unvalidated.
-      bool bias_unwound = bias_h_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_h_at_ != 0;
-      bool natural_off = idle_enough && event_ok && past_setpoint &&
-                         (handoff_demand || bias_unwound) &&
-                         !approach_predict_heat_(diff, now, approach_lead_ms_);
-      if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
-    } else {
-      // Active gears 1..M: upshift on the rate-gated up_diff (colder crosses heat_up_[gear]). The
-      // 1→0 STOP is pong-critical and evaluated on REAL diff (bias_h_ must not move it); gears 2+
-      // downshift on eff_diff. Downshift trip = heat_stop_ (gear 1) else heat_dn_[gear-1].
-      if (gear < M && can_upshift_to(gear + 1) && up_diff < heat_up_[gear] &&
-          !(approach_hold_heat_ &&
-            (gear == 1 || (approach_hold_from_off_ && gear == heat_cold_start_floor_)))) {
-        // Upshift suppressed during a hold — sign-mirror of the cool pin (see run_cool_mode_).
-        new_gear = gear + 1;
-      } else {
-        float dn = (gear == 1) ? H_DN_10 : heat_dn_[gear - 1];
-        float dcmp = (gear == 1) ? diff : eff_diff;   // 1→0 STOP on REAL diff (pong-critical)
-        // The approach hold pins gear 1 above SP; the hold-maintenance block owns its exits.
-        // (The pong-critical 1→0 STOP stays real-diff for every NON-held pass.)
-        if (dcmp > dn &&
-            !(approach_hold_heat_ &&
-              (gear == 1 || (approach_hold_from_off_ && gear == heat_cold_start_floor_))))
-          new_gear = gear - 1;
+    } else if (approach_hold_heat_) {
+      bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
+      float mins = (room_drift_cpm_ < 0.0f) ? diff / (-room_drift_cpm_) : 1e9f;
+      if (diff <= H_DN_10) {
+        // Release at the heat ladder's gear-1 hold boundary. Deliberately REAL-diff (H_DN_10 is the
+        // pong-pinned real-diff rail) so the release keeps the heat 1→0 semantics intact.
+        approach_hold_heat_ = false;
+        ESP_LOGI(TAG, "Approach (heat): reached ladder band — hold released, ladder takes over");
+        // Handover preload from the engagement drift snapshot — mirror of the cool band-release
+        // site (heat's band release is real-diff, so the freeze's crossing release always fires
+        // first and the was_frozen leg is defensive only). ⚠️ winter-unvalidated.
+        {
+          bool was_frozen = (raise_freeze_h_at_ != 0);
+          if (was_frozen) {
+            raise_freeze_h_at_ = 0;
+            ESP_LOGI(TAG, "Raise freeze (heat): released at approach handover — bias %.2f live", bias_h_);
+          }
+          float pd = apply_crossing_preload_(true, now, was_frozen);
+          eff_diff -= was_frozen ? bias_h_ : pd;
+        }
+      } else if (!drift_fresh || !(room_drift_cpm_ < 0.0f) ||
+                 mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
+                 (now - approach_started_at_) / 3 >= approach_lead_ms_) {
+        approach_hold_heat_ = false;
+        approach_abort_at_ = (now != 0) ? now : 1;  // 0 is the "no cooldown" sentinel
+        ESP_LOGI(TAG, "Approach (heat): aborted (drift died/receded or hold cap) — standing down");
       }
     }
-  }
+
+    // Generalized N-gear selection (sign-mirror of cool: diff negative = cold = higher heat gear).
+    // M = highest configured heat gear. Grid trips come from heat_up_[]/heat_dn_[]; the 0↔1 boundary +
+    // idle are the pinned H_UP_01/H_DN_10/H_IDLE.
+    int M = heat_max_gear_;
+    auto entry_thresh = [&](int g) -> float { return (g <= 1) ? H_UP_01 : heat_up_[g - 1]; };
+    // Highest gear whose from-below (colder) entry threshold `d` clears (0 = none).
+    auto pick_from_below = [&](float d) -> int {
+      for (int g = M; g >= 1; g--) if (d < entry_thresh(g)) return g;
+      return 0;
+    };
+
+    // Selection basis — sign-mirror of the cool block (see the cool basis note for the full
+    // rationale: positive live bias only, demand-gated, ff/handover-patch/frozen-bias excluded,
+    // negative bias floors at the static ladder). For heat, demand = room BELOW the band and the
+    // bias SUBTRACTS (more negative = more heat). The demand gate also keeps the pong-critical
+    // 1→0 STOP untouched on user events: at/above SP−deadband the basis IS the real diff, so
+    // bias_h_ cannot hold gear 1 past the real stop (bug-check 2026-08-15). ⚠️ winter-unvalidated.
+    float pick_bias = (adaptive_enable_ && raise_freeze_h_at_ == 0) ? fmaxf(0.0f, bias_h_) : 0.0f;
+    float pick_basis = (diff < -ADAPT_DEADBAND_C) ? (diff - pick_bias) : diff;
+    float sel_basis = from_test ? eff_diff : pick_basis;
+
+    if (gear == -1 || user_input) {
+      // Fresh start from -1 requires the 1-min off lockout (hardware wind-down); no bypass.
+      bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
+      if (gear == -1 && !off_long_enough) {
+        new_gear = -1;  // still in 1-min wind-down period
+      } else if (user_input && gear >= 0 && gear_in_band_heat_(gear, sel_basis)) {
+        // User event but the current gear is still valid for the selection basis — preserve
+        // hunting state. Sign-mirror of cool. ⚠️ winter-unvalidated.
+        new_gear = gear;
+      } else {
+        // From -1: floor at the derived cold-start floor (heat default 1 → no-op); never gear 0.
+        // Positive-bias-aware pick on sel_basis (2026-08-15, sign-mirror of cool — see the cool
+        // basis note for what is deliberately excluded). ⚠️ winter-unvalidated.
+        int picked = pick_from_below(sel_basis);
+        // OFF-entry rules — mirror of cool (2026-09-04): any active gear, quirk row applied if the
+        // YAML has one, else bare; never idle directly from OFF. ⚠️ winter-unvalidated.
+        if (picked >= 1) {
+          new_gear = picked;
+          if (gear == -1 && new_gear < heat_cold_start_floor_) new_gear = heat_cold_start_floor_;
+        } else if (gear == -1 && approach_predict_heat_(diff, now, approach_off_lead_ms_())) {
+          // Approach-side early engagement from OFF — through the normal heat OFF→1 clamp (mirror
+          // of cool: kickstart quirks are REQUIRED for all OFF entries; see the cool comment).
+          // OFF-entry lead is shared with cool (the heat OFF→1 clamp is also ~305s).
+          new_gear = heat_cold_start_floor_;
+          approach_hold_heat_ = true;
+          approach_hold_from_off_ = true;   // atomic clamp commitment — see hold maintenance
+          approach_engaged_this_pass = true;
+          approach_started_at_ = now;
+          // Snapshot the free-fall drift for the handover preload (mirror of cool; the clamp will
+          // suppress the live value from here). ⚠️ winter-unvalidated.
+          approach_entry_drift_cpm_ = room_drift_cpm_;
+          approach_entry_drift_at_ = (now != 0) ? now : 1;
+          ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — gear-%d engagement via clamp",
+                   new_gear);
+        } else if (gear == -1) {
+          new_gear = -1;                               // stays off
+        } else if (user_input && diff > USER_TAP_OFF_MIN_PAST_C) {
+          new_gear = -1;   // user tap FAR past setpoint → off (mirror; ⚠️ winter-unvalidated)
+        } else {
+          new_gear = 0;
+        }
+      }
+    } else {
+      if (gear == 0) {
+        // First compute post-restore: jump straight to the correct gear (skip the HOLD_MS ladder).
+        // Positive-bias-aware via pick_basis (2026-08-15, sign-mirror of cool: demand-gated, so a
+        // restored idle at/above SP−deadband stays a no-op). ⚠️ winter-unvalidated.
+        if (last_gear_change_ == 0) {
+          new_gear = pick_from_below(pick_basis);
+        } else if (can_upshift_to(1) && diff < H_UP_01) {
+          new_gear = 1;
+        } else if (can_upshift_to(1) && approach_predict_heat_(diff, now, approach_lead_ms_)) {
+          // Approach-side early engagement from idle (mirror of cool; idle quirk not bypassed).
+          new_gear = 1;
+          approach_hold_heat_ = true;
+          approach_hold_from_off_ = false;  // idle-fired hold — normal 4-exit maintenance
+          approach_engaged_this_pass = true;
+          approach_started_at_ = now;
+          // Snapshot the free-fall drift for the handover preload (mirror of cool idle site).
+          approach_entry_drift_cpm_ = room_drift_cpm_;
+          approach_entry_drift_at_ = (now != 0) ? now : 1;
+          ESP_LOGI(TAG, "Approach (heat): crossing predicted within lead — early gear-1 from idle");
+        }
+        // 0→-1 gate (natural path only — user_input handled above). A predicted approach suppresses
+        // the natural full-off (mirror of cool); imm_off is NOT suppressible.
+        bool imm_off = !boot_ready_;
+        bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
+        bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
+        bool past_setpoint = diff > mode_switch_temp_offset_c_;
+        // Natural-off gate — sign-mirror of the cool block (see run_cool_mode_ + incident
+        // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): heat full-off waits for the heat integral to be
+        // unwound (no drift leg — Stephen 2026-08-06) — EXCEPT through the HEAT_COOL handoff door
+        // (room risen into cool's engagement territory; this mirror bites in shoulder-season
+        // mornings: sun lifts the room while bias_h_ is still wound and heat idle would otherwise
+        // lock cool out). ⚠️ winter-unvalidated, structurally symmetric only.
+        bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
+                              (room >= get_cool_target_() - mode_switch_temp_offset_c_);
+        // Frozen heat bias counts as unwound — mirror of the cool gate. ⚠️ winter-unvalidated.
+        bool bias_unwound = bias_h_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_h_at_ != 0;
+        bool natural_off = idle_enough && event_ok && past_setpoint &&
+                           (handoff_demand || bias_unwound) &&
+                           !approach_predict_heat_(diff, now, approach_lead_ms_);
+        if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
+      } else {
+        // Active gears 1..M: upshift on the rate-gated up_diff (colder crosses heat_up_[gear]). The
+        // 1→0 STOP is pong-critical and evaluated on REAL diff (bias_h_ must not move it); gears 2+
+        // downshift on eff_diff. Downshift trip = heat_stop_ (gear 1) else heat_dn_[gear-1].
+        if (gear < M && can_upshift_to(gear + 1) && up_diff < heat_up_[gear] &&
+            !(approach_hold_heat_ &&
+              (gear == 1 || (approach_hold_from_off_ && gear == heat_cold_start_floor_)))) {
+          // Upshift suppressed during a hold — sign-mirror of the cool pin (see run_cool_mode_).
+          new_gear = gear + 1;
+        } else {
+          float dn = (gear == 1) ? H_DN_10 : heat_dn_[gear - 1];
+          float dcmp = (gear == 1) ? diff : eff_diff;   // 1→0 STOP on REAL diff (pong-critical)
+          // The approach hold pins gear 1 above SP; the hold-maintenance block owns its exits.
+          // (The pong-critical 1→0 STOP stays real-diff for every NON-held pass.)
+          if (dcmp > dn &&
+              !(approach_hold_heat_ &&
+                (gear == 1 || (approach_hold_from_off_ && gear == heat_cold_start_floor_))))
+            new_gear = gear - 1;
+        }
+      }
+    }
+
+  }  // end production logic ladder (heat)
 
   // Track idle_since
   if (new_gear == 0 && gear != 0) {
@@ -2907,8 +2975,8 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
       const QuirkDef *q = find_quirk_(true, gear, new_gear);
       if (q != nullptr) {
         start_maneuver_(q, now);
-      } else if (current_cs_ != cs) {
-        set_cs_value_(cs, now);
+      } else {
+        apply_gear_frames_(cs, now);   // CS and/or per-gear fan, ordered by the fan direction; no-op if neither changed
       }
     }
   }
@@ -3007,7 +3075,7 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // against the new target, original arm time). NOTE: in HEAT_COOL, a both-gears-off
   // deadband idle wipes this baseline each pass (!do_cool clear), so a drop issued across such a
   // gap records-only; drops during an engaged cool episode preload normally, as in pure COOL.
-  if (!setpoint_pending_) {
+  if (!setpoint_pending_ && !is_script_mode()) {   // script: bias frozen → no preload / raise freeze
     if (isnan(last_committed_cool_target_c_)) {
       last_committed_cool_target_c_ = target;
     } else if (target != last_committed_cool_target_c_) {
@@ -3055,289 +3123,307 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // Phase 2 adaptive: advance the integral and get the effective diff used ONLY for the
   // active-gear switch cases (1-5). Re-engage/idle/mode-switch decisions stay on real diff.
   // Called every cool pass so the integral advances (or decays while idle) consistently.
-  float eff_diff = adaptive_cool_eff_diff_(diff, now, time_in_gear);
-  // Upshift comparisons use the rate-gated diff (bias removed while the room isn't warming);
-  // downshifts and re-engage/idle decisions keep using eff_diff / real diff respectively.
-  float up_diff = cool_eff_up_diff_;
+  float eff_diff, up_diff;
+  if (is_script_mode()) {
+    // Gear-script: the integral is FROZEN — bias_c_ untouched (Stephen 2026-09-05: freeze, don't
+    // zero); the dt clock is kept fresh so the first production pass after exit doesn't integrate
+    // the whole script as one step.
+    adaptive_last_advance_ = now;
+    eff_diff = diff;
+    up_diff = diff;
+  } else {
+    eff_diff = adaptive_cool_eff_diff_(diff, now, time_in_gear);
+    // Upshift comparisons use the rate-gated diff (bias removed while the room isn't warming);
+    // downshifts and re-engage/idle decisions keep using eff_diff / real diff respectively.
+    up_diff = cool_eff_up_diff_;
+  }
   int gear = cool_gear_;
   int new_gear = gear;
 
   bool approach_engaged_this_pass = false;  // set by the two engagement sites below
 
-  // Approach-hold maintenance (early gear-1 engagement below SP; see approach_predict_cool_).
-  // Re-validated every pass from LIVE signals — no event wiring: (a) crossing (room within the
-  // deadband of SP, from below) completes the mission and hands the ladder over; (b) drift dying
-  // or going stale aborts with a retry cooldown (transient gust in storage → one quiet stand-down);
-  // (c) the recomputed crossing receding past 2× lead aborts (SP moved away / cloud edge);
-  // (d) a 3× lead hard cap bounds a mispredicted hold. After an abort the normal selection
-  // downshifts 1→0→-1 naturally. The adaptive integral is FROZEN while a hold is active (see
-  // adaptive_cool_eff_diff_) — gear 1 deliberately running below SP would otherwise read as
-  // overcooling and rapidly unwind the retained bias the coming day regime needs.
-  if (approach_hold_cool_ && approach_hold_from_off_) {
-    // Atomic clamp commitment (Stephen 2026-08-06): an OFF-fired approach IS its OFF-entry clamp —
-    // once committed, no maintenance exits. A mid-clamp release would unfreeze the integral and
-    // unpin the ladder while the maneuver still holds the via-CS blast; with a wound bias, eff can
-    // sit deep inside an active band at release, stacking a genuine gear-2+ start onto the clamp
-    // (the gear-3/4-grade burst this rule exists to prevent). The hold lives exactly as long as
-    // the maneuver; when the clamp ends, THIS pass becomes the single decision point — the ladder
-    // takes whatever gear eff calls for, or drops to idle. No retry cooldown: a completed clamp is
-    // not an abort, and the idle-side approach must be immediately eligible ("back to idle, ready
-    // for an idle→1 firing"). Machine supersedes (user tap / mode switch / failsafe / test) still
-    // clear the hold through their own paths, unchanged. If the engagement found no matching
-    // OFF-entry quirk (kickstart never started), this releases on the next pass — plain start.
-    if (!kickstart_active_()) {
-      approach_hold_cool_ = false;
-      approach_hold_from_off_ = false;
-      ESP_LOGI(TAG, "Approach (cool): OFF-entry clamp complete — handing off to ladder");
-      // Handover preload from the engagement drift snapshot (2026-08-14 — the former MIN_HOLD
-      // gate guarded against sampling engage-time flux at the handover pass; the snapshot IS the
-      // engage-time signal now, deliberately, so the gate is gone). eff_diff is patched so THIS
-      // pass — the single decision point — selects on the live post-handover bias
-      // (downshift/hold legs; up_diff untouched: upshifts wait a pass, dwell-gated anyway).
-      // A handover RELEASES an armed raise freeze (bug-check round 2): the approach only fired
-      // because a crossing is imminent — demand is re-established — and deciding this pass on
-      // blind eff would spuriously downshift away the clamp the unit just spent 305 s on. eff was
-      // computed bias-blind while frozen, so the patch adds the FULL live bias (not the floor
-      // delta); the freeze-intact flag suppresses the estimator's floor over the preserved bias.
-      {
-        bool was_frozen = (raise_freeze_c_at_ != 0);
-        if (was_frozen) {
-          raise_freeze_c_at_ = 0;
-          ESP_LOGI(TAG, "Raise freeze (cool): released at approach handover — bias %.2f live", bias_c_);
-        }
-        float pd = apply_crossing_preload_(false, now, was_frozen);
-        eff_diff += was_frozen ? bias_c_ : pd;
-      }
-    }
-  } else if (approach_hold_cool_) {
-    bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
-    float mins = (room_drift_cpm_ > 0.0f) ? (-diff) / room_drift_cpm_ : 1e9f;
-    if (eff_diff >= C_DN_10) {
-      // Release at the ladder's OWN gear-1 hold boundary (eff-based, like the cool 1→0 rail):
-      // the handover lands exactly where the ladder would keep gear 1 running — no release-pass
-      // downshift, no extra compressor cycle, and no minimum-bias floor for a seamless handoff
-      // (bug-check round-1: releasing at the raw deadband dropped 1→0 whenever bias < ~0.3).
-      approach_hold_cool_ = false;
-      ESP_LOGI(TAG, "Approach (cool): reached ladder band — hold released, ladder takes over");
-      // Handover preload from the engagement drift snapshot (2026-08-14). eff_diff patched for
-      // the same-pass decision; the release condition already fired on the old value. Handover
-      // releases an armed freeze, mirroring the atomic site. The was_frozen leg is LIVE here
-      // whenever the vent-fan feedforward exceeds C_DN_10 + deadband (blind eff = real + ff
-      // reaches the band release before the crossing release) — stock ff 0.25 keeps it dormant,
-      // fan_feedforward_gears: 2 or a retuned gear_step_c makes it real (bug-check round 3).
-      {
-        bool was_frozen = (raise_freeze_c_at_ != 0);
-        if (was_frozen) {
-          raise_freeze_c_at_ = 0;
-          ESP_LOGI(TAG, "Raise freeze (cool): released at approach handover — bias %.2f live", bias_c_);
-        }
-        float pd = apply_crossing_preload_(false, now, was_frozen);
-        eff_diff += was_frozen ? bias_c_ : pd;
-      }
-    } else if (!drift_fresh || !(room_drift_cpm_ > 0.0f) ||
-               mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
-               (now - approach_started_at_) / 3 >= approach_lead_ms_) {
-      // NOTE (bug-check round 2, accepted): under an armed raise freeze this abort leg is the
-      // idle-fired hold's usual exit when gear 1 arrests a light-load rise (the band release
-      // computes on blind eff and the crossing release needs the band). The follow-on — blind
-      // 1→0, natural-off via the freeze bypass, full OFF below the raised SP — is the CORRECT
-      // state for that situation (light load, user asked for less cooling); re-entry is the
-      // OFF-entry approach, whose clamp lands at the crossing and whose handover releases the
-      // freeze. No repeating clamp cycle: the freeze is gone after the first handover.
-      approach_hold_cool_ = false;
-      approach_abort_at_ = (now != 0) ? now : 1;  // 0 is the "no cooldown" sentinel
-      ESP_LOGI(TAG, "Approach (cool): aborted (drift died/receded or hold cap) — standing down");
-    }
-  }
-
-  // Generalized N-gear selection — standard name: STAGE SEQUENCER (staging differentials +
-  // minimum dwell). (design_gear_engine_v2.) M = highest configured gear. Grid trips
-  // come from cool_up_[]/cool_dn_[]; the 0↔1 boundary + idle are the pinned C_UP_01/C_DN_10/C_IDLE.
-  int M = cool_max_gear_;
-  auto entry_thresh = [&](int g) -> float { return (g <= 1) ? C_UP_01 : cool_up_[g - 1]; };
-  auto dn_thresh    = [&](int g) -> float { return (g <= 1) ? C_DN_10 : cool_dn_[g - 1]; };
-  // Highest gear whose from-below entry threshold `d` clears (0 = none).
-  auto pick_from_below = [&](float d) -> int {
-    for (int g = M; g >= 1; g--) if (d > entry_thresh(g)) return g;
-    return 0;
-  };
-
-  // Selection basis for the user/fresh-start block (2026-08-15, hardened in the same session's
-  // bug-check): real diff PLUS the positive LIVE bias, and only under REAL DEMAND (diff above
-  // the deadband). Built from bias_c_ directly — NOT from eff_diff — so it deliberately excludes:
-  // (a) the vent-fan feedforward (bias==0 stays bit-identical to the static ladder — with ff in
-  //     the basis, ff alone could start the unit from OFF while the off-side gates stay real-diff);
-  // (b) the approach-handover eff PATCH (a local eff_diff adjustment — never in this basis).
-  //     Handover SIDE EFFECTS do reach it, deliberately: this basis is computed after the
-  //     handover blocks, so a freeze released there is live here, and a crossing-preload floor
-  //     written into bias_c_ is included. Reachable only on a late-clamp handover coinciding
-  //     with a same-pass user event, and the demand gate covers the at/below-SP outcomes;
-  //     the resulting pick is the load-justified gear (verifier 2026-08-15, accepted);
-  // (c) a raise-frozen bias while STILL armed (stored-not-live) and any bias while adaptive is
-  //     disabled (stale in-memory value after a mid-run toggle).
-  // The demand gate (diff > deadband) keeps every at/below-SP decision on the real diff: the
-  // freeze-release pass can't restart a below-SP unit off its just-released bias (stays OFF until
-  // real demand), a user tap deep below SP still reaches the tap-OFF door (pre-2026-08-15
-  // semantics exactly), and the restore pick stays a no-op at idle. A NEGATIVE bias never enters
-  // (fmaxf 0) — the 2026-06-03 round-3 gear-collapse case stays structurally impossible.
-  float pick_bias = (adaptive_enable_ && raise_freeze_c_at_ == 0) ? fmaxf(0.0f, bias_c_) : 0.0f;
-  float pick_basis = (diff > ADAPT_DEADBAND_C) ? (diff + pick_bias) : diff;
-  // Test-exit keeps the pure-eff pick (2026-07-20 semantics) on BOTH the in-band preserve check
-  // and the pick, so the two can't shadow each other with different bases.
-  float sel_basis = from_test ? eff_diff : pick_basis;
-
-  if (gear == -1 || user_input) {
-    // Fresh start from -1 requires the 1-min off lockout (hardware wind-down); no bypass.
-    bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
-    if (gear == -1 && !off_long_enough) {
-      new_gear = -1;  // still in 1-min wind-down period
-    } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, sel_basis)) {
-      // User event but the current gear is still valid for the selection basis — preserve
-      // hunting state. (The preserve band [stop, next-up] is wider than the pick's entry
-      // threshold by the start/stop hysteresis — that gap is deliberate.) Live case 2026-08-15
-      // 04:56: g4 with real 0.99 / bias 2.0 now STAYS g4 instead of collapsing to the
-      // real-diff pick.
-      new_gear = gear;
-    } else {
-      // From -1: floor at the derived cold-start floor (compressor can't cold-start below it) and
-      // never gear 0 (only reachable by downshift from 1). Running (user_input, gear>=0): no floor.
-      // Positive-bias-aware pick (2026-08-15, Stephen: "bias is the load — it should position the
-      // ladder, through upshifts AND through SP changes") on sel_basis — see the basis note above
-      // for what is deliberately excluded (ff, handover patch, frozen bias, no-demand states).
-      // Live case 2026-08-15 04:42: OFF re-entry at real 0.79 / bias 2.0 picked g1 and crawled;
-      // this pick lands the load-justified gear (cold-start floor still applies as a MINIMUM).
-      int picked = pick_from_below(sel_basis);
-      // OFF-entry rules (Stephen, 2026-09-04): (1) OFF may enter ANY active gear the pick lands on;
-      // the CS/maneuver block below looks up the (-1 → gear) quirk row like any other transition —
-      // apply it if the YAML has one, else the gear's CS goes out bare. Which OFF entries need a
-      // clamped start is a HARDWARE fact and lives in the quirk table (this unit: g1/g2 rows, since
-      // from-OFF start needs CS >= SP+1); the engine must not encode it — a unit that cold-starts
-      // bare simply has no OFF rows. (2) OFF never enters idle directly: OFF→ON only when the pick
-      // calls for a compressor gear (the `picked >= 1` / "stays off" branches below).
-      // (Replaces the 08-15 row-coverage walk-down and the 08-16 identity rows it forced.)
-      if (picked >= 1) {
-        new_gear = picked;
-        if (gear == -1 && new_gear < cool_cold_start_floor_) new_gear = cool_cold_start_floor_;
-      } else if (gear == -1 && approach_predict_cool_(diff, now, approach_off_lead_ms_())) {
-        // Approach-side early engagement from OFF — through the NORMAL OFF-entry clamp, like every
-        // other cold start. HARD RULE (Stephen, 2026-08-03, after a live failure): kickstart quirks
-        // are REQUIRED for all OFF→gear changes INCLUDING approach entries. The 2026-07-07 CS
-        // characterization is unambiguous: from-OFF compressor start needs CS ≥ SP+1 (from-idle
-        // SP+0), and any start-capable CS saturates output upward — there is NO gentle cold start
-        // on this hardware. A brief "direct entry" variant (mode-on at gear-1's SP−1 CS) shipped
-        // 2026-08-03 and simply never started the compressor. The clamp's ~5-min burst below SP is
-        // accepted BECAUSE it is timed to land at the crossing: this site fires on the OFF-entry
-        // lead (~clamp duration + latency, see approach_off_lead_ms_), so the blast completes right
-        // as the room reaches SP — not minutes-of-margin early (2026-08-06 12:54: the shared 15-min
-        // lead put the blast at 66.4°F on a 69°F SP and arrested the climb occupant-noticeably).
-        // The off-dwell lockout was enforced above.
-        new_gear = cool_cold_start_floor_;
-        approach_hold_cool_ = true;
-        approach_hold_from_off_ = true;   // atomic clamp commitment — see hold maintenance
-        approach_engaged_this_pass = true;
-        approach_started_at_ = now;
-        // Snapshot the free-rise drift for the handover preload — approach_predict_cool_ just
-        // validated it fresh and positive; the clamp will suppress the live value from here.
-        approach_entry_drift_cpm_ = room_drift_cpm_;
-        approach_entry_drift_at_ = (now != 0) ? now : 1;
-        ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — gear-%d engagement via clamp",
-                 new_gear);
-      } else if (gear == -1) {
-        new_gear = -1;                               // stays off
-      } else if (user_input && diff < -USER_TAP_OFF_MIN_PAST_C) {
-        new_gear = -1;   // user tap FAR past setpoint → off (approach-covered by construction)
-      } else {
-        new_gear = 0;
-      }
-    }
-    // NOTE (history): this block used REAL diff only from 2026-06-03 (round-3 revert of a
-    // bias-aware restructure — 3 bugs incl. negative-bias gear collapse) until 2026-08-15. The
-    // demand-gated positive-bias basis above re-admits the bias as a value-only change: the June
-    // collapse (negative bias) remains impossible by construction, the block structure is
-    // untouched, and the off/tap-off/approach decisions in this chain still run on REAL diff —
-    // and stay REACHABLE, because every at/below-deadband state collapses sel_basis to the real
-    // diff (a tap deep below SP hits the door exactly as it did pre-change).
+  if (is_script_mode()) {
+    // Gear-script mode: the scripted gear replaces the whole LOGIC ladder below (demand signal,
+    // approach, rate gate, natural-off gates, dwell). Hardware guards stay (script_gear_pick_).
+    // Everything after this block — the CONTROL ladder — runs unchanged.
+    new_gear = script_gear_pick_(false, gear, now);
   } else {
-    if (gear == 0) {
-      // First compute post-restore: jump straight to the correct gear (skip the HOLD_MS ladder).
-      // Positive-bias-aware via pick_basis (2026-08-15): demand-gated, so a restored gear-0 with
-      // a wound NVS bias stays a no-op at/below SP (pre-change semantics) and only positions up
-      // under real demand. Note this branch re-fires every pass until the first gear change
-      // stamps last_gear_change_ (pre-existing).
-      if (last_gear_change_ == 0) {
-        new_gear = pick_from_below(pick_basis);
-      } else if (can_upshift_to(1) && eff_diff > C_UP_01) {
-        // iter-1 #2 (2026-07-20): re-engage 0→1 on eff_diff (real + bias), not real diff, so the
-        // integral shifts the WHOLE ladder together — the 1→2 upshift already trips on eff_diff, so
-        // matching the 0→1 entry to it stops the bias from inverting gear 1's narrow band overnight.
-        // Made safe by iter-1 #4 (fast unwind → bias won't sit wound while the room is at SP). The
-        // 0→-1 off-decision below deliberately stays on REAL diff (failover / don't cool below SP on
-        // a stale bias). Summer/cool-only; revisit for heat↔cool mode hunting before fall.
-        new_gear = 1;
-      } else if (can_upshift_to(1) && approach_predict_cool_(diff, now, approach_lead_ms_)) {
-        // Approach-side early engagement from idle. The idle→1 quick-kick quirk (CS=SP+0) is
-        // harmless here (CS above the below-SP room → fan only), so it is NOT bypassed.
-        new_gear = 1;
-        approach_hold_cool_ = true;
-        approach_hold_from_off_ = false;  // idle-fired hold — normal 4-exit maintenance
-        approach_engaged_this_pass = true;
-        approach_started_at_ = now;
-        // Snapshot the free-rise drift for the handover preload (gear 0 is fan-only, so the
-        // trailing slope here is compressor-free too).
-        approach_entry_drift_cpm_ = room_drift_cpm_;
-        approach_entry_drift_at_ = (now != 0) ? now : 1;
-        ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — early gear-1 from idle");
+    // Approach-hold maintenance (early gear-1 engagement below SP; see approach_predict_cool_).
+    // Re-validated every pass from LIVE signals — no event wiring: (a) crossing (room within the
+    // deadband of SP, from below) completes the mission and hands the ladder over; (b) drift dying
+    // or going stale aborts with a retry cooldown (transient gust in storage → one quiet stand-down);
+    // (c) the recomputed crossing receding past 2× lead aborts (SP moved away / cloud edge);
+    // (d) a 3× lead hard cap bounds a mispredicted hold. After an abort the normal selection
+    // downshifts 1→0→-1 naturally. The adaptive integral is FROZEN while a hold is active (see
+    // adaptive_cool_eff_diff_) — gear 1 deliberately running below SP would otherwise read as
+    // overcooling and rapidly unwind the retained bias the coming day regime needs.
+    if (approach_hold_cool_ && approach_hold_from_off_) {
+      // Atomic clamp commitment (Stephen 2026-08-06): an OFF-fired approach IS its OFF-entry clamp —
+      // once committed, no maintenance exits. A mid-clamp release would unfreeze the integral and
+      // unpin the ladder while the maneuver still holds the via-CS blast; with a wound bias, eff can
+      // sit deep inside an active band at release, stacking a genuine gear-2+ start onto the clamp
+      // (the gear-3/4-grade burst this rule exists to prevent). The hold lives exactly as long as
+      // the maneuver; when the clamp ends, THIS pass becomes the single decision point — the ladder
+      // takes whatever gear eff calls for, or drops to idle. No retry cooldown: a completed clamp is
+      // not an abort, and the idle-side approach must be immediately eligible ("back to idle, ready
+      // for an idle→1 firing"). Machine supersedes (user tap / mode switch / failsafe / test) still
+      // clear the hold through their own paths, unchanged. If the engagement found no matching
+      // OFF-entry quirk (kickstart never started), this releases on the next pass — plain start.
+      if (!kickstart_active_()) {
+        approach_hold_cool_ = false;
+        approach_hold_from_off_ = false;
+        ESP_LOGI(TAG, "Approach (cool): OFF-entry clamp complete — handing off to ladder");
+        // Handover preload from the engagement drift snapshot (2026-08-14 — the former MIN_HOLD
+        // gate guarded against sampling engage-time flux at the handover pass; the snapshot IS the
+        // engage-time signal now, deliberately, so the gate is gone). eff_diff is patched so THIS
+        // pass — the single decision point — selects on the live post-handover bias
+        // (downshift/hold legs; up_diff untouched: upshifts wait a pass, dwell-gated anyway).
+        // A handover RELEASES an armed raise freeze (bug-check round 2): the approach only fired
+        // because a crossing is imminent — demand is re-established — and deciding this pass on
+        // blind eff would spuriously downshift away the clamp the unit just spent 305 s on. eff was
+        // computed bias-blind while frozen, so the patch adds the FULL live bias (not the floor
+        // delta); the freeze-intact flag suppresses the estimator's floor over the preserved bias.
+        {
+          bool was_frozen = (raise_freeze_c_at_ != 0);
+          if (was_frozen) {
+            raise_freeze_c_at_ = 0;
+            ESP_LOGI(TAG, "Raise freeze (cool): released at approach handover — bias %.2f live", bias_c_);
+          }
+          float pd = apply_crossing_preload_(false, now, was_frozen);
+          eff_diff += was_frozen ? bias_c_ : pd;
+        }
       }
-      // 0→-1 gate (natural path only — user_input handled above). A predicted approach also
-      // suppresses the natural drop to full-off (going -1 only to restart within the lead time
-      // wastes an off/on cycle); imm_off (!boot_ready_) is deliberately NOT suppressible.
-      bool imm_off = !boot_ready_;
-      bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
-      bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
-      bool past_setpoint = diff < -mode_switch_temp_offset_c_;
-      // Natural-off gate (incident 2026-08-05, see NATURAL_OFF_BIAS_EPS_C): full-off waits for
-      // the integral to be unwound — a wound bias marks the sub-SP room as self-inflicted
-      // integral lag; hold at idle while the τ=180 idle decay fades it. No drift leg (Stephen
-      // 2026-08-06): a parked or even recovering room below SP−offset with an unwound bias goes
-      // properly OFF. A negative bias (over-satisfied) also counts as unwound. imm_off and the
-      // user-tap-past-SP door above are deliberately NOT gated.
-      // HEAT_COOL handoff door (bug-check 2026-08-06 CRITICAL): 0→−1 is the ONLY road to the
-      // other mode (arbitrate_mode_ pins do_heat while cool_gear_ >= 0), so when the room has
-      // fallen into heat's engagement territory the bias/drift legs MUST NOT stand in the way —
-      // else cool idles for hours (bias decay) or forever (room plateaus sub-floor) while the
-      // room goes arbitrarily cold with heat locked out. NaN heat target compares false → door
-      // stays closed in degenerate states.
-      bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
-                            (room <= get_heat_target_() + mode_switch_temp_offset_c_);
-      // A raise-FROZEN bias counts as unwound (bug-check round 1): the freeze marks the sub-SP
-      // room as user-inflicted (the raise), the bias is stored-not-live, and cooling below a
-      // raised SP is pointless — go properly OFF; the OFF-entry approach handles re-entry.
-      bool bias_unwound = bias_c_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_c_at_ != 0;
-      bool natural_off = idle_enough && event_ok && past_setpoint &&
-                         (handoff_demand || bias_unwound) &&
-                         !approach_predict_cool_(diff, now, approach_lead_ms_);
-      if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
-    } else {
-      // Active gears 1..M select on eff_diff (= diff + adaptive bias + fan feedforward); upshifts
-      // use the rate-gated up_diff. eff_diff == up_diff == diff when adaptive is off → bit-identical
-      // to the static ladder. Upshift trip = cool_up_[gear]; downshift trip = dn_thresh(gear).
-      if (gear < M && can_upshift_to(gear + 1) && up_diff > cool_up_[gear] &&
-          !(approach_hold_cool_ &&
-            (gear == 1 || (approach_hold_from_off_ && gear == cool_cold_start_floor_)))) {
-        // Upshift suppressed during an approach hold: the room is still below SP there, and
-        // up_diff carries the retained bias (under an armed raise freeze up_diff is bias-BLIND
-        // instead — suppressed either way) — letting it climb would run gear 2+ actively
-        // cooling below setpoint off exactly the bias the hold's integral freeze protects
-        // (bug-check round-1 BUG). The hold pins gear 1 in BOTH directions; the maintenance
-        // block owns every exit.
-        new_gear = gear + 1;
-      } else if (eff_diff < dn_thresh(gear) &&
-                 !(approach_hold_cool_ &&
-                   (gear == 1 || (approach_hold_from_off_ && gear == cool_cold_start_floor_)))) {
-        new_gear = gear - 1;
+    } else if (approach_hold_cool_) {
+      bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
+      float mins = (room_drift_cpm_ > 0.0f) ? (-diff) / room_drift_cpm_ : 1e9f;
+      if (eff_diff >= C_DN_10) {
+        // Release at the ladder's OWN gear-1 hold boundary (eff-based, like the cool 1→0 rail):
+        // the handover lands exactly where the ladder would keep gear 1 running — no release-pass
+        // downshift, no extra compressor cycle, and no minimum-bias floor for a seamless handoff
+        // (bug-check round-1: releasing at the raw deadband dropped 1→0 whenever bias < ~0.3).
+        approach_hold_cool_ = false;
+        ESP_LOGI(TAG, "Approach (cool): reached ladder band — hold released, ladder takes over");
+        // Handover preload from the engagement drift snapshot (2026-08-14). eff_diff patched for
+        // the same-pass decision; the release condition already fired on the old value. Handover
+        // releases an armed freeze, mirroring the atomic site. The was_frozen leg is LIVE here
+        // whenever the vent-fan feedforward exceeds C_DN_10 + deadband (blind eff = real + ff
+        // reaches the band release before the crossing release) — stock ff 0.25 keeps it dormant,
+        // fan_feedforward_gears: 2 or a retuned gear_step_c makes it real (bug-check round 3).
+        {
+          bool was_frozen = (raise_freeze_c_at_ != 0);
+          if (was_frozen) {
+            raise_freeze_c_at_ = 0;
+            ESP_LOGI(TAG, "Raise freeze (cool): released at approach handover — bias %.2f live", bias_c_);
+          }
+          float pd = apply_crossing_preload_(false, now, was_frozen);
+          eff_diff += was_frozen ? bias_c_ : pd;
+        }
+      } else if (!drift_fresh || !(room_drift_cpm_ > 0.0f) ||
+                 mins * 60000.0f > 2.0f * (float) approach_lead_ms_ ||
+                 (now - approach_started_at_) / 3 >= approach_lead_ms_) {
+        // NOTE (bug-check round 2, accepted): under an armed raise freeze this abort leg is the
+        // idle-fired hold's usual exit when gear 1 arrests a light-load rise (the band release
+        // computes on blind eff and the crossing release needs the band). The follow-on — blind
+        // 1→0, natural-off via the freeze bypass, full OFF below the raised SP — is the CORRECT
+        // state for that situation (light load, user asked for less cooling); re-entry is the
+        // OFF-entry approach, whose clamp lands at the crossing and whose handover releases the
+        // freeze. No repeating clamp cycle: the freeze is gone after the first handover.
+        approach_hold_cool_ = false;
+        approach_abort_at_ = (now != 0) ? now : 1;  // 0 is the "no cooldown" sentinel
+        ESP_LOGI(TAG, "Approach (cool): aborted (drift died/receded or hold cap) — standing down");
       }
     }
-  }
+
+    // Generalized N-gear selection — standard name: STAGE SEQUENCER (staging differentials +
+    // minimum dwell). (design_gear_engine_v2.) M = highest configured gear. Grid trips
+    // come from cool_up_[]/cool_dn_[]; the 0↔1 boundary + idle are the pinned C_UP_01/C_DN_10/C_IDLE.
+    int M = cool_max_gear_;
+    auto entry_thresh = [&](int g) -> float { return (g <= 1) ? C_UP_01 : cool_up_[g - 1]; };
+    auto dn_thresh    = [&](int g) -> float { return (g <= 1) ? C_DN_10 : cool_dn_[g - 1]; };
+    // Highest gear whose from-below entry threshold `d` clears (0 = none).
+    auto pick_from_below = [&](float d) -> int {
+      for (int g = M; g >= 1; g--) if (d > entry_thresh(g)) return g;
+      return 0;
+    };
+
+    // Selection basis for the user/fresh-start block (2026-08-15, hardened in the same session's
+    // bug-check): real diff PLUS the positive LIVE bias, and only under REAL DEMAND (diff above
+    // the deadband). Built from bias_c_ directly — NOT from eff_diff — so it deliberately excludes:
+    // (a) the vent-fan feedforward (bias==0 stays bit-identical to the static ladder — with ff in
+    //     the basis, ff alone could start the unit from OFF while the off-side gates stay real-diff);
+    // (b) the approach-handover eff PATCH (a local eff_diff adjustment — never in this basis).
+    //     Handover SIDE EFFECTS do reach it, deliberately: this basis is computed after the
+    //     handover blocks, so a freeze released there is live here, and a crossing-preload floor
+    //     written into bias_c_ is included. Reachable only on a late-clamp handover coinciding
+    //     with a same-pass user event, and the demand gate covers the at/below-SP outcomes;
+    //     the resulting pick is the load-justified gear (verifier 2026-08-15, accepted);
+    // (c) a raise-frozen bias while STILL armed (stored-not-live) and any bias while adaptive is
+    //     disabled (stale in-memory value after a mid-run toggle).
+    // The demand gate (diff > deadband) keeps every at/below-SP decision on the real diff: the
+    // freeze-release pass can't restart a below-SP unit off its just-released bias (stays OFF until
+    // real demand), a user tap deep below SP still reaches the tap-OFF door (pre-2026-08-15
+    // semantics exactly), and the restore pick stays a no-op at idle. A NEGATIVE bias never enters
+    // (fmaxf 0) — the 2026-06-03 round-3 gear-collapse case stays structurally impossible.
+    float pick_bias = (adaptive_enable_ && raise_freeze_c_at_ == 0) ? fmaxf(0.0f, bias_c_) : 0.0f;
+    float pick_basis = (diff > ADAPT_DEADBAND_C) ? (diff + pick_bias) : diff;
+    // Test-exit keeps the pure-eff pick (2026-07-20 semantics) on BOTH the in-band preserve check
+    // and the pick, so the two can't shadow each other with different bases.
+    float sel_basis = from_test ? eff_diff : pick_basis;
+
+    if (gear == -1 || user_input) {
+      // Fresh start from -1 requires the 1-min off lockout (hardware wind-down); no bypass.
+      bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
+      if (gear == -1 && !off_long_enough) {
+        new_gear = -1;  // still in 1-min wind-down period
+      } else if (user_input && gear >= 0 && gear_in_band_cool_(gear, sel_basis)) {
+        // User event but the current gear is still valid for the selection basis — preserve
+        // hunting state. (The preserve band [stop, next-up] is wider than the pick's entry
+        // threshold by the start/stop hysteresis — that gap is deliberate.) Live case 2026-08-15
+        // 04:56: g4 with real 0.99 / bias 2.0 now STAYS g4 instead of collapsing to the
+        // real-diff pick.
+        new_gear = gear;
+      } else {
+        // From -1: floor at the derived cold-start floor (compressor can't cold-start below it) and
+        // never gear 0 (only reachable by downshift from 1). Running (user_input, gear>=0): no floor.
+        // Positive-bias-aware pick (2026-08-15, Stephen: "bias is the load — it should position the
+        // ladder, through upshifts AND through SP changes") on sel_basis — see the basis note above
+        // for what is deliberately excluded (ff, handover patch, frozen bias, no-demand states).
+        // Live case 2026-08-15 04:42: OFF re-entry at real 0.79 / bias 2.0 picked g1 and crawled;
+        // this pick lands the load-justified gear (cold-start floor still applies as a MINIMUM).
+        int picked = pick_from_below(sel_basis);
+        // OFF-entry rules (Stephen, 2026-09-04): (1) OFF may enter ANY active gear the pick lands on;
+        // the CS/maneuver block below looks up the (-1 → gear) quirk row like any other transition —
+        // apply it if the YAML has one, else the gear's CS goes out bare. Which OFF entries need a
+        // clamped start is a HARDWARE fact and lives in the quirk table (this unit: g1/g2 rows, since
+        // from-OFF start needs CS >= SP+1); the engine must not encode it — a unit that cold-starts
+        // bare simply has no OFF rows. (2) OFF never enters idle directly: OFF→ON only when the pick
+        // calls for a compressor gear (the `picked >= 1` / "stays off" branches below).
+        // (Replaces the 08-15 row-coverage walk-down and the 08-16 identity rows it forced.)
+        if (picked >= 1) {
+          new_gear = picked;
+          if (gear == -1 && new_gear < cool_cold_start_floor_) new_gear = cool_cold_start_floor_;
+        } else if (gear == -1 && approach_predict_cool_(diff, now, approach_off_lead_ms_())) {
+          // Approach-side early engagement from OFF — through the NORMAL OFF-entry clamp, like every
+          // other cold start. HARD RULE (Stephen, 2026-08-03, after a live failure): kickstart quirks
+          // are REQUIRED for all OFF→gear changes INCLUDING approach entries. The 2026-07-07 CS
+          // characterization is unambiguous: from-OFF compressor start needs CS ≥ SP+1 (from-idle
+          // SP+0), and any start-capable CS saturates output upward — there is NO gentle cold start
+          // on this hardware. A brief "direct entry" variant (mode-on at gear-1's SP−1 CS) shipped
+          // 2026-08-03 and simply never started the compressor. The clamp's ~5-min burst below SP is
+          // accepted BECAUSE it is timed to land at the crossing: this site fires on the OFF-entry
+          // lead (~clamp duration + latency, see approach_off_lead_ms_), so the blast completes right
+          // as the room reaches SP — not minutes-of-margin early (2026-08-06 12:54: the shared 15-min
+          // lead put the blast at 66.4°F on a 69°F SP and arrested the climb occupant-noticeably).
+          // The off-dwell lockout was enforced above.
+          new_gear = cool_cold_start_floor_;
+          approach_hold_cool_ = true;
+          approach_hold_from_off_ = true;   // atomic clamp commitment — see hold maintenance
+          approach_engaged_this_pass = true;
+          approach_started_at_ = now;
+          // Snapshot the free-rise drift for the handover preload — approach_predict_cool_ just
+          // validated it fresh and positive; the clamp will suppress the live value from here.
+          approach_entry_drift_cpm_ = room_drift_cpm_;
+          approach_entry_drift_at_ = (now != 0) ? now : 1;
+          ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — gear-%d engagement via clamp",
+                   new_gear);
+        } else if (gear == -1) {
+          new_gear = -1;                               // stays off
+        } else if (user_input && diff < -USER_TAP_OFF_MIN_PAST_C) {
+          new_gear = -1;   // user tap FAR past setpoint → off (approach-covered by construction)
+        } else {
+          new_gear = 0;
+        }
+      }
+      // NOTE (history): this block used REAL diff only from 2026-06-03 (round-3 revert of a
+      // bias-aware restructure — 3 bugs incl. negative-bias gear collapse) until 2026-08-15. The
+      // demand-gated positive-bias basis above re-admits the bias as a value-only change: the June
+      // collapse (negative bias) remains impossible by construction, the block structure is
+      // untouched, and the off/tap-off/approach decisions in this chain still run on REAL diff —
+      // and stay REACHABLE, because every at/below-deadband state collapses sel_basis to the real
+      // diff (a tap deep below SP hits the door exactly as it did pre-change).
+    } else {
+      if (gear == 0) {
+        // First compute post-restore: jump straight to the correct gear (skip the HOLD_MS ladder).
+        // Positive-bias-aware via pick_basis (2026-08-15): demand-gated, so a restored gear-0 with
+        // a wound NVS bias stays a no-op at/below SP (pre-change semantics) and only positions up
+        // under real demand. Note this branch re-fires every pass until the first gear change
+        // stamps last_gear_change_ (pre-existing).
+        if (last_gear_change_ == 0) {
+          new_gear = pick_from_below(pick_basis);
+        } else if (can_upshift_to(1) && eff_diff > C_UP_01) {
+          // iter-1 #2 (2026-07-20): re-engage 0→1 on eff_diff (real + bias), not real diff, so the
+          // integral shifts the WHOLE ladder together — the 1→2 upshift already trips on eff_diff, so
+          // matching the 0→1 entry to it stops the bias from inverting gear 1's narrow band overnight.
+          // Made safe by iter-1 #4 (fast unwind → bias won't sit wound while the room is at SP). The
+          // 0→-1 off-decision below deliberately stays on REAL diff (failover / don't cool below SP on
+          // a stale bias). Summer/cool-only; revisit for heat↔cool mode hunting before fall.
+          new_gear = 1;
+        } else if (can_upshift_to(1) && approach_predict_cool_(diff, now, approach_lead_ms_)) {
+          // Approach-side early engagement from idle. The idle→1 quick-kick quirk (CS=SP+0) is
+          // harmless here (CS above the below-SP room → fan only), so it is NOT bypassed.
+          new_gear = 1;
+          approach_hold_cool_ = true;
+          approach_hold_from_off_ = false;  // idle-fired hold — normal 4-exit maintenance
+          approach_engaged_this_pass = true;
+          approach_started_at_ = now;
+          // Snapshot the free-rise drift for the handover preload (gear 0 is fan-only, so the
+          // trailing slope here is compressor-free too).
+          approach_entry_drift_cpm_ = room_drift_cpm_;
+          approach_entry_drift_at_ = (now != 0) ? now : 1;
+          ESP_LOGI(TAG, "Approach (cool): crossing predicted within lead — early gear-1 from idle");
+        }
+        // 0→-1 gate (natural path only — user_input handled above). A predicted approach also
+        // suppresses the natural drop to full-off (going -1 only to restart within the lead time
+        // wastes an off/on cycle); imm_off (!boot_ready_) is deliberately NOT suppressible.
+        bool imm_off = !boot_ready_;
+        bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
+        bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
+        bool past_setpoint = diff < -mode_switch_temp_offset_c_;
+        // Natural-off gate (incident 2026-08-05, see NATURAL_OFF_BIAS_EPS_C): full-off waits for
+        // the integral to be unwound — a wound bias marks the sub-SP room as self-inflicted
+        // integral lag; hold at idle while the τ=180 idle decay fades it. No drift leg (Stephen
+        // 2026-08-06): a parked or even recovering room below SP−offset with an unwound bias goes
+        // properly OFF. A negative bias (over-satisfied) also counts as unwound. imm_off and the
+        // user-tap-past-SP door above are deliberately NOT gated.
+        // HEAT_COOL handoff door (bug-check 2026-08-06 CRITICAL): 0→−1 is the ONLY road to the
+        // other mode (arbitrate_mode_ pins do_heat while cool_gear_ >= 0), so when the room has
+        // fallen into heat's engagement territory the bias/drift legs MUST NOT stand in the way —
+        // else cool idles for hours (bias decay) or forever (room plateaus sub-floor) while the
+        // room goes arbitrarily cold with heat locked out. NaN heat target compares false → door
+        // stays closed in degenerate states.
+        bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
+                              (room <= get_heat_target_() + mode_switch_temp_offset_c_);
+        // A raise-FROZEN bias counts as unwound (bug-check round 1): the freeze marks the sub-SP
+        // room as user-inflicted (the raise), the bias is stored-not-live, and cooling below a
+        // raised SP is pointless — go properly OFF; the OFF-entry approach handles re-entry.
+        bool bias_unwound = bias_c_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_c_at_ != 0;
+        bool natural_off = idle_enough && event_ok && past_setpoint &&
+                           (handoff_demand || bias_unwound) &&
+                           !approach_predict_cool_(diff, now, approach_lead_ms_);
+        if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
+      } else {
+        // Active gears 1..M select on eff_diff (= diff + adaptive bias + fan feedforward); upshifts
+        // use the rate-gated up_diff. eff_diff == up_diff == diff when adaptive is off → bit-identical
+        // to the static ladder. Upshift trip = cool_up_[gear]; downshift trip = dn_thresh(gear).
+        if (gear < M && can_upshift_to(gear + 1) && up_diff > cool_up_[gear] &&
+            !(approach_hold_cool_ &&
+              (gear == 1 || (approach_hold_from_off_ && gear == cool_cold_start_floor_)))) {
+          // Upshift suppressed during an approach hold: the room is still below SP there, and
+          // up_diff carries the retained bias (under an armed raise freeze up_diff is bias-BLIND
+          // instead — suppressed either way) — letting it climb would run gear 2+ actively
+          // cooling below setpoint off exactly the bias the hold's integral freeze protects
+          // (bug-check round-1 BUG). The hold pins gear 1 in BOTH directions; the maintenance
+          // block owns every exit.
+          new_gear = gear + 1;
+        } else if (eff_diff < dn_thresh(gear) &&
+                   !(approach_hold_cool_ &&
+                     (gear == 1 || (approach_hold_from_off_ && gear == cool_cold_start_floor_)))) {
+          new_gear = gear - 1;
+        }
+      }
+    }
+
+  }  // end production logic ladder (cool)
 
   // Track idle_since
   if (new_gear == 0 && gear != 0) {
@@ -3388,8 +3474,8 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
       const QuirkDef *q = find_quirk_(false, gear, new_gear);
       if (q != nullptr) {
         start_maneuver_(q, now);
-      } else if (current_cs_ != cs) {
-        set_cs_value_(cs, now);
+      } else {
+        apply_gear_frames_(cs, now);   // CS and/or per-gear fan, ordered by the fan direction; no-op if neither changed
       }
     }
   }
@@ -3555,6 +3641,7 @@ void FurrionChillCube::publish_debug_state_(float diff) {
     int g = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? heat_gear_ : cool_gear_;
     if (test_mode_)                                          regime = "test";
     else if (failsafe_active_)                               regime = "failsafe";
+    else if (is_script_mode())                               regime = "script";
     else if (this->mode == climate::CLIMATE_MODE_OFF)        regime = "off";
     else if (approach_hold_cool_ || approach_hold_heat_)     regime = "approach";
     else if (maneuver_phase_ != ManeuverPhase::IDLE)         regime = "maneuver";
@@ -3589,6 +3676,7 @@ void FurrionChillCube::set_test_mode(bool t) {
     arm_ring_reset_();
     ESP_LOGI(TAG, "TEST mode OFF — resuming production controller (will re-anchor next pass)");
   } else if (!test_mode_ && t) {
+    script_gear_ = SCRIPT_NONE;    // regimes are exclusive — the frame harness wins when set last
     mode_resend_pending_ = false;  // drop a pending reinforcement — stale late resends never cross a test session
     // test_frame rewrites target_temperature_high/low; a surviving baseline would read the
     // test-vs-real difference as a user SP change on exit and spuriously preload. Reset both
@@ -3617,6 +3705,7 @@ void FurrionChillCube::set_test_mode(bool t) {
 // or a raw Midea fan percent 20/40/60/80/100 (test-only 5-speed access).
 void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   test_mode_ = true;          // a test frame always implies test mode
+  script_gear_ = SCRIPT_NONE; // regimes are exclusive (bypasses set_test_mode() — clear here too)
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
   last_committed_cool_target_c_ = NAN;  // bypasses set_test_mode() — reset SP-transition state here too
   last_committed_heat_target_c_ = NAN;
@@ -3672,10 +3761,91 @@ void FurrionChillCube::test_resend_cs() {
 
 void FurrionChillCube::test_off() {
   test_mode_ = true;
+  script_gear_ = SCRIPT_NONE;    // regimes are exclusive
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
   active_ir_mode_ = climate::CLIMATE_MODE_OFF;
   transmit_mode_command_();
   ESP_LOGI(TAG, "TEST: unit OFF");
+}
+
+// ============================================================
+// Gear-script mode (see the header comment on set_script_gear)
+// ============================================================
+
+// Production → script: freeze the LOGIC side. Mirrors set_test_mode(true)'s bookkeeping, except the
+// bias itself is deliberately untouched (held at its entry value — Stephen 2026-09-05: freeze, not
+// zero) and the mode reinforcement keeps running (the control ladder stays live).
+void FurrionChillCube::enter_script_mode_() {
+  last_committed_cool_target_c_ = NAN;   // SP changes stay honoured (display + CS anchor) but never
+  last_committed_heat_target_c_ = NAN;   // preload / raise-freeze inside a script (detector skipped)
+  raise_freeze_c_at_ = 0;
+  raise_freeze_h_at_ = 0;
+  bias_parked_at_ = 0;
+  approach_hold_cool_ = false;
+  approach_hold_heat_ = false;
+  approach_hold_from_off_ = false;
+  approach_entry_drift_cpm_ = NAN;
+  approach_entry_drift_at_ = 0;
+  stall_above_since_c_ = 0;              // stale stall stamps must not fire on the first pass after exit
+  stall_below_since_h_ = 0;
+  stall_logged_c_ = false;
+  stall_logged_h_ = false;
+  script_off_logged_ = false;
+  publish_debug_state_(NAN);             // clear phantom hold/freeze state on the debug sensors now
+  ESP_LOGI(TAG, "SCRIPT mode ON — scripted gears replace the logic ladder; control ladder live");
+}
+
+void FurrionChillCube::set_script_gear(int gear) {
+  if (gear < -1) {
+    clear_script_gear();
+    return;
+  }
+  if (test_mode_) set_test_mode(false);   // whichever regime is set last wins; leave the harness cleanly
+  bool was = is_script_mode();
+  script_set_at_ = millis();              // callback context → self-clocked expiry
+  if (was && gear == script_gear_) return;   // same gear: restamp only (sequencer keep-alive)
+  if (!was) enter_script_mode_();
+  script_gear_ = gear;
+  script_off_logged_ = false;
+  user_changed_ = true;                   // apply on the next loop pass, not the next 60 s interval
+  last_gear_run_ = 0;
+  if (this->mode == climate::CLIMATE_MODE_OFF)
+    ESP_LOGW(TAG, "Script gear %d set while HA mode is OFF — inert until a mode is selected", gear);
+  ESP_LOGI(TAG, "Script gear -> %d", gear);
+}
+
+void FurrionChillCube::clear_script_gear() {
+  if (!is_script_mode()) return;
+  script_gear_ = SCRIPT_NONE;
+  user_changed_ = true;
+  resume_from_test_ = true;   // land on the bias-justified gear (eff_diff pick), not a real-diff drop
+  last_gear_run_ = 0;
+  arm_ring_reset_();          // machine-made room travel must not arm the approach displacement gate
+  ESP_LOGI(TAG, "SCRIPT mode OFF — production logic ladder resumes (bias-aware re-pick next pass)");
+}
+
+// The scripted pick with the HARDWARE guards production applies from OFF: the 1-min wind-down, and
+// "OFF never enters idle" (production only turns the unit on for a compressor gear; the script may
+// not either — Stephen 2026-09-05 — it stays OFF and logs once). Cold-start floor applies as a
+// minimum, as in production; a scripted gear above the ladder's max is clamped to max.
+int FurrionChillCube::script_gear_pick_(bool is_heat, int gear, uint32_t now) {
+  int max_g = is_heat ? heat_max_gear_ : cool_max_gear_;
+  int want = script_gear_;
+  if (want > max_g) want = max_g;
+  if (gear == -1 && want >= 0) {
+    bool off_long_enough = (off_since_ == 0) || (now - off_since_ >= mode_switch_off_ms_);
+    if (!off_long_enough) return -1;   // still in the 1-min wind-down
+    if (want == 0) {
+      if (!script_off_logged_) {
+        ESP_LOGW(TAG, "Script gear 0 from OFF refused — OFF never enters idle; staying OFF");
+        script_off_logged_ = true;
+      }
+      return -1;
+    }
+    int floor = is_heat ? heat_cold_start_floor_ : cool_cold_start_floor_;
+    if (want < floor) want = floor;
+  }
+  return want;
 }
 
 void FurrionChillCube::dump_config() {

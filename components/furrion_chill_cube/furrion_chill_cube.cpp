@@ -1757,8 +1757,8 @@ climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
   // 1. Bench-test operator override — exercise startup-clamp (fan=LOW) sequences directly.
   if (test_mode_ && test_fan_ >= 0) return fan_int_to_mode_(test_fan_);
   // 2. An active maneuver's via_fan (the OFF→gear clamp, the 3→2 fan-LOW clamp, …) overrides all.
-  //    end_maneuver_ clears maneuver_phase_ BEFORE its restoring mode-resend, so the release frame
-  //    correctly picks up the settled gear's fan below rather than the maneuver's via_fan.
+  //    end_maneuver_ clears maneuver_phase_ BEFORE calling apply_gear_frames_, so the release
+  //    frames pick up the settled gear's fan below rather than the maneuver's via_fan.
   if (maneuver_phase_ != ManeuverPhase::IDLE && maneuver_via_fan_ >= 0)
     return fan_int_to_mode_(maneuver_via_fan_);
   // 3. The current gear's commanded fan, if set (controller-driven fan overrides the HA fan entity).
@@ -1814,6 +1814,8 @@ int FurrionChillCube::gear_cs_with_clamp_(bool is_heat, int offset) {
   return furrion_setpoint_c_ + offset + shift;
 }
 
+// Set + transmit a CS with no fan consideration. Since 2026-09-05 the gear-change sites use
+// apply_gear_frames_ (fan/CS ordering); this remains for the unit-OFF neutral CS in run_idle_mode_.
 void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
   current_cs_ = cs;
   if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
@@ -1838,12 +1840,17 @@ void FurrionChillCube::set_cs_value_(int cs, uint32_t now) {
 // place (gear updated / maneuver phase set or cleared), so get_effective_fan_mode_() returns it;
 // `new_cs` is the CS to hold afterwards. No-op on the wire when neither changed. A Main frame is
 // DEFERRED (not sent) while a setpoint change is debouncing — same reason as
-// maybe_apply_gear_fan_, which then retries it — so in that ≤2.5 s window a CS may precede its
-// fan; the commit's own bracket follows immediately (accepted).
+// maybe_apply_gear_fan_ — so in that ≤2.5 s window a CS may precede its fan (accepted). The retry:
+// bare site / maneuver exit → maybe_apply_gear_fan_ on the next pass; maneuver ENTRY →
+// advance_maneuver_'s reinforce (maybe_apply_gear_fan_ is inert during a hold).
 void FurrionChillCube::apply_gear_frames_(int new_cs, uint32_t now) {
   bool cs_changed = (new_cs != current_cs_);
   current_cs_ = new_cs;
-  bool can_tx = boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF;
+  // FAN_ONLY (bench harness mode left behind by a fan-only test step) is excluded exactly as in
+  // transmit_cs_update_(): without it the first production pass after such a step would put a
+  // spurious FAN_ONLY Main frame on the wire (bug-check R1) — the HVAC-on bracket owns that pass.
+  bool can_tx = boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
+                active_ir_mode_ != climate::CLIMATE_MODE_FAN_ONLY;
   climate::ClimateFanMode new_fan = get_effective_fan_mode_();
   bool fan_changed = can_tx && !setpoint_pending_ && ((int) new_fan != last_tx_fan_);
   if (can_tx) {
@@ -2017,6 +2024,14 @@ void FurrionChillCube::advance_maneuver_(uint32_t now) {
   if ((now - maneuver_last_tx_) >= reassert_ms) {
     maneuver_last_tx_ = now;
     if (boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
+      // Self-heal a via_fan Main that entry had to DEFER (apply_gear_frames_ withholds Main frames
+      // while a setpoint change is debouncing, and maybe_apply_gear_fan_ is inert during a maneuver
+      // — bug-check R1): if the wire fan still isn't the hold's fan, send it now, BEFORE the CS
+      // re-assert (fan cap first, then drive — the same order entry would have used).
+      if (!setpoint_pending_ && (int) get_effective_fan_mode_() != last_tx_fan_) {
+        transmit_mode_command_();
+        ESP_LOGI(TAG, "Maneuver: deferred via_fan sent on reinforce (fan=%d)", last_tx_fan_);
+      }
       transmit_cs_update_();
       last_cs_heartbeat_ = now;
     }
@@ -2309,8 +2324,9 @@ void FurrionChillCube::run_gear_controller_() {
     ESP_LOGI(TAG, "Boot ready — first gear computation complete, IR enabled");
   }
 
-  // Persist gear + bias for the warm-reboot restore (no-op unless one changed)
-  save_gear_pref_();
+  // Persist gear + bias for the warm-reboot restore (no-op unless one changed). Not under a gear
+  // script: a machine-forced gear must not become the warm-resume gear (bug-check R1).
+  if (!is_script_mode()) save_gear_pref_();
 
   // Debug sensor publishing
   publish_debug_state_(gear_diff);
@@ -2990,6 +3006,13 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
     transmit_mode_command_();
     if (kickstart_active_()) end_maneuver_(now);
+  } else if (new_gear == -1 && maneuver_phase_ == ManeuverPhase::PRE_CS) {
+    // OFF decided while an OFF→gear start is still in its 500 ms PRE_CS lead (unit not yet on):
+    // drop the pending mode-on instead of letting advance_maneuver_ turn the unit on against this
+    // pass (pre-existing hole; reachable via two rapid gear-script writes — bug-check R1).
+    maneuver_phase_ = ManeuverPhase::IDLE;
+    maneuver_start_ = 0;
+    ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided OFF");
   }
 
   // Apply a per-gear commanded fan (heat gears carry none by default → no-op).
@@ -3489,6 +3512,13 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
     transmit_mode_command_();
     if (kickstart_active_()) end_maneuver_(now);
+  } else if (new_gear == -1 && maneuver_phase_ == ManeuverPhase::PRE_CS) {
+    // OFF decided while an OFF→gear start is still in its 500 ms PRE_CS lead (unit not yet on):
+    // drop the pending mode-on instead of letting advance_maneuver_ turn the unit on against this
+    // pass (pre-existing hole; reachable via two rapid gear-script writes — bug-check R1).
+    maneuver_phase_ = ManeuverPhase::IDLE;
+    maneuver_start_ = 0;
+    ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided OFF");
   }
 
   // Apply a per-gear commanded fan (e.g. gear 3 = med → gear 4 = high, same CS): emit a mode frame
@@ -3503,6 +3533,14 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
 
 // NEITHER-active pass: ensure the unit is OFF and both gears are -1.
 void FurrionChillCube::run_idle_mode_(uint32_t now) {
+  // A gear script is inert here (HA mode OFF, or HEAT_COOL with both gears -1 and the room inside the
+  // deadband so arbitrate_mode_ picked neither) — say so once per script rather than silently holding
+  // the unit OFF for the run (bug-check R1; HEAT_COOL script semantics = open design item).
+  if (is_script_mode() && !script_off_logged_) {
+    script_off_logged_ = true;
+    ESP_LOGW(TAG, "Script gear %d armed but no mode active (HA mode %d, HEAT_COOL deadband?) — unit stays OFF",
+             script_gear_, (int) this->mode);
+  }
   // Ensure HVAC is OFF
   if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
     set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
@@ -3705,7 +3743,10 @@ void FurrionChillCube::set_test_mode(bool t) {
 // or a raw Midea fan percent 20/40/60/80/100 (test-only 5-speed access).
 void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   test_mode_ = true;          // a test frame always implies test mode
-  script_gear_ = SCRIPT_NONE; // regimes are exclusive (bypasses set_test_mode() — clear here too)
+  if (script_gear_ != SCRIPT_NONE) {   // regimes are exclusive (bypasses set_test_mode() — clear here too)
+    script_gear_ = SCRIPT_NONE;
+    publish_debug_state_(NAN);        // gear passes stop in test mode — don't leave the regime on "script"
+  }
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
   last_committed_cool_target_c_ = NAN;  // bypasses set_test_mode() — reset SP-transition state here too
   last_committed_heat_target_c_ = NAN;
@@ -3761,7 +3802,10 @@ void FurrionChillCube::test_resend_cs() {
 
 void FurrionChillCube::test_off() {
   test_mode_ = true;
-  script_gear_ = SCRIPT_NONE;    // regimes are exclusive
+  if (script_gear_ != SCRIPT_NONE) {   // regimes are exclusive
+    script_gear_ = SCRIPT_NONE;
+    publish_debug_state_(NAN);
+  }
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
   active_ir_mode_ = climate::CLIMATE_MODE_OFF;
   transmit_mode_command_();
@@ -3804,9 +3848,9 @@ void FurrionChillCube::set_script_gear(int gear) {
   bool was = is_script_mode();
   script_set_at_ = millis();              // callback context → self-clocked expiry
   if (was && gear == script_gear_) return;   // same gear: restamp only (sequencer keep-alive)
-  if (!was) enter_script_mode_();
-  script_gear_ = gear;
+  script_gear_ = gear;                       // before enter_script_mode_ so its debug publish reads "script"
   script_off_logged_ = false;
+  if (!was) enter_script_mode_();
   user_changed_ = true;                   // apply on the next loop pass, not the next 60 s interval
   last_gear_run_ = 0;
   if (this->mode == climate::CLIMATE_MODE_OFF)

@@ -416,8 +416,13 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_MODE_RESEND_DELAY, default="0s"): cv.positive_time_period_milliseconds,
             # Gear-script mode (2026-09-05): a scripted gear (set_script_gear from YAML) replaces the
             # logic ladder's pick while the production control ladder executes it. The scripted gear
-            # expires this long after its last (re)assert → production resumes. 0s = never expires.
-            cv.Optional(CONF_GEAR_SCRIPT_TIMEOUT, default="15min"): cv.positive_time_period_milliseconds,
+            # expires this long after its last (re)assert → production resumes. Minimum 60s: the
+            # on-device sequencer restamps once a minute, so a shorter expiry would stall a run
+            # (bug-check R1); the expiry is the safety net, so it cannot be disabled.
+            cv.Optional(CONF_GEAR_SCRIPT_TIMEOUT, default="15min"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(seconds=60)),
+            ),
             # Fan feedforward scale: °C of eff_diff per fan-gear (adaptive cool). NOTE:
             # historically tied to modulation spacing; left at 0.25 for behavior-parity.
             cv.Optional(CONF_GEAR_STEP_C, default=0.25): cv.float_range(min=0.0, max=2.0),

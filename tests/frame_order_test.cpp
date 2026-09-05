@@ -97,6 +97,10 @@ int main() {
     check(apply_gear_frames(w, 23, MED) == "" && w.cs == 23, "mode OFF/boot/failsafe: no frames, CS state still set");
     w = {20, AUTO, true, true};
     check(apply_gear_frames(w, 23, MED) == "CS", "setpoint debouncing: MAIN deferred (maybe_apply_gear_fan_ retries), CS only");
+    // FAN_ONLY left behind by a fan-only bench step: can_tx must be false (mirrors transmit_cs_update_'s guard) —
+    // otherwise the first production pass emits a spurious FAN_ONLY Main (bug-check R1). Modelled as can_tx=false.
+    w = {20, HIGH, false, false};
+    check(apply_gear_frames(w, 23, MED) == "" && w.cs == 23, "FAN_ONLY residue: no frames (HVAC-on bracket owns the pass)");
     // symmetry: every running entry to g2 is the same wire sequence from 1, 3 and 4 after the MAIN
     Wire a{19, AUTO, true, false}, b{23, MED, true, false}, c{23, HIGH, true, false};
     apply_gear_frames(a, 23, LOW); apply_gear_frames(b, 23, LOW); apply_gear_frames(c, 23, LOW);

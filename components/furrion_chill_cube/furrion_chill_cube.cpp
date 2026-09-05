@@ -1995,7 +1995,10 @@ void FurrionChillCube::enter_maneuver_hold_(uint32_t now) {
 
 void FurrionChillCube::advance_maneuver_(uint32_t now) {
   if (maneuver_phase_ == ManeuverPhase::PRE_CS) {
-    if ((now - maneuver_phase_start_) >= 500) enter_maneuver_hold_(now);
+    // Mode-on waits for a valid room reading: a NaN-room grace return skips the gear pass but not this
+    // engine, and waking the unit while every CS frame is suppressed (isnan gate) would leave it running
+    // blind with no CS behind it (bug-check R3). The lead simply extends; failsafe clears the phase.
+    if ((now - maneuver_phase_start_) >= 500 && (test_mode_ || !isnan(inside_temp_c_))) enter_maneuver_hold_(now);
     return;
   }
   if (maneuver_phase_ != ManeuverPhase::HOLD) return;
@@ -2329,9 +2332,11 @@ void FurrionChillCube::run_gear_controller_() {
     ESP_LOGI(TAG, "Boot ready — first gear computation complete, IR enabled");
   }
 
-  // Persist gear + bias for the warm-reboot restore (no-op unless one changed). Not under a gear
-  // script: a machine-forced gear must not become the warm-resume gear (bug-check R1).
-  if (!is_script_mode()) save_gear_pref_();
+  // Persist gear + bias for the warm-reboot restore (no-op unless one changed). Also under a gear
+  // script: the warm-restore premise is "saved gear = the unit's TRUE wire state" (setup() seeds
+  // last_tx_fan_ from it); a scripted gear IS that state, and the frozen bias is what it was. (R1 skipped
+  // the save under a script; R2/R3 showed the pre-script gear would restore the wrong fan — reverted.)
+  save_gear_pref_();
 
   // Debug sensor publishing
   publish_debug_state_(gear_diff);
@@ -3011,13 +3016,19 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
     transmit_mode_command_();
     if (kickstart_active_()) end_maneuver_(now);
-  } else if (new_gear == -1 && maneuver_phase_ == ManeuverPhase::PRE_CS) {
-    // OFF decided while an OFF→gear start is still in its 500 ms PRE_CS lead (unit not yet on):
-    // drop the pending mode-on instead of letting advance_maneuver_ turn the unit on against this
-    // pass (pre-existing hole; reachable via two rapid gear-script writes — bug-check R1).
+  } else if (new_gear <= 0 && maneuver_phase_ == ManeuverPhase::PRE_CS) {
+    // OFF or IDLE decided while an OFF→gear start is still in its 500 ms PRE_CS lead (unit not yet
+    // on): drop the pending mode-on instead of letting advance_maneuver_ turn the unit on against this
+    // pass (pre-existing hole; reachable via two rapid gear-script writes — bug-check R1/R3). A pass
+    // that landed on idle here is really "stay OFF": the unit never came on and OFF never enters idle.
     maneuver_phase_ = ManeuverPhase::IDLE;
     maneuver_start_ = 0;
-    ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided OFF");
+    if (new_gear == 0) {
+      heat_gear_ = -1;
+      idle_since_ = 0;
+      if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+    }
+    ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided %s (unit stays OFF)", new_gear == 0 ? "idle" : "OFF");
   }
 
   // Apply a per-gear commanded fan (heat gears carry none by default → no-op).
@@ -3517,13 +3528,19 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
     transmit_mode_command_();
     if (kickstart_active_()) end_maneuver_(now);
-  } else if (new_gear == -1 && maneuver_phase_ == ManeuverPhase::PRE_CS) {
-    // OFF decided while an OFF→gear start is still in its 500 ms PRE_CS lead (unit not yet on):
-    // drop the pending mode-on instead of letting advance_maneuver_ turn the unit on against this
-    // pass (pre-existing hole; reachable via two rapid gear-script writes — bug-check R1).
+  } else if (new_gear <= 0 && maneuver_phase_ == ManeuverPhase::PRE_CS) {
+    // OFF or IDLE decided while an OFF→gear start is still in its 500 ms PRE_CS lead (unit not yet
+    // on): drop the pending mode-on instead of letting advance_maneuver_ turn the unit on against this
+    // pass (pre-existing hole; reachable via two rapid gear-script writes — bug-check R1/R3). A pass
+    // that landed on idle here is really "stay OFF": the unit never came on and OFF never enters idle.
     maneuver_phase_ = ManeuverPhase::IDLE;
     maneuver_start_ = 0;
-    ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided OFF");
+    if (new_gear == 0) {
+      cool_gear_ = -1;
+      idle_since_ = 0;
+      if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+    }
+    ESP_LOGI(TAG, "Maneuver PRE_CS dropped — pass decided %s (unit stays OFF)", new_gear == 0 ? "idle" : "OFF");
   }
 
   // Apply a per-gear commanded fan (e.g. gear 3 = med → gear 4 = high, same CS): emit a mode frame
@@ -3558,6 +3575,7 @@ void FurrionChillCube::run_idle_mode_(uint32_t now) {
     set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
     transmit_mode_command_();
     maneuver_phase_ = ManeuverPhase::IDLE;
+    maneuver_start_ = 0;
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
     // Start the absolute 60s off-lockout. This is the user-OFF (or both-off) path that
     // turns the unit off WITHOUT going through run_heat/cool_mode_'s -1 transition, so it

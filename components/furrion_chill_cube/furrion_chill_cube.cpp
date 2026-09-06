@@ -2083,7 +2083,14 @@ void FurrionChillCube::advance_maneuver_(uint32_t now) {
     // Mode-on waits for a valid room reading: a NaN-room grace return skips the gear pass but not this
     // engine, and waking the unit while every CS frame is suppressed (isnan gate) would leave it running
     // blind with no CS behind it (bug-check R3). The lead simply extends; failsafe clears the phase.
-    if ((now - maneuver_phase_start_) >= 500 && !isnan(inside_temp_c_) && !isnan(get_active_ir_target_()))
+    // Target gate = the target of the mode this maneuver is ABOUT to turn on (maneuver_is_heat_), NOT
+    // get_active_ir_target_(): during PRE_CS the active IR mode is still OFF, so that returns NaN and
+    // the lead can never end — every OFF→g1/g2 cool start and the heat OFF→1 start deadlocked in
+    // PRE_CS with the unit off (bug-check R4 regression, found live 2026-09-06 01:05 on the first
+    // gear-script start from OFF; the ladder is frozen while a maneuver is armed, so nothing else
+    // could turn the unit on either).
+    float target = maneuver_is_heat_ ? get_heat_target_() : get_cool_target_();
+    if ((now - maneuver_phase_start_) >= 500 && !isnan(inside_temp_c_) && !isnan(target))
       enter_maneuver_hold_(now);   // both gates transmit_cs_update_/transmit_mode_command_ need (R4)
     return;
   }

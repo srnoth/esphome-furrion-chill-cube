@@ -1040,8 +1040,10 @@ void FurrionChillCube::diag_restore_log_() {
 #ifdef USE_API
     api_up = (api::global_api_server != nullptr && api::global_api_server->is_connected());
 #endif
+    // HA subscribes to logs a moment AFTER the API connects — the first attempt is lost. Log it on the
+    // first API-up pass and keep repeating it (every readback) for the first 5 minutes of uptime.
     if (api_up || ms > 90000) {
-      diag_restore_logged_ = true;
+      diag_restore_logged_ = (ms > 300000);
       ESP_LOGI(TAG, "DIAG boot restore: %s mode=%d lo=%.2f hi=%.2f tgt=%.2f | live now mode=%d lo=%.2f hi=%.2f "
                "| ir_mode=%d cool_gear=%d | objid_hash=0x%08X uptime=%lus",
                diag_restore_ok_ ? "LOADED" : "NONE", diag_restore_mode_, diag_restore_lo_, diag_restore_hi_,
@@ -1051,6 +1053,7 @@ void FurrionChillCube::diag_restore_log_() {
   }
   if (ms - diag_readback_at_ >= 60000) {
     diag_readback_at_ = ms;
+    if (ms < 300000) diag_restore_logged_ = false;   // re-log the boot restore on the next pass
     auto r = this->restore_state_();   // same key as boot; reads pending-save copy if one is queued, else NVS
     if (r.has_value()) {
       ESP_LOGI(TAG, "DIAG NVS readback: mode=%d lo=%.2f hi=%.2f tgt=%.2f | live mode=%d lo=%.2f hi=%.2f tgt=%.2f%s",

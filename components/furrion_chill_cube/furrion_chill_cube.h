@@ -71,7 +71,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_use_fahrenheit(bool enable) { use_fahrenheit_ = enable; }
 
   // Configurable gear tables (gear number → °C CS offset from setpoint anchor + optional
-  // commanded fan; fan -1 = unset → falls through to the HA fan-mode entity).
+  // commanded fan as a board percent: 0 auto, 20/40/60/80/100; -1 = unset → AUTO on the wire).
+  // Fan vocabulary (2026-09-07): ONE int everywhere — gears, quirks, test hooks, last_tx_fan_,
+  // debug_effective_fan — and no HA fan entity (the controller owns the fan).
   void add_cool_gear(int gear, int cs_offset, int fan) { set_gear_offset_(false, gear, cs_offset, fan); }
   void add_heat_gear(int gear, int cs_offset, int fan) { set_gear_offset_(true, gear, cs_offset, fan); }
   // Ladder params (spacing S, hysteresis h, pinned start/stop/idle). The modulation
@@ -83,7 +85,8 @@ class FurrionChillCube : public climate::Climate, public Component {
     heat_spacing_ = spacing; heat_hyst_ = hyst; heat_start_ = start; heat_stop_ = stop; heat_idle_ = idle;
   }
   // Register a transition quirk (path-dependent maneuver). from_gear -1 = OFF→gear clamped start.
-  // via_fan -1 = leave fan; escape_up = release early if a higher gear is demanded. duration 0 = global.
+  // via_fan -1 = leave fan (else a board percent); escape_up = release early if a higher gear is
+  // demanded. duration 0 = global.
   void add_quirk(bool is_heat, int from_gear, int to_gear, int via_offset, int via_fan,
                  bool escape_up, uint32_t duration_ms);
   void set_quirk_duration_ms(uint32_t ms) { quirk_duration_ms_ = ms; }
@@ -197,10 +200,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   // real HA target, so failover is restored on exit.
   void set_test_mode(bool t);
   bool is_test_mode() const { return test_mode_; }   // single source of truth for the sequencer
-  // Send one full test frame: mode (0=OFF,1=COOL,2=HEAT), °C setpoint, raw CS byte, fan
-  // (0=AUTO,1=LOW,2=MED,3=HIGH — OR a raw Midea fan percent 20/40/60/80/100; the board has
-  // five speeds, the enum reaches three [40/60/100]; captured 2026-09-02). Sets state +
-  // transmits the CS→MODE→CS bracket (or OFF).
+  // Send one full test frame: mode (0=OFF,1=COOL,2=HEAT,3=FAN_ONLY), °C setpoint, raw CS byte, fan
+  // as a board percent (0=AUTO, 20/40/60/80/100; other values → AUTO). Sets state + transmits the
+  // CS→MODE→CS bracket (or OFF / fan-only Main).
   void test_frame(int mode, int setpoint_c, int cs, int fan);
   // Re-assert the current CS only (keep-alive tick; no-op when the held mode is OFF).
   void test_resend_cs();
@@ -244,7 +246,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Consumed by HA's ESPHome "Subscribe to logs from the device" option -> home-assistant.log.
   void log_frame_(const char *kind, const uint8_t *msg, uint8_t len, const char *decoded);
   static const char *mode_name_(climate::ClimateMode m);
-  static const char *fan_name_(climate::ClimateFanMode f);
+  static const char *fan_name_(int f);   // "auto" / "20".."100" / "off" (-1)
+  static bool fan_valid_(int f);         // 0 (auto) or one of the five board percents
+  static constexpr int FAN_AUTO = 0;
   uint32_t tx_seq_{0};  // wire-log frame counter (wraps; only used to make lines distinct)
 
   // Gear controller
@@ -333,7 +337,6 @@ class FurrionChillCube : public climate::Climate, public Component {
   void end_maneuver_(uint32_t now);
   // Look up a configured quirk for a (mode, from_gear→to_gear) transition; nullptr if none.
   const QuirkDef *find_quirk_(bool is_heat, int from_gear, int to_gear);
-  climate::ClimateFanMode fan_int_to_mode_(int f);   // 0 AUTO, 1 LOW, 2 MED, 3 HIGH (else AUTO)
   void maybe_apply_gear_fan_(uint32_t now);           // emit a mode frame if the current gear's fan changed
 
   // Timed vane positioning (open-loop IR homing off the power-on anchor).
@@ -364,7 +367,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void force_off_for_mode_switch_(uint32_t now);
 
   // Fan mode
-  climate::ClimateFanMode get_effective_fan_mode_();
+  int get_effective_fan_mode_();   // board percent for the next mode frame (FAN_AUTO or 20..100)
 
   // Dynamic setpoint
   int compute_setpoint_c_(bool is_heat);
@@ -411,7 +414,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   sensor::Sensor *debug_adaptive_bias_c_sensor_{nullptr};
   sensor::Sensor *debug_room_drift_sensor_{nullptr};
   sensor::Sensor *debug_fan_feedforward_sensor_{nullptr};
-  sensor::Sensor *debug_effective_fan_sensor_{nullptr};   // last-transmitted fan (0 auto/1 low/2 med/3 high, -1 off)
+  sensor::Sensor *debug_effective_fan_sensor_{nullptr};   // last-transmitted fan (0 auto / 20..100 %, -1 off)
   sensor::Sensor *debug_raise_freeze_sensor_{nullptr};    // 0 = none, 1 = cool freeze armed, 2 = heat freeze armed
   text_sensor::TextSensor *debug_regime_sensor_{nullptr}; // engine regime word (see publish_debug_state_)
 
@@ -436,7 +439,7 @@ class FurrionChillCube : public climate::Climate, public Component {
                                // detection (furrion_setpoint_c_ tracks live, so can't be it).
   int last_tx_target_f_{0};   // Last °F target byte actually transmitted (F-protocol);
                               // lets update_furrion_setpoint_() catch sub-°C changes
-  int last_tx_fan_{-1};       // Last fan enum put on the wire via a mode frame (-1 = none/OFF).
+  int last_tx_fan_{-1};       // Last fan (board percent, 0 auto) put on the wire via a mode frame (-1 = none/OFF).
                               // Set inside transmit_mode_command_(); gates the per-gear fan resend.
   climate::ClimateMode active_ir_mode_{climate::CLIMATE_MODE_OFF};
 
@@ -468,7 +471,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t maneuver_phase_start_{0};   // current phase start (PRE_CS 500ms lead)
   uint32_t maneuver_last_tx_{0};       // last via-CS re-assert (for quirk_transmit_interval_ms_)
   int maneuver_via_cs_{0};             // CS held during the maneuver
-  int8_t maneuver_via_fan_{-1};        // fan held during HOLD (-1 = leave fan as-is)
+  int16_t maneuver_via_fan_{-1};       // fan held during HOLD (-1 = leave fan as-is; else board percent)
   uint32_t maneuver_duration_ms_{0};   // this maneuver's HOLD window
   bool maneuver_is_heat_{false};
   int8_t maneuver_from_gear_{0};       // -1 = OFF→gear entry (PRE_CS + mode-on path)
@@ -512,13 +515,13 @@ class FurrionChillCube : public climate::Climate, public Component {
     int8_t from_gear;     // -1 = OFF, 0 = idle, 1.. = active
     int8_t to_gear;
     int8_t via_offset;    // CS offset (°C) from setpoint anchor, held during the maneuver
-    int8_t via_fan;       // fan held during the maneuver: -1 unset, 0 AUTO, 1 LOW, 2 MED, 3 HIGH
+    int16_t via_fan;      // fan held during the maneuver: -1 unset, 0 AUTO, else board percent 20..100
     bool escape_up;       // release early if the demanded gear rises above to_gear
     uint32_t duration_ms; // 0 = use quirk_duration_ms_
   };
   int cool_gear_offset_[MAX_GEARS] = {-5, -2, 0, 3, 0, 0, 0, 0};    // idle, LOW, MED, MAX (defaults)
   int heat_gear_offset_[MAX_GEARS] = {5, 1, 0, -1, 0, 0, 0, 0};     // idle, g1, g2, g3
-  int cool_gear_fan_[MAX_GEARS] = {-1, -1, -1, -1, -1, -1, -1, -1}; // per-gear commanded fan (-1 = HA fan)
+  int cool_gear_fan_[MAX_GEARS] = {-1, -1, -1, -1, -1, -1, -1, -1}; // per-gear commanded fan % (-1 = auto)
   int heat_gear_fan_[MAX_GEARS] = {-1, -1, -1, -1, -1, -1, -1, -1};
   int cool_max_gear_{3};
   int heat_max_gear_{3};
@@ -558,10 +561,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Flags
   bool boot_ready_{false};
   bool failsafe_active_{false};
+  bool failsafe_fan_release_tx_{false};   // true only while check_failsafe_ transmits the fan-AUTO release frame
   bool test_mode_{false};   // bench test harness: loop() inert, unit driven only by test_* hooks
-  int test_fan_{-1};        // fan override for test frames (-1 = none; 0=AUTO,1=LOW,2=MED,3=HIGH)
-  int test_fan_pct_{0};     // TEST-ONLY raw Midea fan percent (0 = off; 20/40/60/80/100) — overrides the
-                            // fan bytes of the mode frame while test_mode_ is set. Never touches production.
+  int test_fan_{-1};        // fan override for test frames (-1 = none; else board percent, 0 = auto)
   bool user_changed_{false};
   bool resume_from_test_{false};  // set on test-exit → gear re-pick uses eff_diff (bias-aware), not real diff
   int script_gear_{SCRIPT_NONE};     // gear-script mode: SCRIPT_NONE = production; -1 OFF, 0 idle, 1..max

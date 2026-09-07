@@ -501,14 +501,23 @@ const char *FurrionChillCube::mode_name_(climate::ClimateMode m) {
     default: return "?";
   }
 }
-const char *FurrionChillCube::fan_name_(climate::ClimateFanMode f) {
+// Fan vocabulary (2026-09-07): a fan is a Midea board PERCENT — 0 = auto, 20/40/60/80/100 = the
+// five fixed speeds, -1 = unset/OFF. Gears, quirks, the test harness and the wire all speak this one
+// vocabulary; the HA climate entity no longer exposes a fan control (the controller owns the fan).
+const char *FurrionChillCube::fan_name_(int f) {
   switch (f) {
-    case climate::CLIMATE_FAN_AUTO: return "auto";
-    case climate::CLIMATE_FAN_LOW: return "low";
-    case climate::CLIMATE_FAN_MEDIUM: return "med";
-    case climate::CLIMATE_FAN_HIGH: return "high";
+    case FAN_AUTO: return "auto";
+    case 20: return "20";
+    case 40: return "40";
+    case 60: return "60";
+    case 80: return "80";
+    case 100: return "100";
+    case -1: return "off";
     default: return "?";
   }
+}
+bool FurrionChillCube::fan_valid_(int f) {
+  return f == FAN_AUTO || f == 20 || f == 40 || f == 60 || f == 80 || f == 100;
 }
 void FurrionChillCube::log_frame_(const char *kind, const uint8_t *msg, uint8_t len, const char *decoded) {
   char hex[3 * 12 + 1] = {0};  // frames are 6 or 12 bytes
@@ -568,44 +577,22 @@ bool FurrionChillCube::transmit_mode_command_() {
     last_tx_setpoint_c_ = furrion_setpoint_c_;
   }
 
-  // Fan speed
-  auto fan = get_effective_fan_mode_();
+  // Fan speed — Midea board percent (captured byte-exact from a Midea U-shape remote 2026-09-02;
+  // ir-codes-catalog.md). msg[7] is the literal percent (auto = 0x66 = 102); msg[2] is the coarse
+  // code and 80/100 share 0x3F. Same table for production gears, quirks and bench frames.
+  int fan = get_effective_fan_mode_();
   if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
     message[2] = 0x7B;  // FAN_OFF
     message[7] = 0x00;
   } else {
     switch (fan) {
-      case climate::CLIMATE_FAN_LOW:
-        message[2] = 0x9F;
-        message[7] = 0x28;
-        break;
-      case climate::CLIMATE_FAN_MEDIUM:
-        message[2] = 0x5F;
-        message[7] = 0x3C;
-        break;
-      case climate::CLIMATE_FAN_HIGH:
-        message[2] = 0x3F;
-        message[7] = 0x64;
-        break;
-      case climate::CLIMATE_FAN_AUTO:
-      default:
-        message[2] = 0xBF;
-        message[7] = 0x66;
-        break;
-    }
-    // Bench-test raw fan percent override (test mode ONLY). The Midea board has FIVE fan speeds
-    // (20/40/60/80/100 — captured from a Midea U-shape remote 2026-09-02) but the CLIMATE_FAN_*
-    // enum above reaches three (40/60/100). msg[7] is the literal percent; msg[2] is coarse and
-    // 80/100 share 0x3F. The production mapping above is untouched — this only fires for test
-    // frames sent with fan >= 20 (see test_frame). Cleared on set_test_mode(false).
-    if (test_mode_ && test_fan_pct_ > 0) {
-      switch (test_fan_pct_) {
-        case 20:  message[2] = 0xFF; message[7] = 0x14; break;
-        case 40:  message[2] = 0x9F; message[7] = 0x28; break;
-        case 60:  message[2] = 0x5F; message[7] = 0x3C; break;
-        case 80:  message[2] = 0x3F; message[7] = 0x50; break;
-        default:  message[2] = 0x3F; message[7] = 0x64; break;  // 100
-      }
+      case 20:  message[2] = 0xFF; message[7] = 0x14; break;
+      case 40:  message[2] = 0x9F; message[7] = 0x28; break;
+      case 60:  message[2] = 0x5F; message[7] = 0x3C; break;
+      case 80:  message[2] = 0x3F; message[7] = 0x50; break;
+      case 100: message[2] = 0x3F; message[7] = 0x64; break;
+      case FAN_AUTO:
+      default:  message[2] = 0xBF; message[7] = 0x66; break;   // auto (and any unmapped value)
     }
   }
   message[3] = ~message[2];
@@ -650,11 +637,11 @@ bool FurrionChillCube::transmit_mode_command_() {
     if (active_ir_mode_ == climate::CLIMATE_MODE_OFF) {
       snprintf(dec, sizeof(dec), "mode=off");
     } else if (use_fahrenheit_) {
-      snprintf(dec, sizeof(dec), "mode=%s fan=%s pct=%d sp=%dF%s", mode_name_(active_ir_mode_), fan_name_(fan),
-               (test_mode_ ? test_fan_pct_ : 0), last_tx_target_f_, test_mode_ ? " test" : "");
+      snprintf(dec, sizeof(dec), "mode=%s fan=%s sp=%dF%s", mode_name_(active_ir_mode_), fan_name_(fan),
+               last_tx_target_f_, test_mode_ ? " test" : "");
     } else {
-      snprintf(dec, sizeof(dec), "mode=%s fan=%s pct=%d sp=%dC%s", mode_name_(active_ir_mode_), fan_name_(fan),
-               (test_mode_ ? test_fan_pct_ : 0), furrion_setpoint_c_, test_mode_ ? " test" : "");
+      snprintf(dec, sizeof(dec), "mode=%s fan=%s sp=%dC%s", mode_name_(active_ir_mode_), fan_name_(fan),
+               furrion_setpoint_c_, test_mode_ ? " test" : "");
     }
     log_frame_("MAIN", message, send_packet2 ? 12 : 6, dec);
   }
@@ -681,13 +668,12 @@ bool FurrionChillCube::transmit_mode_command_() {
     swing_tx.perform();
   }
 
-  ESP_LOGD(TAG, "IR mode=%d fan=%d pct=%d swing=%d",
-           (int)active_ir_mode_, (int)fan, (test_mode_ ? test_fan_pct_ : 0), (int)this->swing_mode);
+  ESP_LOGD(TAG, "IR mode=%d fan=%d swing=%d", (int)active_ir_mode_, fan, (int)this->swing_mode);
 
   // Track the fan actually put on the wire (v2): every mode frame funnels through here (including
   // transmit_mode_with_cs_), so this is the single point that keeps last_tx_fan_ current — which
   // maybe_apply_gear_fan_() diffs against to decide whether a per-gear fan change needs a new frame.
-  last_tx_fan_ = (active_ir_mode_ == climate::CLIMATE_MODE_OFF) ? -1 : (int) fan;
+  last_tx_fan_ = (active_ir_mode_ == climate::CLIMATE_MODE_OFF) ? -1 : fan;
 
   // Arm the one-shot reinforcement (fired in loop() step 3d): re-send this frame once,
   // mode_resend_delay_ms_ later (0 = disabled). Any newer mode frame re-arms, so the
@@ -904,10 +890,9 @@ void FurrionChillCube::setup() {
   auto restore = this->restore_state_();
   if (restore.has_value()) {
     restore->apply(this);
-    ESP_LOGI(TAG, "Restored state: mode=%d temp=%.1f lo=%.1f hi=%.1f fan=%d swing=%d",
+    ESP_LOGI(TAG, "Restored state: mode=%d temp=%.1f lo=%.1f hi=%.1f swing=%d",
              (int)this->mode, this->target_temperature,
              this->target_temperature_low, this->target_temperature_high,
-             (int)this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO),
              (int)this->swing_mode);
   }
 
@@ -969,10 +954,10 @@ void FurrionChillCube::setup() {
     // next CS change (no IR goes out — this is state-tracking only).
     if (cs_value_sensor_) cs_value_sensor_->publish_state(current_cs_);
     seed_last_tx_target_f_();   // F-protocol: avoid a bogus f_changed on first pass
-    // Seed the fan baseline too (v2): active_ir_mode_ + gear + this->fan_mode are all restored now,
+    // Seed the fan baseline too (v2): active_ir_mode_ + gear are restored now,
     // so get_effective_fan_mode_() is valid. Without this, last_tx_fan_ stays -1 and maybe_apply_
     // gear_fan_() would emit a spurious mode-on frame on the first post-warm-reboot pass.
-    last_tx_fan_ = (int) get_effective_fan_mode_();
+    last_tx_fan_ = get_effective_fan_mode_();
     boot_ready_ = true;          // restored state is valid — skip imm_off
     if (g == 0) {
       idle_since_ = millis();    // 10-min lockout before mode switch allowed
@@ -1173,10 +1158,9 @@ climate::ClimateTraits FurrionChillCube::traits() {
   traits.set_visual_max_temperature(30.0f);   // 86°F
   traits.set_visual_current_temperature_step(0.1f);
   traits.set_visual_target_temperature_step(1.0f);
-  traits.add_supported_fan_mode(climate::CLIMATE_FAN_AUTO);
-  traits.add_supported_fan_mode(climate::CLIMATE_FAN_LOW);
-  traits.add_supported_fan_mode(climate::CLIMATE_FAN_MEDIUM);
-  traits.add_supported_fan_mode(climate::CLIMATE_FAN_HIGH);
+  // No fan modes (2026-09-07): the fan is a GEAR AXIS now (20/40/60/80/100 % per gear / quirk), so
+  // the HA climate entity exposes no fan control — a user fan pick and a gear fan can't both own
+  // the wire. A stale fan_mode restored from flash is ignored by the climate base (unsupported).
   traits.add_supported_swing_mode(climate::CLIMATE_SWING_OFF);
   traits.add_supported_swing_mode(climate::CLIMATE_SWING_VERTICAL);
   return traits;
@@ -1189,7 +1173,6 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   // inactive endpoint (low in cool mode, high in heat mode).
   bool mode_changed = false;
   bool temp_changed = false;
-  bool fan_changed = false;
 
   if (call.get_mode().has_value()) {
     auto new_mode = *call.get_mode();
@@ -1285,30 +1268,9 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     this->target_temperature = this->target_temperature_high;
   }
 
-  // Fan mode change — idempotent: same-value sync is a no-op (no IR, no user flag)
-  if (call.get_fan_mode().has_value()) {
-    auto new_fan = *call.get_fan_mode();
-    auto cur_fan = this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
-    fan_changed = (new_fan != cur_fan);
-    this->fan_mode = new_fan;
-    // Deferred while a setpoint change is uncommitted: transmitting here would stamp
-    // last_tx_setpoint_c_/last_tx_target_f_ with the uncommitted target (if a mid-debounce
-    // gear pass already re-anchored it), making the flushed commit below see "unchanged" and
-    // skip its CS→MODE→CS bracket. The flush's immediate gear pass delivers the fan instead
-    // (commit bracket when sp/f changed, else the maybe_apply_gear_fan_ last_tx_fan_ diff).
-    // Both flags: setpoint_pending_ is the normal debounce; user_changed_ is a settled-but-
-    // unconsumed commit held across passes by a NaN-room grace hold — and this fan door is the
-    // one transmit path live while user_changed_ is set, so it must gate on it too (mirrors the
-    // step-3d reinforcement fire). The flush re-sets user_changed_, so the deferred fan is
-    // delivered by the next gear pass to run — on grace-clear that pass consumes user_changed_
-    // and maybe_apply_gear_fan_ transmits it via the last_tx_fan_ diff (or the commit bracket if
-    // the setpoint also changed). Delayed at most until grace clears, never lost.
-    if (fan_changed && active_ir_mode_ != climate::CLIMATE_MODE_OFF && !kickstart_active_() &&
-        !setpoint_pending_ && !user_changed_) {
-      bool sent = transmit_mode_command_();
-      if (sent) ESP_LOGI(TAG, "User fan change → %d, mode command sent", (int)new_fan);
-    }
-  }
+  // Fan mode: NOT user-settable (2026-09-07) — the controller owns the fan (per-gear / via_fan
+  // percents). The traits advertise no fan modes, so HA never sends one; an unexpected fan_mode in a
+  // call is ignored here (never transmitted, never flagged as a user change).
 
   // Swing mode change — standalone swing frame, works during kickstart
   // Does NOT set user_changed_: vent direction is cosmetic and must never
@@ -1330,12 +1292,12 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   // Flag gear recalculation for real, gear-relevant changes. Swing is cosmetic;
   // same-value re-syncs from HA are filtered above.
   //
-  // Mode/fan changes are discrete, single-shot actions → act immediately, and flush any
+  // Mode changes are discrete, single-shot actions → act immediately, and flush any
   // pending setpoint (the immediate gear run commits the latest target too). A pure temp
   // change is DEBOUNCED instead: arm setpoint_pending_ and let loop() commit it after the
   // user stops stepping (SETPOINT_SETTLE_MS). target_temperature is already updated above,
   // so HA's card shows the new value instantly — only the IR transmit is deferred.
-  if (mode_changed || fan_changed) {
+  if (mode_changed) {
     this->user_changed_ = true;
     this->setpoint_pending_ = false;  // flush: the immediate run handles the current target
   } else if (temp_changed) {
@@ -1826,30 +1788,26 @@ void FurrionChillCube::update_furrion_setpoint_(bool is_heat) {
   }
 }
 
-climate::ClimateFanMode FurrionChillCube::fan_int_to_mode_(int f) {
-  switch (f) {
-    case 1:  return climate::CLIMATE_FAN_LOW;
-    case 2:  return climate::CLIMATE_FAN_MEDIUM;
-    case 3:  return climate::CLIMATE_FAN_HIGH;
-    default: return climate::CLIMATE_FAN_AUTO;   // 0 or unrecognized
-  }
-}
-
-climate::ClimateFanMode FurrionChillCube::get_effective_fan_mode_() {
-  // 1. Bench-test operator override — exercise startup-clamp (fan=LOW) sequences directly.
-  if (test_mode_ && test_fan_ >= 0) return fan_int_to_mode_(test_fan_);
-  // 2. An active maneuver's via_fan (the OFF→gear clamp, the 3→2 fan-LOW clamp, …) overrides all.
-  //    end_maneuver_ clears maneuver_phase_ BEFORE calling apply_gear_frames_, so the release
-  //    frames pick up the settled gear's fan below rather than the maneuver's via_fan.
+// The fan to put on the next mode frame, as a board percent (FAN_AUTO = 0, else 20..100).
+int FurrionChillCube::get_effective_fan_mode_() {
+  // 0. Failsafe fan release (see check_failsafe_): the hands-off frame carries AUTO so the unit's own
+  //    thermostat is not left driving a fixed blower speed.
+  if (failsafe_fan_release_tx_) return FAN_AUTO;
+  // 1. Bench-test operator override.
+  if (test_mode_ && test_fan_ >= 0) return test_fan_;
+  // 2. An active maneuver's via_fan (e.g. the heat OFF→gear clamp) overrides all. end_maneuver_
+  //    clears maneuver_phase_ BEFORE calling apply_gear_frames_, so the release frames pick up the
+  //    settled gear's fan below rather than the maneuver's via_fan.
   if (maneuver_phase_ != ManeuverPhase::IDLE && maneuver_via_fan_ >= 0)
-    return fan_int_to_mode_(maneuver_via_fan_);
-  // 3. The current gear's commanded fan, if set (controller-driven fan overrides the HA fan entity).
+    return maneuver_via_fan_;
+  // 3. The current gear's commanded fan, if set. Gear 0 (idle, in-mode) may carry one too (2026-09-07:
+  //    cool idle = SP-5 at 20 %) — the compressor is stopped by the CS, the blower still needs a speed.
   bool is_heat = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT);
   int gear = is_heat ? heat_gear_ : cool_gear_;
   const int *fans = is_heat ? heat_gear_fan_ : cool_gear_fan_;
-  if (gear >= 1 && gear < MAX_GEARS && fans[gear] >= 0) return fan_int_to_mode_(fans[gear]);
-  // 4. Fall through to the HA fan-mode entity (default AUTO) — v1 behavior when no gear fan is set.
-  return this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
+  if (gear >= 0 && gear < MAX_GEARS && fans[gear] >= 0) return fans[gear];
+  // 4. No fan configured for this gear → AUTO (the unit picks). There is no HA fan entity any more.
+  return FAN_AUTO;
 }
 
 int FurrionChillCube::compute_gear_cs_(bool is_heat, int gear) {
@@ -1933,8 +1891,8 @@ void FurrionChillCube::apply_gear_frames_(int new_cs, uint32_t now) {
   // spurious FAN_ONLY Main frame on the wire (bug-check R1) — the HVAC-on bracket owns that pass.
   bool can_tx = boot_ready_ && !failsafe_active_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
                 active_ir_mode_ != climate::CLIMATE_MODE_FAN_ONLY;
-  climate::ClimateFanMode new_fan = get_effective_fan_mode_();
-  bool fan_changed = can_tx && !setpoint_pending_ && ((int) new_fan != last_tx_fan_);
+  int new_fan = get_effective_fan_mode_();
+  bool fan_changed = can_tx && !setpoint_pending_ && (new_fan != last_tx_fan_);
   if (can_tx) {
     if (!fan_changed) {
       if (cs_changed) {
@@ -1943,7 +1901,7 @@ void FurrionChillCube::apply_gear_frames_(int new_cs, uint32_t now) {
       }
     } else if (!cs_changed) {
       transmit_mode_command_();       // shape MAIN (default)
-    } else if (new_fan == climate::CLIMATE_FAN_AUTO) {
+    } else if (new_fan == FAN_AUTO) {
       transmit_cs_update_();          // fixed → auto: CS, Main, CS
       transmit_mode_command_();
       transmit_cs_update_();
@@ -1957,9 +1915,9 @@ void FurrionChillCube::apply_gear_frames_(int new_cs, uint32_t now) {
     }
     if (cs_changed || fan_changed)
       ESP_LOGD(TAG, "Gear frames: cs %s%d fan %s%d order=%s", cs_changed ? "->" : "=", new_cs,
-               fan_changed ? "->" : "=", (int) new_fan,
+               fan_changed ? "->" : "=", new_fan,
                !fan_changed ? "CS" : !cs_changed ? "MAIN" :
-               (new_fan == climate::CLIMATE_FAN_AUTO) ? "CS,MAIN,CS" : "MAIN,CS");
+               (new_fan == FAN_AUTO) ? "CS,MAIN,CS" : "MAIN,CS");
   }
   if (cs_changed && cs_value_sensor_) cs_value_sensor_->publish_state(new_cs);
 }
@@ -2011,7 +1969,7 @@ void FurrionChillCube::maybe_apply_gear_fan_(uint32_t now) {
   if (!boot_ready_ || failsafe_active_ || active_ir_mode_ == climate::CLIMATE_MODE_OFF ||
       kickstart_active_() || setpoint_pending_)
     return;
-  if ((int) get_effective_fan_mode_() != last_tx_fan_) {
+  if (get_effective_fan_mode_() != last_tx_fan_) {
     transmit_mode_command_();   // carries the new fan; updates last_tx_fan_
   }
 }
@@ -2129,7 +2087,7 @@ void FurrionChillCube::advance_maneuver_(uint32_t now) {
       // two transmit doors (setpoint_pending_ AND user_changed_, the settled-but-unconsumed commit a
       // NaN-room grace hold can pin) — bug-check R2.
       if (maneuver_via_fan_ >= 0 && !setpoint_pending_ && !user_changed_ &&
-          (int) fan_int_to_mode_(maneuver_via_fan_) != last_tx_fan_) {
+          maneuver_via_fan_ != last_tx_fan_) {
         if (transmit_mode_command_())
           ESP_LOGI(TAG, "Maneuver: deferred via_fan sent on reinforce (fan=%d)", last_tx_fan_);
         if (mode_resend_pending_) mode_resend_shape_ = MainShape::MAIN_CS;
@@ -2172,7 +2130,7 @@ void FurrionChillCube::add_quirk(bool is_heat, int from_gear, int to_gear, int v
                                  int via_fan, bool escape_up, uint32_t duration_ms) {
   if (quirk_count_ >= MAX_QUIRKS) return;
   quirks_[quirk_count_++] = QuirkDef{is_heat, (int8_t)from_gear, (int8_t)to_gear,
-                                     (int8_t)via_offset, (int8_t)via_fan, escape_up, duration_ms};
+                                     (int8_t)via_offset, (int16_t)via_fan, escape_up, duration_ms};
 }
 
 void FurrionChillCube::set_gear_offset_(bool is_heat, int gear, int cs_offset, int fan) {
@@ -2525,6 +2483,23 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
     if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
     if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
+    // Fan release (2026-09-07): the gears now drive FIXED blower speeds (20..100 %), and a fixed fan
+    // is a persistent setting on the unit — unlike the CS, it never times out. Handing the unit back
+    // to its own thermostat at, say, 20 % would leave it starved (or at 100 %, blasting) for as long
+    // as the outage lasts. So the last thing we say before going quiet is one mode frame at the
+    // current mode / setpoint with fan = AUTO (sent twice — no reinforcement runs under failsafe).
+    // Only when the wire fan is fixed and the unit is on; the mode-frame gate (valid target) still
+    // applies — a NaN target simply skips it (nothing sensible to say). No CS frames are sent, so
+    // the unit's ~7-min CS timeout still returns it to its internal sensor exactly as before.
+    if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && last_tx_fan_ > 0) {
+      failsafe_fan_release_tx_ = true;
+      bool sent = transmit_mode_command_();
+      if (sent) transmit_mode_command_();
+      failsafe_fan_release_tx_ = false;
+      mode_resend_pending_ = false;   // transmit_mode_command_ re-arms the reinforcement — drop it again
+      ESP_LOGW(TAG, "FAILSAFE fan release: %s (mode=%d) — unit's own thermostat gets fan=auto",
+               sent ? "sent x2" : "SKIPPED (no valid target)", (int) active_ir_mode_);
+    }
     // Sync active_ir_mode_ (and mode_pref_) to OFF to match gear state.
     // No IR is transmitted — set_active_ir_mode_() only updates state + saves flash.
     // Without this, mode_pref_ stays at HEAT/COOL and a reboot during failsafe
@@ -3819,19 +3794,11 @@ void FurrionChillCube::publish_debug_state_(float diff) {
   pub(debug_fan_feedforward_sensor_,
       (adaptive_enable_ && vent_fan_on_()) ? (float)fan_feedforward_gears_ : 0.0f);
 
-  // Effective (last-transmitted) fan, normalized to the config `fan:` convention:
-  // -1 off / nothing transmitted · 0 auto · 1 low · 2 med · 3 high. Sourced from last_tx_fan_
-  // (the exact ClimateFanMode enum put on the last mode frame), so it reflects the CONTROLLER-driven
-  // fan — including a per-gear fan (g3=med/g4=high) or a maneuver via_fan clamp — not the HA fan entity.
-  float eff_fan;
-  switch (last_tx_fan_) {
-    case climate::CLIMATE_FAN_AUTO:   eff_fan = 0.0f; break;
-    case climate::CLIMATE_FAN_LOW:    eff_fan = 1.0f; break;
-    case climate::CLIMATE_FAN_MEDIUM: eff_fan = 2.0f; break;
-    case climate::CLIMATE_FAN_HIGH:   eff_fan = 3.0f; break;
-    default:                          eff_fan = -1.0f; break;   // -1 (OFF) or an unmapped mode
-  }
-  pub(debug_effective_fan_sensor_, eff_fan);
+  // Effective (last-transmitted) fan in the config `fan:` vocabulary (2026-09-07 = board percent):
+  // -1 off / nothing transmitted · 0 auto · 20/40/60/80/100 fixed. Sourced from last_tx_fan_ (the
+  // exact value put on the last mode frame), so it reflects the CONTROLLER-driven fan — a per-gear
+  // fan or a maneuver via_fan clamp. (Scale changed from the 0-3 enum on 2026-09-07.)
+  pub(debug_effective_fan_sensor_, (float) last_tx_fan_);
 
   // Engine regime label (2026-09-04, Phase 2 data labelling): one word per controller state so
   // recorder samples can be bucketed offline without reconstructing the state machine from the
@@ -3873,7 +3840,6 @@ void FurrionChillCube::set_test_mode(bool t) {
     // Resuming production: clear the fan override and force a gear pass next loop so the unit's
     // setpoint/CS re-anchor to the real HA target (failover restored — project_failover_invariant).
     test_fan_ = -1;
-    test_fan_pct_ = 0;
     user_changed_ = true;
     resume_from_test_ = true;   // land on the bias-justified gear (eff_diff pick), not a real-diff drop
     resync_on_resume_ = true;   // item 7: full CS→Main→CS re-command of the evaluated gear on the first pass
@@ -3935,15 +3901,7 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   failsafe_active_ = false;
   publish_debug_state_(NAN);  // bypasses set_test_mode() — publish the cleared state here too
   boot_ready_ = true;
-  if (fan >= 20) {
-    // Raw Midea fan percent (20/40/60/80/100). The enum slot carries HIGH as a placeholder so the
-    // effective-fan / last_tx_fan_ plumbing stays well-formed; the frame bytes come from the pct.
-    test_fan_pct_ = fan;
-    test_fan_ = 3;
-  } else {
-    test_fan_pct_ = 0;
-    test_fan_ = fan;
-  }
+  test_fan_ = fan_valid_(fan) ? fan : FAN_AUTO;   // board percent (0 auto, 20..100); anything else → auto
   if (mode == 0) {
     active_ir_mode_ = climate::CLIMATE_MODE_OFF;
   } else if (mode == 3) {

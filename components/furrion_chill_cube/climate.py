@@ -63,14 +63,30 @@ CONF_QUIRK_VIA_FAN = "via_fan"
 CONF_QUIRK_ESCAPE_UP = "escape_up"
 CONF_QUIRK_DURATION = "duration"
 
-# Fan name → int for the C++ setters (add_*_gear / add_quirk). -1 = unset.
-_FAN_TO_INT = {"auto": 0, "low": 1, "med": 2, "medium": 2, "high": 3}
-_FAN_NAMES = cv.one_of(*_FAN_TO_INT.keys(), lower=True)
+# Fan value for the C++ setters (add_*_gear / add_quirk): a Midea board PERCENT — 0 = auto,
+# 20/40/60/80/100 = the five fixed blower speeds (2026-09-07; the low/med/high names are gone —
+# they mapped to 40/60/100 and hid the 20 and 80 rungs). -1 = unset (→ auto on the wire).
+_FAN_PCTS = (0, 20, 40, 60, 80, 100)
+
+
+def _fan_value(value):
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return 0
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise cv.Invalid("fan must be 'auto' or one of 20/40/60/80/100 (board percent)")
+    if v not in _FAN_PCTS:
+        raise cv.Invalid("fan must be 'auto' or one of 20/40/60/80/100 (board percent)")
+    return v
+
+
+_FAN_NAMES = _fan_value
 
 
 def _fan_int(row, key):
-    """Map an optional validated fan name in row[key] to its int, or -1 if absent."""
-    return _FAN_TO_INT[row[key]] if key in row else -1
+    """The validated fan percent in row[key] (0 = auto), or -1 if absent."""
+    return row[key] if key in row else -1
 CONF_QUIRK_DURATION_DEFAULT = "quirk_duration"
 CONF_CS_TRANSMIT_INTERVAL = "cs_transmit_interval"
 CONF_QUIRK_TRANSMIT_INTERVAL = "quirk_transmit_interval"
@@ -253,8 +269,8 @@ def _validate_vent_pairs(config):
 
 # ── Configurable ladders + quirks ───────────────────────────────────────────
 # One gear row: gear number, CS offset (°C) from the setpoint anchor, and an optional commanded
-# fan (auto|low|med|high). When `fan` is set the controller commands it while holding this gear,
-# overriding the HA fan-mode entity; omitted → falls through to the HA fan mode.
+# fan (auto | 20 | 40 | 60 | 80 | 100 — board percent). When `fan` is set the controller commands
+# it while holding this gear (gear 0 included); omitted → auto. There is no HA fan entity.
 GEAR_SCHEMA = cv.Schema(
     {
         cv.Required(CONF_GEAR): cv.int_range(min=0, max=7),
@@ -322,19 +338,19 @@ _DEFAULT_HEAT_LADDER = {
 }
 # Default quirks reproduce the v1 behavior — INCLUDING the OFF→gear clamped starts, which v1
 # hardcoded in C++ and v2 expresses as from_gear:-1 quirks (escape_up defaults true for from:-1):
-#   cool OFF→MED (-1→2) via SP+1, fan=LOW, 305s: the clamped cold-start (caps the startup spike;
+#   cool OFF→MED (-1→2) via SP+1, fan=40 %, 305s: the clamped cold-start (caps the startup spike;
 #     drops early if MAX is demanded). The cool cold-start floor (2) is derived from this quirk.
 #   cool idle→LOW (0→1) via SP+0, 90s: holds the restart CS across the ~3-min anti-short-cycle lockout.
 #   cool MAX→MED (3→2) via SP−1, global quirk_duration (60s): re-seat the path-dependent MED (2026-07-09).
-#   heat OFF→g1 (-1→1) via SP+0, fan=LOW, 305s: the heat clamped cold-start.
+#   heat OFF→g1 (-1→1) via SP+0, fan=40 %, 305s: the heat clamped cold-start.
 _DEFAULT_QUIRKS = [
     {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: -1, CONF_QUIRK_TO: 2, CONF_QUIRK_VIA_OFFSET: 1,
-     CONF_QUIRK_VIA_FAN: "low", CONF_QUIRK_DURATION: "305s"},
+     CONF_QUIRK_VIA_FAN: 40, CONF_QUIRK_DURATION: "305s"},
     {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: 0, CONF_QUIRK_TO: 1, CONF_QUIRK_VIA_OFFSET: 0,
      CONF_QUIRK_DURATION: "90s"},
     {CONF_QUIRK_MODE: "cool", CONF_QUIRK_FROM: 3, CONF_QUIRK_TO: 2, CONF_QUIRK_VIA_OFFSET: -1},
     {CONF_QUIRK_MODE: "heat", CONF_QUIRK_FROM: -1, CONF_QUIRK_TO: 1, CONF_QUIRK_VIA_OFFSET: 0,
-     CONF_QUIRK_VIA_FAN: "low", CONF_QUIRK_DURATION: "305s"},
+     CONF_QUIRK_VIA_FAN: 40, CONF_QUIRK_DURATION: "305s"},
 ]
 
 

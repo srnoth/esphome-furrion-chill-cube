@@ -888,7 +888,12 @@ void FurrionChillCube::setup() {
 
   // Restore mode, targets, fan, swing from flash
   auto restore = this->restore_state_();
+  diag_restore_ok_ = restore.has_value();
   if (restore.has_value()) {
+    diag_restore_mode_ = (int) restore->mode;
+    diag_restore_lo_ = restore->target_temperature_low;
+    diag_restore_hi_ = restore->target_temperature_high;
+    diag_restore_tgt_ = restore->target_temperature;
     restore->apply(this);
     ESP_LOGI(TAG, "Restored state: mode=%d temp=%.1f lo=%.1f hi=%.1f swing=%d",
              (int)this->mode, this->target_temperature,
@@ -1027,8 +1032,40 @@ void FurrionChillCube::setup() {
   }
 }
 
+// DIAG: re-log the boot restore once HA can hear us, then read the saved climate blob back every 60 s.
+void FurrionChillCube::diag_restore_log_() {
+  uint32_t ms = millis();
+  if (!diag_restore_logged_) {
+    bool api_up = false;
+#ifdef USE_API
+    api_up = (api::global_api_server != nullptr && api::global_api_server->is_connected());
+#endif
+    if (api_up || ms > 90000) {
+      diag_restore_logged_ = true;
+      ESP_LOGI(TAG, "DIAG boot restore: %s mode=%d lo=%.2f hi=%.2f tgt=%.2f | live now mode=%d lo=%.2f hi=%.2f "
+               "| ir_mode=%d cool_gear=%d | objid_hash=0x%08X uptime=%lus",
+               diag_restore_ok_ ? "LOADED" : "NONE", diag_restore_mode_, diag_restore_lo_, diag_restore_hi_,
+               diag_restore_tgt_, (int) this->mode, this->target_temperature_low, this->target_temperature_high,
+               (int) active_ir_mode_, cool_gear_, (unsigned) this->get_object_id_hash(), (unsigned long) (ms / 1000));
+    }
+  }
+  if (ms - diag_readback_at_ >= 60000) {
+    diag_readback_at_ = ms;
+    auto r = this->restore_state_();   // same key as boot; reads pending-save copy if one is queued, else NVS
+    if (r.has_value()) {
+      ESP_LOGI(TAG, "DIAG NVS readback: mode=%d lo=%.2f hi=%.2f tgt=%.2f | live mode=%d lo=%.2f hi=%.2f tgt=%.2f%s",
+               (int) r->mode, r->target_temperature_low, r->target_temperature_high, r->target_temperature,
+               (int) this->mode, this->target_temperature_low, this->target_temperature_high, this->target_temperature,
+               ((int) r->mode != (int) this->mode) ? "  <-- MODE MISMATCH" : "");
+    } else {
+      ESP_LOGW(TAG, "DIAG NVS readback: NO blob (load failed) | live mode=%d", (int) this->mode);
+    }
+  }
+}
+
 void FurrionChillCube::loop() {
   uint32_t now = millis();
+  diag_restore_log_();
 
   // Bench test harness: while test_mode_ is set the production controller is fully inert —
   // no gear pass, kickstart, maneuver, vane, or heartbeat. The unit is driven ONLY by the

@@ -447,6 +447,15 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Timing (all uint32_t for millis())
   uint32_t boot_time_{0};
+  // DIAG 2026-09-07 (stale climate restore after every reboot — session_log 09-07): what the climate
+  // base's restore_state_() returned in setup(), re-logged once the API is up so HA captures it, plus
+  // a 60 s readback of the saved climate state vs the live one (does save_state_ ever land in NVS?).
+  bool diag_restore_ok_{false};
+  int diag_restore_mode_{-1};
+  float diag_restore_lo_{NAN}, diag_restore_hi_{NAN}, diag_restore_tgt_{NAN};
+  bool diag_restore_logged_{false};
+  uint32_t diag_readback_at_{0};
+  void diag_restore_log_();
   uint32_t last_temp_update_{0};
   uint32_t last_gear_change_{0};
   uint32_t idle_since_{0};

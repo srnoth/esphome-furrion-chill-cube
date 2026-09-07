@@ -2150,6 +2150,14 @@ void FurrionChillCube::set_gear_offset_(bool is_heat, int gear, int cs_offset, i
 // upshift trip = ±n·S; downshift trip = ±(n·S − h). Sign is + for cool (positive=hot),
 // − for heat (negative=cold). start/stop/idle pins are stored as-is (not on the grid).
 void FurrionChillCube::build_ladders_() {
+  // Derived spacing (spacing <= 0): span / (max_gear − 1). The span is the °C of demand between the
+  // gear-1 grid origin and the trip INTO the top gear, so the top gear's shift point is invariant
+  // to the gear count and extra gears tighten the rungs between. 4 cool gears at 0.55 ⇔ span 1.65.
+  if (cool_spacing_ <= 0.0f) cool_spacing_ = cool_span_ / (float) std::max(1, cool_max_gear_ - 1);
+  if (heat_spacing_ <= 0.0f) heat_spacing_ = heat_span_ / (float) std::max(1, heat_max_gear_ - 1);
+  ESP_LOGI(TAG, "Ladders: cool S=%.3f (max gear %d, top trip %+.2f) heat S=%.3f (max gear %d, top trip %+.2f)",
+           cool_spacing_, cool_max_gear_, cool_start_ + (cool_max_gear_ - 1) * cool_spacing_,
+           heat_spacing_, heat_max_gear_, -((heat_max_gear_ - 1) * heat_spacing_));
   for (int n = 1; n < MAX_GEARS; n++) {
     // COOL: offset the modulation grid by the 0↔1 start pin so gear 1 gets a FULL-spacing runway
     // from its entry (cool_start_) to its upshift (cool_up_[1] = start + S), matching every other
@@ -2416,7 +2424,11 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
   // === Failsafe scenario 1: Boot, HA never connects (5 min) ===
   bool never_got_update = (last_temp_update_ == 0 && (now - boot_time_) > 300000);
 
-  // === Failsafe scenario 2: HA API disconnected (15 min) ===
+  // === Failsafe scenario 2: HA API disconnected (7 min; was 15 until 2026-09-07) ===
+  // The room reading does NOT go NaN when HA drops (the homeassistant sensor keeps its last value),
+  // so this timer bounds how long a stale room temperature — and, since the fan-percent ladder, a
+  // FIXED blower speed — keeps driving the unit. 7 min ≈ the unit's own CS timeout and still clears a
+  // normal HA restart (~2 min).
 #ifdef USE_API
   bool api_connected = (api::global_api_server != nullptr &&
                         api::global_api_server->is_connected());
@@ -2424,10 +2436,10 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     ha_disconnect_time_ = 0;
   } else if (ha_disconnect_time_ == 0 && last_temp_update_ > 0) {
     ha_disconnect_time_ = now;
-    ESP_LOGW(TAG, "HA API disconnected — 15-min failsafe timer started");
+    ESP_LOGW(TAG, "HA API disconnected — 7-min failsafe timer started");
   }
   bool ha_disconnected = (ha_disconnect_time_ > 0 &&
-                          (now - ha_disconnect_time_) > 900000);
+                          (now - ha_disconnect_time_) > 420000);
 #else
   bool ha_disconnected = false;
 #endif

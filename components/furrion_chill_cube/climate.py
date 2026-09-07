@@ -50,6 +50,7 @@ CONF_GEAR_FAN = "fan"
 CONF_COOL_LADDER = "cool_ladder"
 CONF_HEAT_LADDER = "heat_ladder"
 CONF_MODULATION_SPACING = "modulation_spacing"
+CONF_MODULATION_SPAN = "modulation_span"
 CONF_MODULATION_HYSTERESIS = "modulation_hysteresis"
 CONF_LADDER_START = "start"
 CONF_LADDER_STOP = "stop"
@@ -299,9 +300,14 @@ QUIRK_SCHEMA = cv.Schema(
 # (1↔2, 2↔3, …) are auto-built from spacing S: up-trip(n→n+1) = n·S, down-trip =
 # n·S − hysteresis. start (0→1), stop (1→0), idle (0→−1) are pinned off-grid.
 # Signs: cool positive-is-hot, heat negative-is-cold (caller supplies signed pins).
+# S comes from ONE of: `modulation_spacing` (fixed °C per rung) or `modulation_span` (°C from the
+# grid origin to the trip into the TOP gear; S = span / (max_gear − 1), so the ladder auto-scales
+# with the gear count — more gears = tighter shift points; 2026-09-07). Neither → span 1.65
+# (= the shipped 4-gear cool ladder, 3 × 0.55).
 LADDER_SCHEMA = cv.Schema(
     {
-        cv.Optional(CONF_MODULATION_SPACING, default=0.55): cv.float_,
+        cv.Optional(CONF_MODULATION_SPACING): cv.float_,
+        cv.Optional(CONF_MODULATION_SPAN, default=1.65): cv.float_,
         cv.Optional(CONF_MODULATION_HYSTERESIS, default=0.0): cv.float_,
         cv.Required(CONF_LADDER_START): cv.float_,
         cv.Required(CONF_LADDER_STOP): cv.float_,
@@ -603,7 +609,8 @@ async def to_code(config):
     cool_l = config[CONF_COOL_LADDER]
     cg.add(
         var.set_cool_ladder(
-            cool_l[CONF_MODULATION_SPACING],
+            cool_l.get(CONF_MODULATION_SPACING, -1.0),   # -1 = derive from span in build_ladders_
+            cool_l[CONF_MODULATION_SPAN],
             cool_l[CONF_MODULATION_HYSTERESIS],
             cool_l[CONF_LADDER_START],
             cool_l[CONF_LADDER_STOP],
@@ -613,7 +620,8 @@ async def to_code(config):
     heat_l = config[CONF_HEAT_LADDER]
     cg.add(
         var.set_heat_ladder(
-            heat_l[CONF_MODULATION_SPACING],
+            heat_l.get(CONF_MODULATION_SPACING, -1.0),
+            heat_l[CONF_MODULATION_SPAN],
             heat_l[CONF_MODULATION_HYSTERESIS],
             heat_l[CONF_LADDER_START],
             heat_l[CONF_LADDER_STOP],

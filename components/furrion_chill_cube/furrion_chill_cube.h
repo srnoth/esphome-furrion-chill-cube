@@ -76,13 +76,15 @@ class FurrionChillCube : public climate::Climate, public Component {
   // debug_effective_fan — and no HA fan entity (the controller owns the fan).
   void add_cool_gear(int gear, int cs_offset, int fan) { set_gear_offset_(false, gear, cs_offset, fan); }
   void add_heat_gear(int gear, int cs_offset, int fan) { set_gear_offset_(true, gear, cs_offset, fan); }
-  // Ladder params (spacing S, hysteresis h, pinned start/stop/idle). The modulation
-  // rungs are auto-built from S in setup() (build_ladders_); pins stored as-is.
-  void set_cool_ladder(float spacing, float hyst, float start, float stop, float idle) {
-    cool_spacing_ = spacing; cool_hyst_ = hyst; cool_start_ = start; cool_stop_ = stop; cool_idle_ = idle;
+  // Ladder params (spacing S, hysteresis h, pinned start/stop/idle). The modulation rungs are
+  // auto-built from S in setup() (build_ladders_); pins stored as-is. spacing <= 0 → S is DERIVED
+  // from `span` and the registered gear count: S = span / (max_gear − 1), so the top gear's trip
+  // stays put and more gears = tighter shift points (Stephen 2026-09-07).
+  void set_cool_ladder(float spacing, float span, float hyst, float start, float stop, float idle) {
+    cool_spacing_ = spacing; cool_span_ = span; cool_hyst_ = hyst; cool_start_ = start; cool_stop_ = stop; cool_idle_ = idle;
   }
-  void set_heat_ladder(float spacing, float hyst, float start, float stop, float idle) {
-    heat_spacing_ = spacing; heat_hyst_ = hyst; heat_start_ = start; heat_stop_ = stop; heat_idle_ = idle;
+  void set_heat_ladder(float spacing, float span, float hyst, float start, float stop, float idle) {
+    heat_spacing_ = spacing; heat_span_ = span; heat_hyst_ = hyst; heat_start_ = start; heat_stop_ = stop; heat_idle_ = idle;
   }
   // Register a transition quirk (path-dependent maneuver). from_gear -1 = OFF→gear clamped start.
   // via_fan -1 = leave fan (else a board percent); escape_up = release early if a higher gear is
@@ -530,9 +532,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   QuirkDef quirks_[MAX_QUIRKS];
   int quirk_count_{0};
   // Ladder params (defaults = shipped values). Modulation rungs auto-built in build_ladders_().
-  float cool_spacing_{0.55f}, cool_hyst_{0.0f};
+  float cool_spacing_{0.55f}, cool_span_{1.65f}, cool_hyst_{0.0f};   // spacing <= 0 → derived from span
   float cool_start_{0.35f}, cool_stop_{0.15f}, cool_idle_{-0.30f};
-  float heat_spacing_{0.55f}, heat_hyst_{0.0f};
+  float heat_spacing_{0.55f}, heat_span_{1.10f}, heat_hyst_{0.0f};
   float heat_start_{-0.35f}, heat_stop_{-0.15f}, heat_idle_{0.30f};
   // Modulation trips built from spacing (index n = boundary between gear n and n+1)
   float cool_up_[MAX_GEARS] = {0};     // cool_up_[n]: upshift n→n+1  (= +n·S)

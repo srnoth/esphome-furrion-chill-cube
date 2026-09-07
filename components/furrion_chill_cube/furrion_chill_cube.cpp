@@ -1030,11 +1030,19 @@ void FurrionChillCube::setup() {
                                  : 0.0f;
     compressor_output_sensor_->publish_state(pct);
   }
+  diag_setup_end_mode_ = (int) this->mode;   // DIAG
 }
 
 // DIAG: re-log the boot restore once HA can hear us, then read the saved climate blob back every 60 s.
 void FurrionChillCube::diag_restore_log_() {
   uint32_t ms = millis();
+  if ((int) this->mode != diag_last_mode_) {
+    if (diag_last_mode_ != -99) {
+      diag_mode_changes_++;
+      if (diag_mode_change_at_ == 0) { diag_mode_change_at_ = ms; diag_mode_from_ = diag_last_mode_; diag_mode_to_ = (int) this->mode; }
+    }
+    diag_last_mode_ = (int) this->mode;
+  }
   if (!diag_restore_logged_) {
     bool api_up = false;
 #ifdef USE_API
@@ -1044,11 +1052,12 @@ void FurrionChillCube::diag_restore_log_() {
     // first API-up pass and keep repeating it (every readback) for the first 5 minutes of uptime.
     if (api_up || ms > 90000) {
       diag_restore_logged_ = true;   // re-armed by the 60 s readback for the first 5 min
-      ESP_LOGI(TAG, "DIAG boot restore: %s mode=%d lo=%.2f hi=%.2f tgt=%.2f | live now mode=%d lo=%.2f hi=%.2f "
-               "| ir_mode=%d cool_gear=%d | objid_hash=0x%08X uptime=%lus",
+      ESP_LOGI(TAG, "DIAG boot restore: %s mode=%d lo=%.2f hi=%.2f tgt=%.2f | setup-end mode=%d | first loop-seen change "
+               "%d->%d at %lums (changes=%d, control calls=%d) | live now mode=%d | uptime=%lus",
                diag_restore_ok_ ? "LOADED" : "NONE", diag_restore_mode_, diag_restore_lo_, diag_restore_hi_,
-               diag_restore_tgt_, (int) this->mode, this->target_temperature_low, this->target_temperature_high,
-               (int) active_ir_mode_, cool_gear_, (unsigned) this->get_object_id_hash(), (unsigned long) (ms / 1000));
+               diag_restore_tgt_, diag_setup_end_mode_, diag_mode_from_, diag_mode_to_,
+               (unsigned long) diag_mode_change_at_, diag_mode_changes_, diag_control_calls_, (int) this->mode,
+               (unsigned long) (ms / 1000));
     }
   }
   if (ms - diag_readback_at_ >= 60000) {
@@ -1207,6 +1216,7 @@ climate::ClimateTraits FurrionChillCube::traits() {
 }
 
 void FurrionChillCube::control(const climate::ClimateCall &call) {
+  diag_control_calls_++;
   // Track whether each field *actually* changed. user_changed_ is set only for
   // real, mode-relevant changes — not for redundant HA re-syncs after reconnect
   // (which send the same values we already have) and not for tweaks to the

@@ -1043,7 +1043,7 @@ void FurrionChillCube::diag_restore_log_() {
     // HA subscribes to logs a moment AFTER the API connects — the first attempt is lost. Log it on the
     // first API-up pass and keep repeating it (every readback) for the first 5 minutes of uptime.
     if (api_up || ms > 90000) {
-      diag_restore_logged_ = (ms > 300000);
+      diag_restore_logged_ = true;   // re-armed by the 60 s readback for the first 5 min
       ESP_LOGI(TAG, "DIAG boot restore: %s mode=%d lo=%.2f hi=%.2f tgt=%.2f | live now mode=%d lo=%.2f hi=%.2f "
                "| ir_mode=%d cool_gear=%d | objid_hash=0x%08X uptime=%lus",
                diag_restore_ok_ ? "LOADED" : "NONE", diag_restore_mode_, diag_restore_lo_, diag_restore_hi_,
@@ -1216,6 +1216,8 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 
   if (call.get_mode().has_value()) {
     auto new_mode = *call.get_mode();
+    ESP_LOGI(TAG, "DIAG control: mode call %d (current %d) at uptime %lums", (int) new_mode, (int) this->mode,
+             (unsigned long) millis());
 
     // Ensure two-point values valid for first boot (BEFORE sync to avoid NaN copy)
     if (isnan(this->target_temperature_low)) this->target_temperature_low = 20.0f;

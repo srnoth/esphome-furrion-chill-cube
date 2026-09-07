@@ -888,12 +888,7 @@ void FurrionChillCube::setup() {
 
   // Restore mode, targets, fan, swing from flash
   auto restore = this->restore_state_();
-  diag_restore_ok_ = restore.has_value();
   if (restore.has_value()) {
-    diag_restore_mode_ = (int) restore->mode;
-    diag_restore_lo_ = restore->target_temperature_low;
-    diag_restore_hi_ = restore->target_temperature_high;
-    diag_restore_tgt_ = restore->target_temperature;
     restore->apply(this);
     ESP_LOGI(TAG, "Restored state: mode=%d temp=%.1f lo=%.1f hi=%.1f swing=%d",
              (int)this->mode, this->target_temperature,
@@ -1030,54 +1025,10 @@ void FurrionChillCube::setup() {
                                  : 0.0f;
     compressor_output_sensor_->publish_state(pct);
   }
-  diag_setup_end_mode_ = (int) this->mode;   // DIAG
-}
-
-// DIAG: re-log the boot restore once HA can hear us, then read the saved climate blob back every 60 s.
-void FurrionChillCube::diag_restore_log_() {
-  uint32_t ms = millis();
-  if ((int) this->mode != diag_last_mode_) {
-    if (diag_last_mode_ != -99) {
-      diag_mode_changes_++;
-      if (diag_mode_change_at_ == 0) { diag_mode_change_at_ = ms; diag_mode_from_ = diag_last_mode_; diag_mode_to_ = (int) this->mode; }
-    }
-    diag_last_mode_ = (int) this->mode;
-  }
-  if (!diag_restore_logged_) {
-    bool api_up = false;
-#ifdef USE_API
-    api_up = (api::global_api_server != nullptr && api::global_api_server->is_connected());
-#endif
-    // HA subscribes to logs a moment AFTER the API connects — the first attempt is lost. Log it on the
-    // first API-up pass and keep repeating it (every readback) for the first 5 minutes of uptime.
-    if (api_up || ms > 90000) {
-      diag_restore_logged_ = true;   // re-armed by the 60 s readback for the first 5 min
-      ESP_LOGI(TAG, "DIAG boot restore: %s mode=%d lo=%.2f hi=%.2f tgt=%.2f | setup-end mode=%d | first loop-seen change "
-               "%d->%d at %lums (changes=%d, control calls=%d) | live now mode=%d | uptime=%lus",
-               diag_restore_ok_ ? "LOADED" : "NONE", diag_restore_mode_, diag_restore_lo_, diag_restore_hi_,
-               diag_restore_tgt_, diag_setup_end_mode_, diag_mode_from_, diag_mode_to_,
-               (unsigned long) diag_mode_change_at_, diag_mode_changes_, diag_control_calls_, (int) this->mode,
-               (unsigned long) (ms / 1000));
-    }
-  }
-  if (ms - diag_readback_at_ >= 60000) {
-    diag_readback_at_ = ms;
-    if (ms < 300000) diag_restore_logged_ = false;   // re-log the boot restore on the next pass
-    auto r = this->restore_state_();   // same key as boot; reads pending-save copy if one is queued, else NVS
-    if (r.has_value()) {
-      ESP_LOGI(TAG, "DIAG NVS readback: mode=%d lo=%.2f hi=%.2f tgt=%.2f | live mode=%d lo=%.2f hi=%.2f tgt=%.2f%s",
-               (int) r->mode, r->target_temperature_low, r->target_temperature_high, r->target_temperature,
-               (int) this->mode, this->target_temperature_low, this->target_temperature_high, this->target_temperature,
-               ((int) r->mode != (int) this->mode) ? "  <-- MODE MISMATCH" : "");
-    } else {
-      ESP_LOGW(TAG, "DIAG NVS readback: NO blob (load failed) | live mode=%d", (int) this->mode);
-    }
-  }
 }
 
 void FurrionChillCube::loop() {
   uint32_t now = millis();
-  diag_restore_log_();
 
   // Bench test harness: while test_mode_ is set the production controller is fully inert —
   // no gear pass, kickstart, maneuver, vane, or heartbeat. The unit is driven ONLY by the
@@ -1216,7 +1167,6 @@ climate::ClimateTraits FurrionChillCube::traits() {
 }
 
 void FurrionChillCube::control(const climate::ClimateCall &call) {
-  diag_control_calls_++;
   // Track whether each field *actually* changed. user_changed_ is set only for
   // real, mode-relevant changes — not for redundant HA re-syncs after reconnect
   // (which send the same values we already have) and not for tweaks to the
@@ -1226,8 +1176,6 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 
   if (call.get_mode().has_value()) {
     auto new_mode = *call.get_mode();
-    ESP_LOGI(TAG, "DIAG control: mode call %d (current %d) at uptime %lums", (int) new_mode, (int) this->mode,
-             (unsigned long) millis());
 
     // Ensure two-point values valid for first boot (BEFORE sync to avoid NaN copy)
     if (isnan(this->target_temperature_low)) this->target_temperature_low = 20.0f;

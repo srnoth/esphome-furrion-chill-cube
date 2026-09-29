@@ -418,6 +418,9 @@ void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
   // Leaving an active mode (-> OFF, or a mode change that routes through OFF) aborts
   // any in-progress homing. Note: setup()'s boot-restore assigns active_ir_mode_
   // DIRECTLY (not via this setter), so a reboot never spuriously re-homes the vane.
+  // Per-mode vane memory: load the new context's swing BEFORE the homing check (it arms only
+  // on swing OFF) and before the caller's main frame, whose swing trailer then carries it.
+  apply_vane_memory_();
   if (mode == climate::CLIMATE_MODE_OFF) {
     abort_vent_positioning_();
   } else if (prev == climate::CLIMATE_MODE_OFF) {
@@ -968,6 +971,29 @@ void FurrionChillCube::setup() {
              furrion_setpoint_c_, current_cs_, bias_c_);
   }
 
+  // Per-mode vane memory. Runs after the mode restore so active_ir_mode_ is the restored wire mode.
+  // The restored swing_mode is the wire truth (a reboot never re-sends or re-homes the vane), so
+  // it wins for the boot context — this also migrates the first boot, when no pref exists yet
+  // and the other mode takes its YAML default.
+  if (vane_memory_enabled_) {
+    vane_pref_ = global_preferences->make_preference<uint8_t>(this->get_object_id_hash() ^ 0x56414E45);
+    uint8_t v = 0;
+    if (vane_pref_.load(&v) && (v & 0x80)) {
+      heat_vane_swing_ = v & 0x01;
+      cool_vane_swing_ = v & 0x02;
+      vane_ctx_heat_ = v & 0x04;
+      last_saved_vane_ = v;
+    }
+    vane_ctx_heat_ = vane_ctx_is_heat_();
+    bool swing = (this->swing_mode == climate::CLIMATE_SWING_VERTICAL);
+    if (vane_ctx_heat_) heat_vane_swing_ = swing; else cool_vane_swing_ = swing;
+    save_vane_pref_();
+    if (heat_vane_switch_) heat_vane_switch_->publish_state(heat_vane_swing_);
+    if (cool_vane_switch_) cool_vane_switch_->publish_state(cool_vane_swing_);
+    ESP_LOGI(TAG, "Vane memory: heat=%s cool=%s (context %s)", heat_vane_swing_ ? "auto" : "fixed",
+             cool_vane_swing_ ? "auto" : "fixed", vane_ctx_heat_ ? "HEAT" : "COOL");
+  }
+
   // Register temperature sensor callbacks
   if (inside_temp_sensor_) {
     inside_temp_sensor_->add_on_state_callback([this](float value) {
@@ -1275,6 +1301,9 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   // Swing mode change — standalone swing frame, works during kickstart
   // Does NOT set user_changed_: vent direction is cosmetic and must never
   // trigger gear recalculation, timer resets, or immediate-off logic.
+  // A mode change while the unit is off moves the vane context (a running unit keeps its wire
+  // mode's context until the forced OFF, which re-applies from set_active_ir_mode_).
+  apply_vane_memory_();
   if (call.get_swing_mode().has_value()) {
     this->swing_mode = *call.get_swing_mode();
     // User took manual vane control — exit any in-progress timed homing cleanly and
@@ -1287,6 +1316,8 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     vane_step_active_ = false;
     send_swing_state_();
     ESP_LOGI(TAG, "User swing change → %d", (int)*call.get_swing_mode());
+    if (vane_memory_enabled_)
+      store_vane_memory_(vane_ctx_heat_, this->swing_mode == climate::CLIMATE_SWING_VERTICAL);
   }
 
   // Flag gear recalculation for real, gear-relevant changes. Swing is cosmetic;
@@ -2250,6 +2281,63 @@ void FurrionChillCube::abort_vent_positioning_() {
     ESP_LOGI(TAG, "Vane: positioning aborted (phase=%d)", (int)vent_phase_);
     vent_phase_ = VentPhase::IDLE;
   }
+}
+
+// Vane context = the mode whose saved swing applies: the running wire mode, else the climate
+// mode (e.g. the off-dwell of a heat↔cool switch, or a mode picked while off), else the last one
+// (OFF, failsafe, or HEAT_COOL between sides).
+bool FurrionChillCube::vane_ctx_is_heat_() {
+  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) return true;
+  if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) return false;
+  if (this->mode == climate::CLIMATE_MODE_HEAT) return true;
+  if (this->mode == climate::CLIMATE_MODE_COOL) return false;
+  return vane_ctx_heat_;
+}
+
+// On a context change, load that mode's saved swing into swing_mode and publish it. No IR here:
+// a change happens with the unit off (nothing to move) or on an OFF→active start, whose main
+// frame follows and carries the swing trailer.
+void FurrionChillCube::apply_vane_memory_() {
+  if (!vane_memory_enabled_) return;
+  bool heat = vane_ctx_is_heat_();
+  if (heat == vane_ctx_heat_) return;
+  vane_ctx_heat_ = heat;
+  save_vane_pref_();
+  bool swing = heat ? heat_vane_swing_ : cool_vane_swing_;
+  ESP_LOGI(TAG, "Vane memory: %s context → %s", heat ? "HEAT" : "COOL", swing ? "auto" : "fixed");
+  auto want = swing ? climate::CLIMATE_SWING_VERTICAL : climate::CLIMATE_SWING_OFF;
+  if (this->swing_mode == want) return;
+  this->swing_mode = want;
+  this->publish_state();
+}
+
+void FurrionChillCube::store_vane_memory_(bool is_heat, bool swing) {
+  if (is_heat) heat_vane_swing_ = swing; else cool_vane_swing_ = swing;
+  save_vane_pref_();
+  switch_::Switch *sw = is_heat ? heat_vane_switch_ : cool_vane_switch_;
+  if (sw) sw->publish_state(swing);
+}
+
+void FurrionChillCube::save_vane_pref_() {
+  uint8_t v = 0x80 | (heat_vane_swing_ ? 0x01 : 0) | (cool_vane_swing_ ? 0x02 : 0) | (vane_ctx_heat_ ? 0x04 : 0);
+  if (v == last_saved_vane_) return;
+  vane_pref_.save(&v);
+  last_saved_vane_ = v;
+}
+
+// Switch write path. The live context's switch drives the vane exactly like a climate swing
+// toggle (same call path: homing/step aborts, swing frame, publish, and the save-back); the
+// other mode's switch only edits what that mode will load next time.
+void FurrionChillCube::set_vane_memory(bool is_heat, bool swing) {
+  store_vane_memory_(is_heat, swing);
+  ESP_LOGI(TAG, "Vane memory: %s set to %s%s", is_heat ? "HEAT" : "COOL", swing ? "auto" : "fixed",
+           is_heat == vane_ctx_heat_ ? " (live)" : "");
+  if (is_heat != vane_ctx_heat_) return;
+  auto want = swing ? climate::CLIMATE_SWING_VERTICAL : climate::CLIMATE_SWING_OFF;
+  if (this->swing_mode == want) return;
+  auto call = this->make_call();
+  call.set_swing_mode(want);
+  call.perform();
 }
 
 // Force a real OFF + off-dwell on a heat↔cool transition. Turns the unit OFF, stamps

@@ -8,6 +8,7 @@
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/button/button.h"
+#include "esphome/components/switch/switch.h"
 #include "esphome/core/preferences.h"
 
 namespace esphome {
@@ -104,6 +105,19 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_cool_vent_move_delay_ms(uint32_t ms) { cool_vent_move_delay_ms_ = ms; }
   void set_cool_vent_interval_ms(uint32_t ms) { cool_vent_interval_ms_ = ms; }
   void set_vane_step_duration_ms(uint32_t ms) { vane_step_duration_ms_ = ms; }
+
+  // Per-mode vane memory (2026-09-29). The swing setting (auto = oscillate / fixed = timed
+  // positioning) is remembered separately for heat and cool and re-applied whenever the vane
+  // context changes, so cool can run auto and heat fixed-at-floor without re-toggling on every
+  // switch. The context is the running wire mode, else the climate mode, else the last one.
+  // A climate swing toggle saves into the current context. The optional switches expose each
+  // mode's saved value; toggling the live context's switch drives the vane like a climate toggle.
+  void set_vane_memory_enabled(bool en) { vane_memory_enabled_ = en; }
+  void set_heat_vane_default(bool swing) { heat_vane_swing_ = swing; }
+  void set_cool_vane_default(bool swing) { cool_vane_swing_ = swing; }
+  void set_heat_vane_switch(switch_::Switch *s) { heat_vane_switch_ = s; }
+  void set_cool_vane_switch(switch_::Switch *s) { cool_vane_switch_ = s; }
+  void set_vane_memory(bool is_heat, bool swing);   // switch write path
 
   // Phase 2 adaptive equilibrium-gear controller (cool mode)
   void set_adaptive_enable(bool enable) { adaptive_enable_ = enable; }
@@ -363,6 +377,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   void abort_vent_positioning_();
   bool vent_positioning_active_() { return vent_phase_ != VentPhase::IDLE; }
 
+  // Per-mode vane memory internals (see set_vane_memory_enabled).
+  bool vane_ctx_is_heat_();
+  void apply_vane_memory_();                        // on a context change: load that mode's swing
+  void store_vane_memory_(bool is_heat, bool swing);
+  void save_vane_pref_();
+
   // Force a real OFF + off-dwell on a heat<->cool transition (compressor safety +
   // the vane's known OFF->ON anchor). Stamps off_since_ so the dwell gate then holds
   // the new mode off until mode_switch_off_ms_ elapses.
@@ -496,6 +516,18 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t vane_step_duration_ms_{500};  // swing-ON hold per press (YAML, default 0.5s)
   bool vane_step_active_{false};
   uint32_t vane_step_start_{0};
+
+  // Per-mode vane memory. true = auto (CLIMATE_SWING_VERTICAL), false = fixed (SWING_OFF).
+  // YAML defaults apply until the first save; persisted as one byte (bit0 heat, bit1 cool,
+  // bit2 context is heat, bit7 valid).
+  bool vane_memory_enabled_{false};
+  bool heat_vane_swing_{false};
+  bool cool_vane_swing_{true};
+  bool vane_ctx_heat_{false};            // context the current swing_mode belongs to
+  ESPPreferenceObject vane_pref_;
+  uint8_t last_saved_vane_{0};           // 0 = nothing saved this boot (bit7 is always set once saved)
+  switch_::Switch *heat_vane_switch_{nullptr};
+  switch_::Switch *cool_vane_switch_{nullptr};
 
   // Target encoding (F vs C) — configurable via YAML, default Fahrenheit.
   // Selects whether transmit_mode_command_() encodes the target temperature
@@ -761,6 +793,18 @@ class SwingOffButton : public button::Button, public Parented<FurrionChillCube> 
 class VaneStepButton : public button::Button, public Parented<FurrionChillCube> {
  protected:
   void press_action() override { this->parent_->send_vane_step(); }
+};
+
+// Per-mode vane memory switch (one per mode). Not a Component, so ESPHome never runs a boot-time
+// restore write_state() on it (cf. the template-switch ALWAYS_OFF boot action) — the climate
+// component owns the persisted value and publishes it at setup.
+class VaneMemorySwitch : public switch_::Switch, public Parented<FurrionChillCube> {
+ public:
+  void set_is_heat(bool is_heat) { is_heat_ = is_heat; }
+
+ protected:
+  void write_state(bool state) override { this->parent_->set_vane_memory(is_heat_, state); }
+  bool is_heat_{false};
 };
 
 }  // namespace furrion_chill_cube

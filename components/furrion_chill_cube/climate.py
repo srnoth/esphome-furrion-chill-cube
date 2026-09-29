@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import climate, sensor, binary_sensor, button, remote_transmitter, text_sensor
+from esphome.components import climate, sensor, binary_sensor, button, switch, remote_transmitter, text_sensor
 from esphome.const import (
     CONF_ID,
     CONF_NAME,
@@ -12,7 +12,7 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["remote_transmitter"]
-AUTO_LOAD = ["sensor", "binary_sensor", "button", "text_sensor"]
+AUTO_LOAD = ["sensor", "binary_sensor", "button", "switch", "text_sensor"]
 CODEOWNERS = ["@srnoth"]
 
 fcc_ns = cg.esphome_ns.namespace("furrion_chill_cube")
@@ -25,6 +25,9 @@ TurboOffButton = fcc_ns.class_("TurboOffButton", button.Button)
 SwingOnButton = fcc_ns.class_("SwingOnButton", button.Button)
 SwingOffButton = fcc_ns.class_("SwingOffButton", button.Button)
 VaneStepButton = fcc_ns.class_("VaneStepButton", button.Button)
+
+# Switch classes
+VaneMemorySwitch = fcc_ns.class_("VaneMemorySwitch", switch.Switch)
 
 # Config keys
 CONF_TRANSMITTER_ID = "transmitter_id"
@@ -142,6 +145,13 @@ CONF_SWING_ON = "swing_on"
 CONF_SWING_OFF = "swing_off"
 CONF_VANE_STEP = "vane_step"
 CONF_VANE_STEP_DURATION = "vane_step_duration"
+# Per-mode vane memory (2026-09-29)
+CONF_VANE_MEMORY = "vane_memory"
+CONF_HEAT_VANE_DEFAULT = "heat_vane_default"
+CONF_COOL_VANE_DEFAULT = "cool_vane_default"
+CONF_HEAT_VANE_AUTO = "heat_vane_auto"
+CONF_COOL_VANE_AUTO = "cool_vane_auto"
+VANE_POSITIONS = ["fixed", "auto"]
 CONF_DEBUG = "debug"
 CONF_DEBUG_ACTIVE_IR_MODE = "debug_active_ir_mode"
 CONF_DEBUG_LAST_ACTIVE_MODE = "debug_last_active_mode"
@@ -265,6 +275,15 @@ def _validate_vent_pairs(config):
         for key in (delay, interval):
             if key in config and config[key].total_milliseconds == 0:
                 raise cv.Invalid(f"'{key}' must be greater than 0.")
+    return config
+
+
+def _validate_vane_memory(config):
+    """The per-mode vane switches expose the vane memory, so they need it enabled."""
+    if not config[CONF_VANE_MEMORY]:
+        for key in (CONF_HEAT_VANE_AUTO, CONF_COOL_VANE_AUTO):
+            if key in config:
+                raise cv.Invalid(f"'{key}' needs '{CONF_VANE_MEMORY}: true'.")
     return config
 
 
@@ -416,6 +435,12 @@ CONFIG_SCHEMA = cv.All(
             # Manual vane-step nudge: each press of the vane_step button pulses the swing
             # ON then OFF after this duration, for a uniform incremental move. Default 0.5s.
             cv.Optional(CONF_VANE_STEP_DURATION, default="0.5s"): cv.positive_time_period_milliseconds,
+            # Per-mode vane memory: remember swing (auto = oscillate / fixed = timed positioning)
+            # separately for heat and cool and re-apply it on every mode change. The defaults
+            # apply until a mode's value is first saved.
+            cv.Optional(CONF_VANE_MEMORY, default=False): cv.boolean,
+            cv.Optional(CONF_HEAT_VANE_DEFAULT, default="fixed"): cv.one_of(*VANE_POSITIONS, lower=True),
+            cv.Optional(CONF_COOL_VANE_DEFAULT, default="auto"): cv.one_of(*VANE_POSITIONS, lower=True),
             # Configurable gear CS-offset tables (gear → °C offset from setpoint).
             cv.Optional(CONF_COOL_GEARS, default=_DEFAULT_COOL_GEARS): cv.All(
                 cv.ensure_list(GEAR_SCHEMA), _validate_gears("cool_gears")
@@ -561,11 +586,23 @@ CONFIG_SCHEMA = cv.All(
                 VaneStepButton,
                 entity_category=ENTITY_CATEGORY_CONFIG,
             ),
+            # Per-mode vane memory switches (ON = auto). Need vane_memory: true.
+            cv.Optional(CONF_HEAT_VANE_AUTO): switch.switch_schema(
+                VaneMemorySwitch,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+                icon="mdi:arrow-oscillating",
+            ),
+            cv.Optional(CONF_COOL_VANE_AUTO): switch.switch_schema(
+                VaneMemorySwitch,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+                icon="mdi:arrow-oscillating",
+            ),
         }
     )
     .extend(cv.COMPONENT_SCHEMA),
     _auto_debug_sensors,
     _validate_vent_pairs,
+    _validate_vane_memory,
 )
 
 
@@ -665,6 +702,21 @@ async def to_code(config):
         if key in config:
             cg.add(getattr(var, setter)(config[key].total_milliseconds))
     cg.add(var.set_vane_step_duration_ms(config[CONF_VANE_STEP_DURATION].total_milliseconds))
+
+    # Per-mode vane memory (+ optional switches)
+    if config[CONF_VANE_MEMORY]:
+        cg.add(var.set_vane_memory_enabled(True))
+        cg.add(var.set_heat_vane_default(config[CONF_HEAT_VANE_DEFAULT] == "auto"))
+        cg.add(var.set_cool_vane_default(config[CONF_COOL_VANE_DEFAULT] == "auto"))
+    for key, is_heat, setter in [
+        (CONF_HEAT_VANE_AUTO, True, "set_heat_vane_switch"),
+        (CONF_COOL_VANE_AUTO, False, "set_cool_vane_switch"),
+    ]:
+        if key in config:
+            sw = await switch.new_switch(config[key])
+            await cg.register_parented(sw, config[CONF_ID])
+            cg.add(sw.set_is_heat(is_heat))
+            cg.add(getattr(var, setter)(sw))
 
     # Phase 2 adaptive equilibrium-gear controller (cool mode)
     cg.add(var.set_adaptive_enable(config[CONF_ADAPTIVE_ENABLE]))

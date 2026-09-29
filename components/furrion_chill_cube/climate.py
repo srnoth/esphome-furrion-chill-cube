@@ -591,11 +591,13 @@ CONFIG_SCHEMA = cv.All(
                 VaneMemorySwitch,
                 entity_category=ENTITY_CATEGORY_CONFIG,
                 icon="mdi:arrow-oscillating",
+                default_restore_mode="DISABLED",  # the climate component persists + publishes the value
             ),
             cv.Optional(CONF_COOL_VANE_AUTO): switch.switch_schema(
                 VaneMemorySwitch,
                 entity_category=ENTITY_CATEGORY_CONFIG,
                 icon="mdi:arrow-oscillating",
+                default_restore_mode="DISABLED",  # the climate component persists + publishes the value
             ),
         }
     )

@@ -2329,6 +2329,10 @@ void FurrionChillCube::save_vane_pref_() {
 // toggle (same call path: homing/step aborts, swing frame, publish, and the save-back); the
 // other mode's switch only edits what that mode will load next time.
 void FurrionChillCube::set_vane_memory(bool is_heat, bool swing) {
+  // Refresh the context first: the bench harness assigns active_ir_mode_ directly (no setter), so
+  // vane_ctx_heat_ can lag; the refresh inside control() would then land AFTER this store and
+  // write the value into the other mode's memory.
+  apply_vane_memory_();
   store_vane_memory_(is_heat, swing);
   ESP_LOGI(TAG, "Vane memory: %s set to %s%s", is_heat ? "HEAT" : "COOL", swing ? "auto" : "fixed",
            is_heat == vane_ctx_heat_ ? " (live)" : "");

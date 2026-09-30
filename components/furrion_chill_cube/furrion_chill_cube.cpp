@@ -1656,9 +1656,8 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
   if (e > -ADAPT_DEADBAND_C && e < ADAPT_DEADBAND_C) e = 0.0f;
 
   bool idle = (heat_gear_ <= 0);  // heat off/idle — error not controllable
-  // Conditional-integration anti-windup: freeze POSITIVE (more-heat) accumulation when the gear
-  // cannot rise — at gear 3 (max heat), while an upshift is hold-blocked, or while the rate gate
-  // suppresses the upshift. NEGATIVE (less-heat) accumulation is never rail-blocked (gear 0/idle is
+  // Conditional-integration anti-windup: freeze POSITIVE (more-heat) accumulation only when the gear
+  // physically cannot rise — at max heat gear or while an upshift is hold-blocked. NEGATIVE (less-heat) accumulation is never rail-blocked (gear 0/idle is
   // always reachable), so a stale positive bias can always unwind (suspended, deliberately,
   // during an approach hold or an armed raise freeze). Mirror of the cool anti-windup.
   bool upshift_held = (heat_gear_ < heat_max_gear_) && (time_in_gear < HOLD_MS[heat_gear_ + 1]);
@@ -1667,9 +1666,13 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
   // A POSITIVE-magnitude drift reading is trusted only while fresh; NaN stays legacy-permissive.
   bool cooling = isnan(room_drift_cpm_) ||
                  (room_drift_cpm_ < -ADAPT_UPSHIFT_DRIFT_MIN_CPM && drift_fresh);
+  // The `!cooling` clause was REMOVED 2026-09-30 (mirror of cool iter-1 #4, 2026-07-20): freezing
+  // accumulation whenever the room isn't actively falling gates out most of a steady below-SP hunt,
+  // so the integral runs at a fraction of its speed and lags the load by hours. The upshift itself
+  // stays protected against a wound bias by the `cooling ? eff : fmaxf(...)` gate on heat_eff_up_diff_.
   // NOTE: the cut "pull-up windup window" (see the cool-side note in adaptive_cool_eff_diff_)
   // applied here too — same reasoning, sign-mirrored. The SP-raise preload replaces it.
-  bool block_up = (e > 0.0f) && (heat_gear_ >= heat_max_gear_ || upshift_held || !cooling);
+  bool block_up = (e > 0.0f) && (heat_gear_ >= heat_max_gear_ || upshift_held);
   // Raise-side bias freeze maintenance — SIGN-MIRROR of the cool block (armed by a heat SP DROP
   // that removes demand; released when the room falls back into the band from above, at an
   // approach handover (see the hold-maintenance blocks), or at the
@@ -1702,21 +1705,18 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
     if (bias_h_ < -ADAPT_BIAS_C_MAX) bias_h_ = -ADAPT_BIAS_C_MAX;
   }
 
-  // Raise-frozen bias is STORED, not live — bias-blind eff while frozen, mirror of cool (heat's
-  // 0→1 re-engage is real-diff so the cool pin bug doesn't exist here, but the downshift/hold
-  // legs DO select on eff and must not act on a stored bias). ⚠️ winter-unvalidated.
+  // Raise-frozen bias is STORED, not live — bias-blind eff while frozen, mirror of cool: the eff-based
+  // 0→1 re-engage (since 2026-09-30) would otherwise fire below a lowered SP off the stored bias and
+  // hunt 1↔0 there for the whole horizon, and the downshift/hold legs must not act on it either.
   float live_bias = raise_frozen ? 0.0f : bias_h_;
   float eff = real_diff - live_bias;  // bias_h_ > 0 (cold demand) → more negative → higher heat gear
   // Upshift decisions see the learned bias while cooling OR while PERSISTENTLY stalled below the
   // band (sign-mirror of cool's stalled_above; see ADAPT_STALL_FALL_CPM / ADAPT_STALL_DWELL_MS).
   // Otherwise fall back to the unbiased diff — on that fallback leg, fmaxf (mirror of cool's
   // fminf) guarantees the gate can only SUPPRESS an upshift, never enable one: a stale POSITIVE
-  // bias (eff < real_diff) is clamped up to real_diff. ⚠️ winter-unvalidated. HONEST ASYMMETRY
-  // (bug-check 2026-08-15): heat's block_up above still carries the `!cooling` clause that cool
-  // dropped on 2026-07-20, so during the very stall this escape targets the heat integral is
-  // FROZEN — the escape can only release a bias wound during an earlier falling phase, not grow
-  // one at the stall. Deliberately left as-is (winter-unvalidated side; revisit with real heat
-  // cycles before making it a true mirror).
+  // bias (eff < real_diff) is clamped up to real_diff. (The 2026-08-15 asymmetry — heat's block_up
+  // still carrying `!cooling`, freezing the integral during the very stall this escape targets —
+  // is gone since 2026-09-30: the heat integral now grows at a stall exactly like cool's.)
   // PLATEAU only (|drift| < threshold) — mirror of cool; a live FALL is the cooling leg's job.
   bool stall_cond = (real_diff < -ADAPT_DEADBAND_C) && drift_fresh &&
                     !isnan(room_drift_cpm_) && (room_drift_cpm_ < ADAPT_STALL_FALL_CPM) &&
@@ -3090,7 +3090,11 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         // restored idle at/above SP−deadband stays a no-op). ⚠️ winter-unvalidated.
         if (last_gear_change_ == 0) {
           new_gear = pick_from_below(pick_basis);
-        } else if (can_upshift_to(1) && diff < H_UP_01) {
+        } else if (can_upshift_to(1) && eff_diff < H_UP_01) {
+          // Re-engage 0→1 on eff_diff (real − bias_h_), not real diff — mirror of cool iter-1 #2
+          // (2026-07-20): the integral shifts the WHOLE heat ladder together, start pin included, so a
+          // cold-night bias raises the cycle's floor instead of inverting gear 1's band. The 0→-1
+          // off-decision below stays on REAL diff (failover / don't heat above SP on a stale bias).
           new_gear = 1;
         } else if (can_upshift_to(1) && approach_predict_heat_(diff, now, approach_lead_ms_)) {
           // Approach-side early engagement from idle (mirror of cool; idle quirk not bypassed).

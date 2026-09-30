@@ -123,7 +123,7 @@ static const uint32_t SETPOINT_SETTLE_MS = 2500;  // 2.5s
 // momentum instead of dropping straight through to LOW. The slow integral (bias_h_) is UNCHANGED and
 // still centers whichever boundary the load selects on the heat setpoint.
 //   • 0↔1 (start/stop) + idle: NOT on the 1°F grid. H_DN_10 is PINNED near setpoint by the heat→cool
-//     pong constraint (2026-04-13) and run_heat_mode_ evaluates 1→0 on REAL diff so bias can't move it.
+//     pong constraint (2026-04-13). Since 2026-09-30 1→0 runs on eff_diff (mirror of cool) — see run_heat_mode_.
 //   • Asymmetric runway (descent ≠ ascent) is NOT used — no data yet shows descent needs more room.
 //     Re-add only if a symmetric 1°F descent runway still drops MAX→MED→LOW on the hottest days
 //     (momentum is the one directional asymmetry; that drop-through is its signature).
@@ -136,10 +136,10 @@ static const uint32_t SETPOINT_SETTLE_MS = 2500;  // 2.5s
 // build_ladders_()). Each run_*_mode_ / gear_in_band_* aliases them back to the old H_*/C_*
 // names at function entry so the selection logic stays byte-identical. Defaults reproduce the
 // 2026-07-08 symmetric-1°F ladder. NOTE the two PINNED boundaries kept off the uniform grid:
-//   • start/stop (0↔1): compressor start/stop hysteresis; stop (H_DN_10=-0.15) is heat→cool
-//     pong-critical — stops heat 0.27°F below setpoint so the ~0.85°F post-drop carry lands
-//     inside mode_switch_temp_offset_c_ (2026-04-13). run_heat_mode_ evaluates 1→0 on REAL diff
-//     so bias_h_ can't move it.
+//   • start/stop (0↔1): compressor start/stop hysteresis; stop (H_DN_10=-0.15) stops heat 0.27°F
+//     below setpoint so the ~0.85°F post-stop run-on carry peaks near +0.6°F. (Was pinned on REAL
+//     diff for the 2026-04-13 heat→cool pong margin; the HEAT_COOL door moved to cool's engagement
+//     point on 2026-09-30 and 1→0 now runs on eff_diff like cool.)
 //   • idle (0→-1).
 
 // Cooling deadbands (diff = room - target, positive = hot)
@@ -1619,9 +1619,9 @@ float FurrionChillCube::adaptive_cool_eff_diff_(float real_diff, uint32_t now, u
 // isn't cooling per the rate gate). The rate gate's "raise allowed" condition is the room getting
 // COLDER (drift < -threshold) — the mirror of cool's "warming". No fan feedforward on the heat side
 // (the vent-fan FF is a cooling-load model; heat FF is a separate unmeasured question — omitted).
-// ⚠️ WINTER-VALIDATE: this loop shifts the heat downshift thresholds via bias_h_. The pong-critical
-// 1→0 STOP is deliberately evaluated on REAL diff in run_heat_mode_ so bias can't move it, but the
-// centering + overshoot behavior is UNTESTED until a real heat cycle — verify before trusting.
+// Since 2026-09-30 bias_h_ shifts the WHOLE heat ladder (0→1 re-engage and 1→0 stop included) —
+// the mirror of cool iter-1 #2. First heat nights on this: watch the run-on overshoot (the integral
+// is blind during the post-stop run-on, which happens at gear 0).
 float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, uint32_t time_in_gear) {
   if (!adaptive_enable_) {
     heat_adaptive_last_advance_ = now;  // keep dt fresh so a later enable doesn't see a huge gap
@@ -2946,8 +2946,8 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   }
 
   // Phase 2 adaptive (heat): advance the integral and get the effective diff for the active-gear
-  // switch cases. Mirror of the cool call. Re-engage/idle/mode-switch AND the pong-critical 1→0
-  // STOP decision stay on real diff. Called every heat pass so the integral advances/decays.
+  // switch cases, the 0→1 re-engage and the 1→0 stop (all eff since 2026-09-30, mirror of cool).
+  // Idle/mode-switch decisions stay on real diff. Called every heat pass so the integral advances/decays.
   float eff_diff, up_diff;
   if (is_script_mode()) {
     // Gear-script: heat integral FROZEN (mirror of the cool block).
@@ -2994,9 +2994,10 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     } else if (approach_hold_heat_) {
       bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
       float mins = (room_drift_cpm_ < 0.0f) ? diff / (-room_drift_cpm_) : 1e9f;
-      if (diff <= H_DN_10) {
-        // Release at the heat ladder's gear-1 hold boundary. Deliberately REAL-diff (H_DN_10 is the
-        // pong-pinned real-diff rail) so the release keeps the heat 1→0 semantics intact.
+      if (eff_diff <= H_DN_10) {
+        // Release at the heat ladder's OWN gear-1 hold boundary — eff-based like the heat 1→0 rail
+        // since 2026-09-30 (mirror of cool): the handover lands where the ladder keeps gear 1 running,
+        // no release-pass downshift.
         approach_hold_heat_ = false;
         ESP_LOGI(TAG, "Approach (heat): reached ladder band — hold released, ladder takes over");
         // Handover preload from the engagement drift snapshot — mirror of the cool band-release
@@ -3034,9 +3035,9 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     // Selection basis — sign-mirror of the cool block (see the cool basis note for the full
     // rationale: positive live bias only, demand-gated, ff/handover-patch/frozen-bias excluded,
     // negative bias floors at the static ladder). For heat, demand = room BELOW the band and the
-    // bias SUBTRACTS (more negative = more heat). The demand gate also keeps the pong-critical
-    // 1→0 STOP untouched on user events: at/above SP−deadband the basis IS the real diff, so
-    // bias_h_ cannot hold gear 1 past the real stop (bug-check 2026-08-15). ⚠️ winter-unvalidated.
+    // bias SUBTRACTS (more negative = more heat). The demand gate also keeps user-event picks at/above
+    // SP−deadband on the real diff, so bias_h_ cannot position gear 1 past the real stop on a user
+    // event (bug-check 2026-08-15; identical to the cool basis).
     float pick_bias = (adaptive_enable_ && raise_freeze_h_at_ == 0) ? fmaxf(0.0f, bias_h_) : 0.0f;
     float pick_basis = (diff < -ADAPT_DEADBAND_C) ? (diff - pick_bias) : diff;
     float sel_basis = from_test ? eff_diff : pick_basis;
@@ -3135,9 +3136,9 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
                            !approach_predict_heat_(diff, now, approach_lead_ms_);
         if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
       } else {
-        // Active gears 1..M: upshift on the rate-gated up_diff (colder crosses heat_up_[gear]). The
-        // 1→0 STOP is pong-critical and evaluated on REAL diff (bias_h_ must not move it); gears 2+
-        // downshift on eff_diff. Downshift trip = heat_stop_ (gear 1) else heat_dn_[gear-1].
+        // Active gears 1..M: upshift on the rate-gated up_diff (colder crosses heat_up_[gear]);
+        // every downshift, the 1→0 stop included, on eff_diff. Downshift trip = heat_stop_ (gear 1)
+        // else heat_dn_[gear-1].
         if (gear < M && can_upshift_to(gear + 1) && up_diff < heat_up_[gear] &&
             !(approach_hold_heat_ &&
               (gear == 1 || (approach_hold_from_off_ && gear == heat_cold_start_floor_)))) {
@@ -3145,10 +3146,13 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
           new_gear = gear + 1;
         } else {
           float dn = (gear == 1) ? H_DN_10 : heat_dn_[gear - 1];
-          float dcmp = (gear == 1) ? diff : eff_diff;   // 1→0 STOP on REAL diff (pong-critical)
+          // 1→0 STOP on eff_diff since 2026-09-30 (mirror of cool): the integral centers the whole
+          // ladder, stop included. Was REAL diff, pinned against the heat→cool pong (2026-04-13: the
+          // ~0.85°F post-stop run-on carry had to land short of the HEAT_COOL door at cool target −
+          // 1°F); that door now opens only at cool's own engagement point (room > cool target +
+          // cool start), ≥ 1.46°C above heat target on the camper's 67/69 band.
           // The approach hold pins gear 1 above SP; the hold-maintenance block owns its exits.
-          // (The pong-critical 1→0 STOP stays real-diff for every NON-held pass.)
-          if (dcmp > dn &&
+          if (eff_diff > dn &&
               !(approach_hold_heat_ &&
                 (gear == 1 || (approach_hold_from_off_ && gear == heat_cold_start_floor_))))
             new_gear = gear - 1;

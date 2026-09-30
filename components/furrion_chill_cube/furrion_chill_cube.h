@@ -244,6 +244,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   void clear_script_gear();         // back to production (bias-justified re-pick next pass)
   bool is_script_mode() const { return script_gear_ != SCRIPT_NONE; }
   int script_gear() const { return script_gear_; }
+  // Configured ladder tops (from the YAML gear lists) — lets the sequencer bound script gears to
+  // what production actually supports instead of a hardcoded count.
+  int cool_max_gear() const { return cool_max_gear_; }
+  int heat_max_gear() const { return heat_max_gear_; }
   void set_script_timeout_ms(uint32_t ms) { script_timeout_ms_ = ms; }
 
  protected:

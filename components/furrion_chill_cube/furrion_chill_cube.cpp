@@ -127,9 +127,10 @@ static const uint32_t SETPOINT_SETTLE_MS = 2500;  // 2.5s
 //   • Asymmetric runway (descent ≠ ascent) is NOT used — no data yet shows descent needs more room.
 //     Re-add only if a symmetric 1°F descent runway still drops MAX→MED→LOW on the hottest days
 //     (momentum is the one directional asymmetry; that drop-through is its signature).
-// Up-rail (start/upshift): -0.35 / -0.55 / -1.10 ; Down-rail (stop/downshift): -0.15 / -0.55 / -1.10.
-// Monotonic (more negative = higher gear). ⚠️ UNTESTABLE until heating season — validate the pong
-// margin + centering on the first real heat cycle before trusting.
+// 2026-09-30: the grid is now offset by the start pin (mirror of cool iter-1 #1) and auto-scaled from
+// modulation_span; with the camper's span 1.10 / hysteresis 0.1 the rails are
+// Up-rail (start/upshift): -0.35 / -0.90 / -1.45 ; Down-rail (stop/downshift): -0.15 / -0.80 / -1.35.
+// Monotonic (more negative = higher gear).
 // Ladder thresholds are now CONFIGURABLE members (heat_start_/heat_stop_/heat_idle_ pins +
 // heat_up_[]/heat_dn_[] modulation trips auto-built from heat_spacing_/heat_hyst_ in
 // build_ladders_()). Each run_*_mode_ / gear_in_band_* aliases them back to the old H_*/C_*
@@ -1379,7 +1380,7 @@ void FurrionChillCube::seed_last_tx_target_f_() {
 // the user change doesn't actually move the room out of the current gear's band.
 bool FurrionChillCube::gear_in_band_heat_(int gear, float diff) {
   // Gear N stays between its own transition trips. Heat: diff negative when cold, so the upshift
-  // trip (heat_up_[N] = −N·S) is the LOWER bound and the downshift trip is the UPPER bound. Pins:
+  // trip (heat_up_[N] = start − N·S) is the LOWER bound and the downshift trip is the UPPER bound. Pins:
   // gear 0 sits in [start, idle]; gear 1's downshift is the pinned stop. Generalized over N gears;
   // reproduces the old case 0/1/2/3 for heat_max_gear_ == 3.
   int M = heat_max_gear_;
@@ -2188,19 +2189,21 @@ void FurrionChillCube::build_ladders_() {
   if (heat_spacing_ <= 0.0f) heat_spacing_ = heat_span_ / (float) std::max(1, heat_max_gear_ - 1);
   ESP_LOGI(TAG, "Ladders: cool S=%.3f (max gear %d, top trip %+.2f) heat S=%.3f (max gear %d, top trip %+.2f)",
            cool_spacing_, cool_max_gear_, cool_start_ + (cool_max_gear_ - 1) * cool_spacing_,
-           heat_spacing_, heat_max_gear_, -((heat_max_gear_ - 1) * heat_spacing_));
+           heat_spacing_, heat_max_gear_, heat_start_ - (heat_max_gear_ - 1) * heat_spacing_);
   for (int n = 1; n < MAX_GEARS; n++) {
-    // COOL: offset the modulation grid by the 0↔1 start pin so gear 1 gets a FULL-spacing runway
-    // from its entry (cool_start_) to its upshift (cool_up_[1] = start + S), matching every other
-    // rung. Without the offset gear 1's runway is only (S − start) ≈ 0.20°C — the narrowest rung and
-    // the first to collapse under a residual adaptive bias (the overnight 0↔1→2 popping diagnosed
-    // 2026-07-20). Trade: shifts the whole cool ladder top up by cool_start_ (~0.35°C), so MAX needs
-    // a touch more demand — acceptable once the bias tracks (iter-1 #1). HEAT keeps the un-offset grid
-    // (winter-unvalidated; do the sign-mirror deliberately before heating season).
+    // Offset the modulation grid by the 0↔1 start pin so gear 1 gets a FULL-spacing runway from its
+    // entry (start) to its upshift (up[1] = start ± S), matching every other rung. Without the offset
+    // gear 1's runway is only (S − |start|) ≈ 0.20°C — the narrowest rung and the first to collapse
+    // under a residual adaptive bias (cool: the overnight 0↔1→2 popping diagnosed 2026-07-20,
+    // iter-1 #1). Trade: shifts the whole ladder top out by |start| (~0.35°C), so MAX needs a touch
+    // more demand — acceptable once the bias tracks.
+    // HEAT sign-mirror (2026-09-30): the 3-min compressor start latency let the room fall through the
+    // 0.20°C g1 runway every cold-night cycle (0→1→2→1→0, g2 blips of 1-2 min); heat_start_ is
+    // negative, so the heat grid extends downward from it.
     cool_up_[n] = cool_start_ + n * cool_spacing_;
     cool_dn_[n] = cool_start_ + n * cool_spacing_ - cool_hyst_;
-    heat_up_[n] = -(n * heat_spacing_);
-    heat_dn_[n] = -(n * heat_spacing_ - heat_hyst_);
+    heat_up_[n] = heat_start_ - n * heat_spacing_;
+    heat_dn_[n] = heat_start_ - n * heat_spacing_ + heat_hyst_;
   }
 }
 

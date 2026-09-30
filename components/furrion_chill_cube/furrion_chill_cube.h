@@ -573,10 +573,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   float heat_spacing_{0.55f}, heat_span_{1.10f}, heat_hyst_{0.0f};
   float heat_start_{-0.35f}, heat_stop_{-0.15f}, heat_idle_{0.30f};
   // Modulation trips built from spacing (index n = boundary between gear n and n+1)
-  float cool_up_[MAX_GEARS] = {0};     // cool_up_[n]: upshift n→n+1  (= +n·S)
-  float cool_dn_[MAX_GEARS] = {0};     // cool_dn_[n]: downshift n+1→n (= +n·S − h)
-  float heat_up_[MAX_GEARS] = {0};     // heat_up_[n]: upshift n→n+1  (= −n·S)
-  float heat_dn_[MAX_GEARS] = {0};     // heat_dn_[n]: downshift n+1→n (= −(n·S − h))
+  float cool_up_[MAX_GEARS] = {0};     // cool_up_[n]: upshift n→n+1  (= start + n·S)
+  float cool_dn_[MAX_GEARS] = {0};     // cool_dn_[n]: downshift n+1→n (= start + n·S − h)
+  float heat_up_[MAX_GEARS] = {0};     // heat_up_[n]: upshift n→n+1  (= start − n·S)
+  float heat_dn_[MAX_GEARS] = {0};     // heat_dn_[n]: downshift n+1→n (= start − n·S + h)
   // CS transmit cadence + quirk timing (all YAML-configurable)
   uint32_t cs_transmit_interval_ms_{10000};    // normal heartbeat (was fixed 30s)
   uint32_t quirk_transmit_interval_ms_{5000};  // denser re-assert during a maneuver

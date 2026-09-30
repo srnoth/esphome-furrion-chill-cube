@@ -3116,23 +3116,17 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
         bool past_setpoint = diff > mode_switch_temp_offset_c_;
         // Natural-off gate — sign-mirror of the cool block (see run_cool_mode_ + incident
-        // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): in pure HEAT, full-off waits for the heat integral to
-        // be unwound (no drift leg — Stephen 2026-08-06).
-        // HEAT_COOL (Stephen 2026-09-30): heat does NOT go OFF until cool is actually ready to run —
-        // the ONLY road is the handoff door, and the door opens at cool's own 0→1 engagement point
-        // (room past cool target + cool start pin). OFF costs a clamped cold start (the 305 s OFF→1
-        // burst); the old door at (cool target − 1°F) = the band midpoint fired on the heat run-on
-        // carry every mild evening (09-27/28/30: OFF at 68.1-68.2°F on a 67/69 band, cool never
-        // engaged, heat restarted from OFF ~45 min later). Heat idle holds instead. The door still
-        // covers shoulder mornings (sun lifts the room while bias_h_ is wound). A NaN cool target
-        // falls back to the pure-HEAT gate.
-        float c_tgt = get_cool_target_();
-        bool door_only = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) && !isnan(c_tgt);
-        bool handoff_demand = door_only && (room > c_tgt + cool_start_);
-        // Frozen heat bias counts as unwound — mirror of the cool gate.
+        // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): heat full-off waits for the heat integral to be
+        // unwound (no drift leg — Stephen 2026-08-06) — EXCEPT through the HEAT_COOL handoff door
+        // (room risen into cool's engagement territory; this mirror bites in shoulder-season
+        // mornings: sun lifts the room while bias_h_ is still wound and heat idle would otherwise
+        // lock cool out). ⚠️ winter-unvalidated, structurally symmetric only.
+        bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
+                              (room >= get_cool_target_() - mode_switch_temp_offset_c_);
+        // Frozen heat bias counts as unwound — mirror of the cool gate. ⚠️ winter-unvalidated.
         bool bias_unwound = bias_h_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_h_at_ != 0;
         bool natural_off = idle_enough && event_ok && past_setpoint &&
-                           (door_only ? handoff_demand : bias_unwound) &&
+                           (handoff_demand || bias_unwound) &&
                            !approach_predict_heat_(diff, now, approach_lead_ms_);
         if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
       } else {
@@ -3651,23 +3645,16 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         // other mode (arbitrate_mode_ pins do_heat while cool_gear_ >= 0), so when the room has
         // fallen into heat's engagement territory the bias/drift legs MUST NOT stand in the way —
         // else cool idles for hours (bias decay) or forever (room plateaus sub-floor) while the
-        // room goes arbitrarily cold with heat locked out.
-        // Stephen 2026-09-30: in HEAT_COOL cool does NOT go OFF until heat is actually ready to run
-        // — the door is the ONLY road, and it opens at heat's own 0→1 engagement point (room below
-        // heat target + heat start pin; heat_start_ is negative). The old door at (heat target + 1°F)
-        // = the band midpoint parked the unit OFF every mild evening (09-27/28/29 COOL 0→-1 at 68°F
-        // on a 67/69 band) and heat then paid a clamped cold start. When heat can't run (outdoor
-        // lockout) or its target is NaN, fall back to the pure-COOL gate so cool can't idle forever.
-        float h_tgt = get_heat_target_();
-        bool door_only = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) && !heater_locked_out_ &&
-                         !isnan(h_tgt);
-        bool handoff_demand = door_only && (room < h_tgt + heat_start_);
+        // room goes arbitrarily cold with heat locked out. NaN heat target compares false → door
+        // stays closed in degenerate states.
+        bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
+                              (room <= get_heat_target_() + mode_switch_temp_offset_c_);
         // A raise-FROZEN bias counts as unwound (bug-check round 1): the freeze marks the sub-SP
         // room as user-inflicted (the raise), the bias is stored-not-live, and cooling below a
         // raised SP is pointless — go properly OFF; the OFF-entry approach handles re-entry.
         bool bias_unwound = bias_c_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_c_at_ != 0;
         bool natural_off = idle_enough && event_ok && past_setpoint &&
-                           (door_only ? handoff_demand : bias_unwound) &&
+                           (handoff_demand || bias_unwound) &&
                            !approach_predict_cool_(diff, now, approach_lead_ms_);
         if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
       } else {

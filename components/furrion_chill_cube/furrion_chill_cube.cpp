@@ -1660,9 +1660,10 @@ float FurrionChillCube::adaptive_heat_eff_diff_(float real_diff, uint32_t now, u
 
   bool idle = (heat_gear_ <= 0);  // heat off/idle — error not controllable
   // Conditional-integration anti-windup: freeze POSITIVE (more-heat) accumulation only when the gear
-  // physically cannot rise — at max heat gear or while an upshift is hold-blocked. NEGATIVE (less-heat) accumulation is never rail-blocked (gear 0/idle is
-  // always reachable), so a stale positive bias can always unwind (suspended, deliberately,
-  // during an approach hold or an armed raise freeze). Mirror of the cool anti-windup.
+  // physically cannot rise — at max heat gear or while an upshift is hold-blocked. NEGATIVE
+  // (less-heat) accumulation is never rail-blocked (gear 0/idle is always reachable), so a stale
+  // positive bias can always unwind (suspended, deliberately, during an approach hold or an armed
+  // raise freeze). Mirror of the cool anti-windup.
   bool upshift_held = (heat_gear_ < heat_max_gear_) && (time_in_gear < HOLD_MS[heat_gear_ + 1]);
   bool drift_fresh = (last_temp_update_ != 0) && (now - last_temp_update_ <= DRIFT_STALE_MS);
   // "cooling" = room getting colder = raising the heat gear is warranted (mirror of cool's "warming").

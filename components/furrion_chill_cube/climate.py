@@ -40,6 +40,8 @@ CONF_MODE_SWITCH_IDLE_MIN = "mode_switch_idle_min"
 CONF_MODE_SWITCH_EVENT_MIN = "mode_switch_event_min"
 CONF_MODE_SWITCH_TEMP_OFFSET = "mode_switch_temp_offset"
 CONF_MODE_SWITCH_OFF = "mode_switch_off_time"
+CONF_CHANGEOVER_TREND_WINDOW = "changeover_trend_window"
+CONF_CHANGEOVER_TREND_MIN = "changeover_trend_min"
 # Configurable gear ladders + transition quirks + CS transmit cadence.
 # Gears are (gear_number → CS offset from the °C setpoint anchor). Quirks are
 # path-dependent transition maneuvers: on a matching (mode, from→to) gear change,
@@ -425,6 +427,15 @@ CONFIG_SCHEMA = cv.All(
             # natural HEAT_COOL handoff) and any re-engage from -1. ESPHome time format
             # (e.g. "60s", "90s", "1min"). Default 60s.
             cv.Optional(CONF_MODE_SWITCH_OFF, default="60s"): cv.positive_time_period_milliseconds,
+            # HEAT_COOL auto-changeover supervisor (2026-09-30): after mode_switch_idle_min at idle,
+            # the wrong-way room trend must be sustained over this window (net ≥ changeover_trend_min,
+            # no pullback > ~1 sensor step). Max 15 min = the on-device trend ring's reach.
+            cv.Optional(CONF_CHANGEOVER_TREND_WINDOW, default="10min"): cv.All(
+                cv.positive_time_period_milliseconds,
+                cv.Range(min=cv.TimePeriod(minutes=2), max=cv.TimePeriod(minutes=15)),
+            ),
+            # Minimum net wrong-way move across the window. "0.1F", "0.05C", or bare = °C.
+            cv.Optional(CONF_CHANGEOVER_TREND_MIN, default="0.1F"): validate_mode_switch_temp_offset,
             # Timed vane positioning (optional, no defaults → feature off if unset). On an
             # OFF→active start, wait <move_delay> then run the vane <interval> and stop, landing
             # it at a fixed mode-specific position. A mode runs only if BOTH its values are set.
@@ -635,6 +646,8 @@ async def to_code(config):
     cg.add(var.set_mode_switch_event_min(config[CONF_MODE_SWITCH_EVENT_MIN]))
     cg.add(var.set_mode_switch_temp_offset(config[CONF_MODE_SWITCH_TEMP_OFFSET]))
     cg.add(var.set_mode_switch_off_ms(config[CONF_MODE_SWITCH_OFF].total_milliseconds))
+    cg.add(var.set_changeover_trend_window_ms(config[CONF_CHANGEOVER_TREND_WINDOW].total_milliseconds))
+    cg.add(var.set_changeover_trend_min_c(config[CONF_CHANGEOVER_TREND_MIN]))
     cg.add(var.set_use_fahrenheit(config[CONF_USE_FAHRENHEIT]))
     cg.add(var.set_test_mode(config[CONF_TEST_MODE]))
 

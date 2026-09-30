@@ -138,8 +138,8 @@ static const uint32_t SETPOINT_SETTLE_MS = 2500;  // 2.5s
 // 2026-07-08 symmetric-1°F ladder. NOTE the two PINNED boundaries kept off the uniform grid:
 //   • start/stop (0↔1): compressor start/stop hysteresis; stop (H_DN_10=-0.15) stops heat 0.27°F
 //     below setpoint so the ~0.85°F post-stop run-on carry peaks near +0.6°F. (Was pinned on REAL
-//     diff for the 2026-04-13 heat→cool pong margin; the HEAT_COOL door moved to cool's engagement
-//     point on 2026-09-30 and 1→0 now runs on eff_diff like cool.)
+//     diff for the 2026-04-13 heat→cool pong margin; since 2026-09-30 the HEAT_COOL auto-changeover
+//     supervisor's sustained-trend gate rejects a run-on carry, and 1→0 runs on eff_diff like cool.)
 //   • idle (0→-1).
 
 // Cooling deadbands (diff = room - target, positive = hot)
@@ -1006,10 +1006,12 @@ void FurrionChillCube::setup() {
         drift_buf_count_ = 0;
         room_drift_cpm_ = NAN;
         arm_ring_reset_();  // same rule for the displacement ring: never measure travel across a gap
+        trend_ring_reset_();  // and for the changeover trend ring
       } else {
         inside_temp_c_ = inside_temp_fahrenheit_ ? (value - 32.0f) * (5.0f / 9.0f) : value;
         room_drift_cpm_ = update_room_drift_(cb_now);  // 3-min windowed slope (°C/min)
         arm_ring_record_(inside_temp_c_, cb_now);      // ~60-min displacement history (approach arming)
+        trend_ring_record_(inside_temp_c_, cb_now);    // ~17-min trend history (HEAT_COOL changeover)
       }
       this->current_temperature = inside_temp_c_;
       this->last_temp_update_ = cb_now;
@@ -1217,6 +1219,7 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 
     mode_changed = (new_mode != this->mode);
     this->mode = new_mode;
+    if (mode_changed) clear_mode_latch_();   // a HEAT_COOL changeover latch belongs to that mode only
 
     if (mode_changed) {
       // Abort an active IR override (clamped kickstart OR transition maneuver) only if the new
@@ -2574,6 +2577,8 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     arm_ring_reset_();  // unit ran itself during failsafe — its travel is machine-made, don't
                         // let the post-recovery warm-back arm approach off it (NaN path already
                         // resets via the callback; this covers the HA-disconnect/boot triggers)
+    trend_ring_reset_();  // same for the changeover trend — and the latch dies with the episode
+    clear_mode_latch_();
     idle_since_ = 0;
     last_active_mode_ = MODE_NONE;
     last_mode_event_at_ = 0;
@@ -2619,6 +2624,7 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     // Unit's setpoint is already near the desired target (dynamic setpoint).
     // After ~7 min with no CS, unit reverts to its own internal sensor.
     failsafe_active_ = true;
+    clear_mode_latch_();   // hands off — the latch dies with the controller's authority
     boot_ready_ = true;
     update_action_();
     // Publish from the post-teardown state (bug-check round 3): without this the debug sensors
@@ -2691,6 +2697,12 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
       do_cool = false;  // heat already engaged — stay in heat
     } else if (cool_gear_ >= 0) {
       do_heat = false;  // cool already engaged — stay in cool
+    } else if (latched_mode_ == MODE_HEAT) {
+      // Both OFF, but an auto-changeover latched heat (see changeover_ready_): heat's own from-OFF logic
+      // (pick / approach) runs even while the room is still between the setpoints.
+      do_cool = false;
+    } else if (latched_mode_ == MODE_COOL) {
+      do_heat = false;  // mirror — cool's approach can fire early on a sun-driven morning rise
     } else {
       // Both gears -1 (fully off). Pick based on temperature.
       if (room <= h_target) { do_cool = false; }
@@ -2738,6 +2750,86 @@ float FurrionChillCube::arm_rise_c_(uint32_t now) {
   }
   if (isnan(trough)) return NAN;
   return inside_temp_c_ - trough;
+}
+
+// ── HEAT_COOL auto-changeover supervisor (Stephen 2026-09-30) ───────────────────────────────
+// Standard auto-changeover structure (single-setpoint AUTO / changeover supervisor): the supervisor
+// picks the mode; the mode's own controller runs until the next changeover. Gates, all required:
+//   1. wrong side: room past the CURRENT mode's own setpoint by mode_switch_temp_offset_c_ (caller),
+//   2. delay: mode_switch_idle_ms_ since the mode went idle (or was latched while OFF) — longer than
+//      the heat compressor's 3.5–5 min run-on after gear 0,
+//   3. persistence + trend: the wrong-way move is sustained over the FOLLOWING changeover_window_ms_
+//      (net ≥ changeover_trend_min_c_, no pullback > TREND_PULLBACK_C) — a run-on overshoot peaks
+//      6–12 min after gear 0 and is falling back by the time the window opens (09-27..30 replay: 7/7
+//      blocked), while a sun-driven morning rise passes (09-28/29 replay: 12:19 / 12:22 at 68.1 °F),
+//   4. no own-mode approach predicted (caller).
+// DEEP backstop: once the room is also past the OTHER mode's setpoint by the offset, the trend
+// requirement relaxes to "not recovering" (net ≥ −TREND_PULLBACK_C) so a room that plateaus deep on
+// the wrong side can never lock the other mode out (the 2026-08-06 CRITICAL behind the old door).
+static const uint32_t TREND_SAMPLE_MS = 30000;    // trend ring cadence
+static constexpr float TREND_PULLBACK_C = 0.04f;  // ~1 cabin-sensor step (0.06 °F = 0.033 °C)
+
+// Recorded from the temp-sensor callback on its own millis() (armed outside the gear pass — the
+// millis-vs-now convention); read from the gear pass with its cached `now`, skipping samples newer
+// than that cache (the live inside_temp_c_ covers them).
+void FurrionChillCube::trend_ring_record_(float temp_c, uint32_t now) {
+  if (trend_ring_last_sample_ != 0 && (now - trend_ring_last_sample_) < TREND_SAMPLE_MS) return;
+  trend_ring_at_[trend_ring_head_] = now;
+  trend_ring_temp_[trend_ring_head_] = temp_c;
+  trend_ring_head_ = (uint8_t)((trend_ring_head_ + 1) % TREND_RING_N);
+  if (trend_ring_count_ < TREND_RING_N) trend_ring_count_++;
+  trend_ring_last_sample_ = now;
+}
+
+void FurrionChillCube::trend_ring_reset_() {
+  trend_ring_head_ = 0;
+  trend_ring_count_ = 0;
+  trend_ring_last_sample_ = 0;
+}
+
+// Wrong-way trend over the trailing changeover window, read as a step function (a quiet sensor holds
+// its value): baseline = the newest sample at or before the window start; then every in-window sample
+// in order; then the live reading. rising = the heat→cool direction. Fails CLOSED without a baseline
+// (boot / after a reset) — the mode just keeps idling until real history exists.
+bool FurrionChillCube::changeover_trend_ok_(bool rising, bool deep, uint32_t now) {
+  if (isnan(inside_temp_c_) || trend_ring_count_ == 0) return false;
+  const float s = rising ? 1.0f : -1.0f;   // project every reading onto the wrong-way axis
+  const uint32_t w = changeover_window_ms_;
+  bool have_base = false;
+  float base = 0.0f, extreme = 0.0f, pull = 0.0f;
+  for (uint8_t k = 0; k < trend_ring_count_; k++) {
+    uint8_t idx = (uint8_t)((trend_ring_head_ + TREND_RING_N - trend_ring_count_ + k) % TREND_RING_N);
+    uint32_t age = now - trend_ring_at_[idx];
+    if (age > 0x80000000u) break;            // recorded after this pass's cached now (chronological → rest too)
+    float v = s * trend_ring_temp_[idx];
+    if (age >= w) {                           // at/before the window start → candidate baseline
+      base = v;
+      extreme = v;
+      have_base = true;
+      continue;
+    }
+    if (!have_base) return false;             // ring doesn't reach back to the window start yet
+    if (v > extreme) extreme = v;
+    if (extreme - v > pull) pull = extreme - v;
+  }
+  if (!have_base) return false;
+  float live = s * inside_temp_c_;
+  if (live > extreme) extreme = live;
+  if (extreme - live > pull) pull = extreme - live;
+  float net = live - base;
+  if (deep) return net >= -TREND_PULLBACK_C;
+  return net >= changeover_trend_min_c_ && pull <= TREND_PULLBACK_C;
+}
+
+// Gates 2 + 3 (+ the deep backstop). `since` = idle_since_ for an idle mode, latched_at_ for a latched
+// mode that is still OFF. The trend window must lie entirely AFTER the delay: earliest handover at
+// delay + window (20 min at the defaults).
+bool FurrionChillCube::changeover_ready_(bool from_heat, float room, float other_target, uint32_t since,
+                                         uint32_t now) {
+  if (since == 0 || (now - since) < mode_switch_idle_ms_ + changeover_window_ms_) return false;
+  bool deep = from_heat ? (room > other_target + mode_switch_temp_offset_c_)
+                        : (room < other_target - mode_switch_temp_offset_c_);
+  return changeover_trend_ok_(from_heat, deep, now);
 }
 
 // Heat mirror: fall of the current room temp below the trailing-window peak. ⚠️ winter-unvalidated.
@@ -2901,6 +2993,11 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   }
   float diff = room - target;
   gear_diff = diff;  // debug always reports REAL (unbiased) diff
+  // HEAT_COOL auto-changeover supervisor inputs (see changeover_ready_). Cool is always available in
+  // HEAT_COOL; a NaN cool target degrades to the pure-HEAT behavior.
+  float co_other = get_cool_target_();
+  bool auto_co = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) && !isnan(co_other);
+  bool changeover_this_pass = false;
 
   // Setpoint-transition detector — SIGN-MIRROR of the cool one (see run_cool_mode_ for the full
   // rationale + accepted edges). Heat demand rises on a setpoint RAISE: preload bias_h_ with a
@@ -3078,6 +3175,15 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
                    new_gear);
         } else if (gear == -1) {
           new_gear = -1;                               // stays off
+          // Latched by a changeover but never engaged: the same supervisor can hand the latch back
+          // (no frames — the unit is already OFF). `since` = the latch time.
+          if (auto_co && latched_mode_ == MODE_HEAT && diff > mode_switch_temp_offset_c_ &&
+              changeover_ready_(true, room, co_other, latched_at_, now)) {
+            changeover_this_pass = true;
+            latched_mode_ = MODE_COOL;
+            latched_at_ = (now != 0) ? now : 1;
+            ESP_LOGI(TAG, "Changeover HEAT→COOL (latched, unit OFF): room %.2f, sustained rise — cool latched", room);
+          }
         } else if (user_input && diff > USER_TAP_OFF_MIN_PAST_C) {
           new_gear = -1;   // user tap FAR past setpoint → off (mirror; ⚠️ winter-unvalidated)
         } else {
@@ -3115,20 +3221,37 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
         bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
         bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
         bool past_setpoint = diff > mode_switch_temp_offset_c_;
+        bool approach = approach_predict_heat_(diff, now, approach_lead_ms_);
         // Natural-off gate — sign-mirror of the cool block (see run_cool_mode_ + incident
         // 2026-08-05 + NATURAL_OFF_BIAS_EPS_C): heat full-off waits for the heat integral to be
-        // unwound (no drift leg — Stephen 2026-08-06) — EXCEPT through the HEAT_COOL handoff door
-        // (room risen into cool's engagement territory; this mirror bites in shoulder-season
-        // mornings: sun lifts the room while bias_h_ is still wound and heat idle would otherwise
-        // lock cool out). ⚠️ winter-unvalidated, structurally symmetric only.
-        bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
-                              (room >= get_cool_target_() - mode_switch_temp_offset_c_);
-        // Frozen heat bias counts as unwound — mirror of the cool gate. ⚠️ winter-unvalidated.
+        // unwound (no drift leg — Stephen 2026-08-06). Frozen heat bias counts as unwound.
+        // HEAT_COOL (Stephen 2026-09-30): natural-off only OUTSIDE the interference zone — the room at
+        // least the offset short of the cool target (storage 60/76: off anywhere 61..75 °F). Inside the
+        // zone (67/69, same SP) heat idles indefinitely: an OFF there costs a clamped cold start, and
+        // the only road out is the auto-changeover below.
         bool bias_unwound = bias_h_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_h_at_ != 0;
-        bool natural_off = idle_enough && event_ok && past_setpoint &&
-                           (handoff_demand || bias_unwound) &&
-                           !approach_predict_heat_(diff, now, approach_lead_ms_);
-        if ((imm_off || natural_off) && diff > H_IDLE) new_gear = -1;
+        bool outside_zone = !auto_co || (room <= co_other - mode_switch_temp_offset_c_);
+        bool natural_off = idle_enough && event_ok && past_setpoint && bias_unwound && outside_zone &&
+                           !approach;
+        // Auto-changeover heat → cool (replaces the old handoff door at cool target − offset, which
+        // fired on the heat run-on carry every mild evening 09-27..30 with no bias requirement — the
+        // sustained-trend gate now does that job and still covers the shoulder-morning sun ramp).
+        bool changeover = auto_co && event_ok && past_setpoint && !approach &&
+                          changeover_ready_(true, room, co_other, idle_since_, now);
+        if (diff > H_IDLE) {
+          if (imm_off) {
+            new_gear = -1;
+          } else if (changeover) {
+            new_gear = -1;
+            changeover_this_pass = true;
+            latched_mode_ = MODE_COOL;
+            latched_at_ = (now != 0) ? now : 1;
+            ESP_LOGI(TAG, "Changeover HEAT→COOL: room %.2f diff %+.2f, sustained rise — heat OFF, cool latched",
+                     room, diff);
+          } else if (natural_off) {
+            new_gear = -1;
+          }
+        }
       } else {
         // Active gears 1..M: upshift on the rate-gated up_diff (colder crosses heat_up_[gear]);
         // every downshift, the 1→0 stop included, on eff_diff. Downshift trip = heat_stop_ (gear 1)
@@ -3143,8 +3266,9 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
           // 1→0 STOP on eff_diff since 2026-09-30 (mirror of cool): the integral centers the whole
           // ladder, stop included. Was REAL diff, pinned against the heat→cool pong (2026-04-13: the
           // ~0.85°F post-stop run-on carry had to land short of the HEAT_COOL door at cool target −
-          // 1°F); that door now opens only at cool's own engagement point (room > cool target +
-          // cool start), ≥ 1.46°C above heat target on the camper's 67/69 band.
+          // 1°F). The door is gone: the auto-changeover supervisor (changeover_ready_) needs a
+          // wrong-way trend sustained for a window that opens after the run-on has peaked, so a
+          // bias-lifted carry can't trigger a heat→cool pong.
           // The approach hold pins gear 1 above SP; the hold-maintenance block owns its exits.
           if (eff_diff > dn &&
               !(approach_hold_heat_ &&
@@ -3166,6 +3290,13 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   // Track off_since_ for the 1-min off lockout
   if (new_gear == -1 && gear != -1) {
     off_since_ = now;
+  }
+
+  // HEAT_COOL latch bookkeeping: engaging (gear pins arbitration now) or any non-changeover OFF
+  // (natural / user tap / boot) drops the latch → arbitration by setpoint as before.
+  if (new_gear != gear && !changeover_this_pass &&
+      ((gear == -1 && new_gear >= 0) || new_gear == -1)) {
+    clear_mode_latch_();
   }
 
   // Publish gear and compressor on change
@@ -3301,6 +3432,12 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   }
   float diff = room - target;
   gear_diff = diff;  // debug always reports REAL (unbiased) diff
+  // HEAT_COOL auto-changeover supervisor inputs (see changeover_ready_). Heat must be able to run: an
+  // outdoor lockout or a NaN heat target degrades to the pure-COOL behavior (cool can never idle
+  // forever waiting for a mode that can't engage).
+  float co_other = get_heat_target_();
+  bool auto_co = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) && !heater_locked_out_ && !isnan(co_other);
+  bool changeover_this_pass = false;
 
   // Setpoint-transition detector — standard name: REFERENCE FEEDFORWARD (two-degree-of-freedom
   // control / setpoint weighting; Åström & Hägglund). Compare the
@@ -3584,6 +3721,15 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
                    new_gear);
         } else if (gear == -1) {
           new_gear = -1;                               // stays off
+          // Latched by a changeover but never engaged: hand the latch back through the same supervisor
+          // (no frames — the unit is already OFF). Mirror of the heat site.
+          if (auto_co && latched_mode_ == MODE_COOL && diff < -mode_switch_temp_offset_c_ &&
+              changeover_ready_(false, room, co_other, latched_at_, now)) {
+            changeover_this_pass = true;
+            latched_mode_ = MODE_HEAT;
+            latched_at_ = (now != 0) ? now : 1;
+            ESP_LOGI(TAG, "Changeover COOL→HEAT (latched, unit OFF): room %.2f, sustained fall — heat latched", room);
+          }
         } else if (user_input && diff < -USER_TAP_OFF_MIN_PAST_C) {
           new_gear = -1;   // user tap FAR past setpoint → off (approach-covered by construction)
         } else {
@@ -3635,28 +3781,45 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
         bool idle_enough = (idle_since_ > 0) && (now - idle_since_ >= mode_switch_idle_ms_);
         bool event_ok = (last_mode_event_at_ == 0) || (now - last_mode_event_at_ >= mode_switch_event_ms_);
         bool past_setpoint = diff < -mode_switch_temp_offset_c_;
+        bool approach = approach_predict_cool_(diff, now, approach_lead_ms_);
         // Natural-off gate (incident 2026-08-05, see NATURAL_OFF_BIAS_EPS_C): full-off waits for
         // the integral to be unwound — a wound bias marks the sub-SP room as self-inflicted
         // integral lag; hold at idle while the τ=180 idle decay fades it. No drift leg (Stephen
         // 2026-08-06): a parked or even recovering room below SP−offset with an unwound bias goes
         // properly OFF. A negative bias (over-satisfied) also counts as unwound. imm_off and the
         // user-tap-past-SP door above are deliberately NOT gated.
-        // HEAT_COOL handoff door (bug-check 2026-08-06 CRITICAL): 0→−1 is the ONLY road to the
-        // other mode (arbitrate_mode_ pins do_heat while cool_gear_ >= 0), so when the room has
-        // fallen into heat's engagement territory the bias/drift legs MUST NOT stand in the way —
-        // else cool idles for hours (bias decay) or forever (room plateaus sub-floor) while the
-        // room goes arbitrarily cold with heat locked out. NaN heat target compares false → door
-        // stays closed in degenerate states.
-        bool handoff_demand = (this->mode == climate::CLIMATE_MODE_HEAT_COOL) &&
-                              (room <= get_heat_target_() + mode_switch_temp_offset_c_);
         // A raise-FROZEN bias counts as unwound (bug-check round 1): the freeze marks the sub-SP
         // room as user-inflicted (the raise), the bias is stored-not-live, and cooling below a
         // raised SP is pointless — go properly OFF; the OFF-entry approach handles re-entry.
+        // HEAT_COOL (Stephen 2026-09-30): natural-off only OUTSIDE the interference zone — the room at
+        // least the offset short of the heat target (storage 60/76: off anywhere 75..61 °F). Inside the
+        // zone cool idles indefinitely; the only road out is the auto-changeover below.
         bool bias_unwound = bias_c_ <= NATURAL_OFF_BIAS_EPS_C || raise_freeze_c_at_ != 0;
-        bool natural_off = idle_enough && event_ok && past_setpoint &&
-                           (handoff_demand || bias_unwound) &&
-                           !approach_predict_cool_(diff, now, approach_lead_ms_);
-        if ((imm_off || natural_off) && diff < C_IDLE) new_gear = -1;
+        bool outside_zone = !auto_co || (room >= co_other + mode_switch_temp_offset_c_);
+        bool natural_off = idle_enough && event_ok && past_setpoint && bias_unwound && outside_zone &&
+                           !approach;
+        // Auto-changeover cool → heat. Replaces the old HEAT_COOL handoff door (bug-check 2026-08-06
+        // CRITICAL: 0→−1 is the ONLY road to the other mode — arbitrate_mode_ pins do_heat while
+        // cool_gear_ >= 0 — so the bias legs must not stand in the way or cool idles forever while the
+        // room goes arbitrarily cold). The supervisor has no bias requirement, and its DEEP backstop
+        // (room past the heat target by the offset → trend only needs "not recovering") keeps a
+        // sub-floor plateau from locking heat out.
+        bool changeover = auto_co && event_ok && past_setpoint && !approach &&
+                          changeover_ready_(false, room, co_other, idle_since_, now);
+        if (diff < C_IDLE) {
+          if (imm_off) {
+            new_gear = -1;
+          } else if (changeover) {
+            new_gear = -1;
+            changeover_this_pass = true;
+            latched_mode_ = MODE_HEAT;
+            latched_at_ = (now != 0) ? now : 1;
+            ESP_LOGI(TAG, "Changeover COOL→HEAT: room %.2f diff %+.2f, sustained fall — cool OFF, heat latched",
+                     room, diff);
+          } else if (natural_off) {
+            new_gear = -1;
+          }
+        }
       } else {
         // Active gears 1..M select on eff_diff (= diff + adaptive bias + fan feedforward); upshifts
         // use the rate-gated up_diff. eff_diff == up_diff == diff when adaptive is off → bit-identical
@@ -3691,6 +3854,12 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // Track off_since_ for the 1-min off lockout
   if (new_gear == -1 && gear != -1) {
     off_since_ = now;
+  }
+
+  // HEAT_COOL latch bookkeeping — mirror of the heat pass.
+  if (new_gear != gear && !changeover_this_pass &&
+      ((gear == -1 && new_gear >= 0) || new_gear == -1)) {
+    clear_mode_latch_();
   }
 
   // Publish gear and compressor on change
@@ -3963,6 +4132,8 @@ void FurrionChillCube::set_test_mode(bool t) {
     // free, so it must not arm the approach displacement gate on exit. Same rule as the sensor-NaN
     // reset: never measure travel across a discontinuity. First fresh sample re-seeds the trough.
     arm_ring_reset_();
+    trend_ring_reset_();   // same rule for the changeover trend ring
+    clear_mode_latch_();   // HA's mode is re-pulled on exit; arbitration starts fresh
     ESP_LOGI(TAG, "TEST mode OFF — resuming production controller (will re-anchor next pass)");
   } else if (!test_mode_ && t) {
     script_gear_ = SCRIPT_NONE;    // regimes are exclusive — the frame harness wins when set last
@@ -3984,6 +4155,7 @@ void FurrionChillCube::set_test_mode(bool t) {
     approach_hold_from_off_ = false;
     approach_entry_drift_cpm_ = NAN;
     approach_entry_drift_at_ = 0;
+    clear_mode_latch_();           // a HEAT_COOL changeover latch never survives into a bench session
     // Gear passes stop while test_mode_ is set — publish the cleared freeze/holds now so the
     // debug sensors don't show phantom state for the whole bench session (bug-check round 3).
     publish_debug_state_(NAN);
@@ -4083,6 +4255,7 @@ void FurrionChillCube::enter_script_mode_() {
   stall_logged_h_ = false;
   script_off_logged_ = false;
   script_idle_logged_ = false;
+  clear_mode_latch_();                   // a script binds its own mode; the HEAT_COOL latch doesn't apply
   publish_debug_state_(NAN);             // clear phantom hold/freeze state on the debug sensors now
   ESP_LOGI(TAG, "SCRIPT mode ON — scripted gears replace the logic ladder; control ladder live");
 }
@@ -4117,6 +4290,8 @@ void FurrionChillCube::clear_script_gear() {
   resync_on_resume_ = true;   // item 7: re-evaluate from HA's live mode/SP and fire a full CS→Main→CS
   last_gear_run_ = 0;
   arm_ring_reset_();          // machine-made room travel must not arm the approach displacement gate
+  trend_ring_reset_();        // ...nor feed the HEAT_COOL changeover trend
+  clear_mode_latch_();
   ESP_LOGI(TAG, "SCRIPT mode OFF — production logic ladder resumes (bias-aware re-pick next pass)");
 }
 
@@ -4157,6 +4332,9 @@ void FurrionChillCube::dump_config() {
                          "none (fresh boot)";
   ESP_LOGCONFIG(TAG, "  Prior Mode: %s", mode_str);
   ESP_LOGCONFIG(TAG, "  Mode-switch off-dwell: %lus", (unsigned long)(mode_switch_off_ms_ / 1000));
+  ESP_LOGCONFIG(TAG, "  HEAT_COOL changeover: offset %.2fC, delay %lu min, trend window %lu min, min move %.3fC",
+                mode_switch_temp_offset_c_, (unsigned long)(mode_switch_idle_ms_ / 60000UL),
+                (unsigned long)(changeover_window_ms_ / 60000UL), changeover_trend_min_c_);
   ESP_LOGCONFIG(TAG, "  CS transmit interval: %lus (quirk %lus)",
                 (unsigned long)(cs_transmit_interval_ms_ / 1000),
                 (unsigned long)(quirk_transmit_interval_ms_ / 1000));

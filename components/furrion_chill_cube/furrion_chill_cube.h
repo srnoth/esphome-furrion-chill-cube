@@ -69,6 +69,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Off-dwell between active states (ms). Enforced on EVERY heat<->cool transition —
   // direct user mode change AND natural HEAT_COOL handoff — and on any re-engage from -1.
   void set_mode_switch_off_ms(uint32_t ms) { mode_switch_off_ms_ = ms; }
+  // HEAT_COOL auto-changeover supervisor (2026-09-30, see changeover_ready_): trailing window the
+  // wrong-way trend must be sustained over, and the minimum net move across it (°C).
+  void set_changeover_trend_window_ms(uint32_t ms) { changeover_window_ms_ = ms; }
+  void set_changeover_trend_min_c(float c) { changeover_trend_min_c_ = c; }
   void set_use_fahrenheit(bool enable) { use_fahrenheit_ = enable; }
 
   // Configurable gear tables (gear number → °C CS offset from setpoint anchor + optional
@@ -328,6 +332,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   void arm_ring_reset_();
   float arm_rise_c_(uint32_t now);   // current − windowed trough (NAN until history exists)
   float arm_fall_c_(uint32_t now);   // windowed peak − current (heat mirror)
+  // HEAT_COOL auto-changeover supervisor (2026-09-30). See the member block + changeover_ready_.
+  void trend_ring_record_(float temp_c, uint32_t now);
+  void trend_ring_reset_();
+  bool changeover_trend_ok_(bool rising, bool deep, uint32_t now);
+  bool changeover_ready_(bool from_heat, float room, float other_target, uint32_t since, uint32_t now);
+  void clear_mode_latch_() { latched_mode_ = MODE_NONE; latched_at_ = 0; }
   // Phase 2 adaptive (heat): mirror of the cool integral with inverted sign (heat demand = -diff).
   // Advances bias_h_ with anti-windup and returns eff_diff (real_diff - bias_h_); more-negative
   // eff selects a higher heat gear. Returns real_diff unchanged when adaptive is disabled. Must be
@@ -483,6 +493,15 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint32_t mode_switch_event_ms_{1200000};  // 20 min since last fresh start
   float mode_switch_temp_offset_c_{0.556f}; // room must be this far past setpoint (°C delta)
   uint32_t mode_switch_off_ms_{60000};      // 1 min minimum in -1 before fresh start
+  // HEAT_COOL auto-changeover supervisor (Stephen 2026-09-30). A mode in charge that is idle (or
+  // latched and still OFF) hands over to the other mode only when the room is past ITS OWN setpoint
+  // by mode_switch_temp_offset_c_, after mode_switch_idle_ms_, with the wrong-way trend sustained
+  // over changeover_window_ms_. The new mode is LATCHED so its own from-OFF logic (pick / approach)
+  // runs even while the room is still between the setpoints. latched_mode_ uses ActiveMode.
+  uint32_t changeover_window_ms_{600000};   // 10 min trend window
+  float changeover_trend_min_c_{0.0556f};   // 0.1 °F minimum net wrong-way move over the window
+  uint8_t latched_mode_{0};                 // MODE_NONE / MODE_HEAT / MODE_COOL
+  uint32_t latched_at_{0};                  // millis() the latch was set (changeover time gate)
   uint32_t last_mode_event_at_{0};  // last mode switch or fresh start (time-based lockout)
   uint32_t ha_disconnect_time_{0};
   uint32_t temp_nan_since_{0};
@@ -738,6 +757,15 @@ class FurrionChillCube : public climate::Climate, public Component {
   uint8_t  arm_ring_head_{0};            // next write slot
   uint8_t  arm_ring_count_{0};           // valid samples currently in the ring
   uint32_t arm_ring_last_sample_{0};     // millis() of last recorded sample (0 = none yet)
+  // Changeover trend ring (2026-09-30): inside °C at a 30 s cadence, 34 slots ≈ 17 min — covers the
+  // trend window (schema max 15 min) plus a baseline sample at or before its start. Read as a step
+  // function (a quiet sensor holds its last value). Reset on sensor gaps / machine-made travel.
+  static constexpr uint8_t TREND_RING_N = 34;
+  uint32_t trend_ring_at_[TREND_RING_N] = {0};
+  float    trend_ring_temp_[TREND_RING_N] = {0};
+  uint8_t  trend_ring_head_{0};
+  uint8_t  trend_ring_count_{0};
+  uint32_t trend_ring_last_sample_{0};
   // Room-drift estimator: ring buffer of recent (timestamp ms, inside °C) samples for the
   // trailing-window slope (see DRIFT_WINDOW_MS in the .cpp). Sized to hold ~6 min at normal cadence.
   static constexpr uint8_t DRIFT_BUF_N = 48;

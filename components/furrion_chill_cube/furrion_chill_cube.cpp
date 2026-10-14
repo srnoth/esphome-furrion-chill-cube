@@ -1081,9 +1081,18 @@ void FurrionChillCube::loop() {
   // Self-clock on millis() (NOT loop's cached `now`): setpoint_pending_since_ is armed in
   // control(), outside the loop-`now` context, so per reference_furrion_millis_now_footgun a
   // timer armed from a callback must compare against its own clock to avoid any underflow.
+  // Only a change to the RUNNING side's target is a user event for the gear pass (2026-10-14: a
+  // HEAT_COOL heat-SP tap 70→69 while cooling at g2 with the room at SP re-ran the cool user-event
+  // pick on the real diff, collapsed g2→0 and cost a +0.8°F overrun). A tap on the idle side, or a
+  // net-zero tap pair, commits nothing: the wire setpoint is keyed on the running side and is
+  // unchanged, and the changeover supervisor reads the other SP on the next routine pass.
   if (setpoint_pending_ && (millis() - setpoint_pending_since_) >= SETPOINT_SETTLE_MS) {
     setpoint_pending_ = false;
-    user_changed_ = true;
+    if (setpoint_commit_moves_running_side_()) {
+      user_changed_ = true;
+    } else {
+      ESP_LOGI(TAG, "Setpoint commit: running side's target unchanged — no gear re-pick");
+    }
   }
 
   // 2. Run gear controller if triggered. Not blocked by an active override (clamped kickstart or
@@ -1202,6 +1211,10 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   // inactive endpoint (low in cool mode, high in heat mode).
   bool mode_changed = false;
   bool temp_changed = false;
+  // Pre-call targets: the baseline a new debounce episode compares its commit against.
+  const float pre_target = this->target_temperature;
+  const float pre_low = this->target_temperature_low;
+  const float pre_high = this->target_temperature_high;
 
   if (call.get_mode().has_value()) {
     auto new_mode = *call.get_mode();
@@ -1336,6 +1349,12 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
     this->user_changed_ = true;
     this->setpoint_pending_ = false;  // flush: the immediate run handles the current target
   } else if (temp_changed) {
+    if (!this->setpoint_pending_) {
+      // First change of a new episode: snapshot the targets it started from.
+      this->sp_base_target_ = pre_target;
+      this->sp_base_low_ = pre_low;
+      this->sp_base_high_ = pre_high;
+    }
     this->setpoint_pending_ = true;
     this->setpoint_pending_since_ = millis();
   }
@@ -1345,6 +1364,22 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
 // ============================================================
 // Helpers
 // ============================================================
+
+// Settle-commit relevance (loop 1b). Keyed on active_ir_mode_ — the same key the wire setpoint uses
+// (get_active_ir_target_) — so a commit judged irrelevant never owes a transmit. Unit OFF (or no
+// baseline): any target change counts, as before. The single-mode target_temperature is included
+// for the matching single mode only.
+bool FurrionChillCube::setpoint_commit_moves_running_side_() {
+  auto moved = [](float now_v, float base_v) { return isnan(base_v) || now_v != base_v; };
+  bool single_moved = moved(this->target_temperature, sp_base_target_);
+  bool low_moved = moved(this->target_temperature_low, sp_base_low_);
+  bool high_moved = moved(this->target_temperature_high, sp_base_high_);
+  if (active_ir_mode_ == climate::CLIMATE_MODE_COOL)
+    return high_moved || (this->mode == climate::CLIMATE_MODE_COOL && single_moved);
+  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT)
+    return low_moved || (this->mode == climate::CLIMATE_MODE_HEAT && single_moved);
+  return single_moved || low_moved || high_moved;
+}
 
 float FurrionChillCube::get_heat_target_() {
   return this->target_temperature_low;

@@ -637,6 +637,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   // (sets user_changed_) once SETPOINT_SETTLE_MS of steady state has elapsed.
   bool setpoint_pending_{false};
   uint32_t setpoint_pending_since_{0};
+  // Targets as they stood when the current debounce episode armed. The commit re-picks the gear only
+  // if the RUNNING side's target differs from these (setpoint_commit_moves_running_side_()).
+  float sp_base_target_{NAN};
+  float sp_base_low_{NAN};
+  float sp_base_high_{NAN};
+  bool setpoint_commit_moves_running_side_();
 
   // Phase 2 adaptive equilibrium-gear controller (cool mode) — see PHASE2_ADAPTIVE_DESIGN.md
   bool adaptive_enable_{false};          // master switch (set true via YAML on the phase2 branch)

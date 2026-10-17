@@ -1781,6 +1781,18 @@ int FurrionChillCube::compute_setpoint_c_(bool is_heat) {
   float target_c = is_heat ? get_heat_target_() : get_cool_target_();
   if (isnan(target_c)) return 22;  // safe default
   int rounded = (int)roundf(target_c);
+  if (is_heat && use_fahrenheit_) {
+    // F-protocol heat: anchor on the unit's own setpoint, rounded DOWN. The unit holds the °F byte
+    // as a 0.5 °C setpoint and compares it with the whole-°C CS, so a half-degree setpoint acts
+    // like the °C above it in cool and the °C below it in heat. 69°F = 20.5 °C: roundf gave 21,
+    // the unit heats as if SP = 20 → the heat ladder sat one °C warm (g1 CS 22 = hold band, never
+    // starts from idle; g2 ran at g1 output — 2026-10-16). Cool keeps roundf (= round-up there,
+    // cool sweep 2026-05-17). Same °F derivation as the wire byte in transmit_mode_command_().
+    int tf = (int) roundf(target_c * 1.8f + 32.0f);
+    tf = std::max(FURRION_MIN_TEMP_F, std::min(FURRION_MAX_TEMP_F, tf));
+    int half_c = (int) roundf((tf - 32) / 1.8f * 2.0f);   // unit setpoint in 0.5 °C steps
+    rounded = half_c / 2;                                  // floor (positive)
+  }
   return std::max(FURRION_MIN_TEMP_C, std::min(FURRION_MAX_TEMP_C, rounded));
 }
 

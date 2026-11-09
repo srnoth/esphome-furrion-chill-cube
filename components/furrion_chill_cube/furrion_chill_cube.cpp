@@ -1063,60 +1063,9 @@ void FurrionChillCube::setup() {
       if (this->adaptive_enable_) this->temp_dirty_ = true;
     });
   }
-  // Load shed input. Every change prompts a gear pass. Unknown until the first HA report (see the
-  // bounded boot wait in run_power_and_shed_).
-  if (load_shed_sensor_) {
-    load_shed_sensor_->add_on_state_callback([this](bool on) {
-      bool first = !this->shed_known_;
-      this->shed_known_ = true;
-      if (!first && on == this->shed_req_) return;
-      this->shed_req_ = on;
-      ESP_LOGI(TAG, "Load shed input %s%s", on ? "ON" : "OFF", first ? " (first report)" : "");
-      this->temp_dirty_ = true;
-    });
-  }
-  // Unit power input. The first report after boot only initialises: a reboot is never an outage (an OFF
-  // first report starts the loss timer — the unit really is unpowered now). Later edges: OFF arms the
-  // power_loss_ms_ confirmation (update_power_state_); ON after a CONFIRMED loss = restore → immediate
-  // gear pass + the display timer; ON before confirmation = a short dip, ignored. HA's
-  // unavailable/unknown never reaches here (the homeassistant platform drops them).
-  if (unit_power_sensor_) {
-    unit_power_sensor_->add_on_state_callback([this](bool on) {
-      uint32_t t = millis();
-      if (!this->power_known_) {
-        this->power_known_ = true;
-        this->power_raw_ = on;
-        if (!on) {
-          this->power_false_at_ = t;
-          this->power_loss_at_boot_ = true;
-          ESP_LOGW(TAG, "Unit power: first report OFF — confirming outage");
-        } else {
-          ESP_LOGI(TAG, "Unit power: first report ON (initial state, not an edge)");
-        }
-        return;
-      }
-      if (on == this->power_raw_) return;
-      this->power_raw_ = on;
-      if (!on) {
-        this->power_false_at_ = t;
-        ESP_LOGW(TAG, "Unit power: OFF — confirming (%lums)", (unsigned long) this->power_loss_ms_);
-        return;
-      }
-      uint32_t off_ms = t - this->power_false_at_;
-      if (!this->power_lost_) {
-        ESP_LOGI(TAG, "Unit power: back after %lums (< threshold) — ignored", (unsigned long) off_ms);
-        return;
-      }
-      this->power_lost_ = false;
-      this->power_restore_pending_ = true;
-      this->temp_dirty_ = true;
-      ESP_LOGW(TAG, "Unit power: RESTORED after %lus — re-commanding from OFF", (unsigned long) (off_ms / 1000));
-      if (this->display_off_sensor_ != nullptr) {
-        this->display_off_pending_ = true;
-        this->display_off_at_ = t;
-      }
-    });
-  }
+  // Load shed / unit power / display inputs are POLLED in loop() (update_power_state_), not callback-
+  // driven: ESPHome binary sensors default to trigger_on_initial_state = false, so a state callback never
+  // sees the first report after boot — exactly the one that must initialise without being an edge.
 
   if (outside_temp_sensor_) {
     outside_temp_sensor_->add_on_state_callback([this](float value) {
@@ -2535,11 +2484,56 @@ void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
 // Unit power / load shed (2026-11-09) — see set_load_shed_sensor in the header
 // ============================================================
 
-// Every loop, every regime. Self-clocked on millis(): power_false_at_ / display_off_at_ are stamped in
-// the sensor callback (reference_furrion_millis_now_footgun).
+// Every loop, every regime. Polls the inputs (see setup) and runs the self-clocked outage confirmation
+// + display timer on millis() (reference_furrion_millis_now_footgun). Every input change prompts a gear
+// pass. HA's unavailable/unknown never reach the sensors (the homeassistant platform drops them).
 void FurrionChillCube::update_power_state_() {
-  if (unit_power_sensor_ == nullptr) return;
   uint32_t now = millis();
+  if (load_shed_sensor_ != nullptr && load_shed_sensor_->has_state()) {
+    bool on = load_shed_sensor_->state;
+    if (!shed_known_ || on != shed_req_) {
+      ESP_LOGI(TAG, "Load shed input %s%s", on ? "ON" : "OFF", shed_known_ ? "" : " (first report)");
+      shed_known_ = true;
+      shed_req_ = on;
+      temp_dirty_ = true;
+    }
+  }
+  if (unit_power_sensor_ == nullptr) return;
+  if (unit_power_sensor_->has_state()) {
+    bool on = unit_power_sensor_->state;
+    if (!power_known_) {
+      // First report after boot: initialise only — a reboot is never an outage. OFF = the unit really is
+      // unpowered now: start the confirmation (its pre-outage side is unknown).
+      power_known_ = true;
+      power_raw_ = on;
+      if (!on) {
+        power_false_at_ = now;
+        power_loss_at_boot_ = true;
+        ESP_LOGW(TAG, "Unit power: first report OFF — confirming outage");
+      } else {
+        ESP_LOGI(TAG, "Unit power: first report ON (initial state, not an edge)");
+      }
+    } else if (on != power_raw_) {
+      power_raw_ = on;
+      if (!on) {
+        power_false_at_ = now;
+        ESP_LOGW(TAG, "Unit power: OFF — confirming (%lums)", (unsigned long) power_loss_ms_);
+      } else if (!power_lost_) {
+        ESP_LOGI(TAG, "Unit power: back after %lums (< threshold) — ignored",
+                 (unsigned long) (now - power_false_at_));
+      } else {
+        power_lost_ = false;
+        power_restore_pending_ = true;
+        temp_dirty_ = true;
+        ESP_LOGW(TAG, "Unit power: RESTORED after %lus — re-commanding from OFF",
+                 (unsigned long) ((now - power_false_at_) / 1000));
+        if (display_off_sensor_ != nullptr) {
+          display_off_pending_ = true;
+          display_off_at_ = now;
+        }
+      }
+    }
+  }
   if (power_known_ && !power_raw_ && !power_lost_ && (now - power_false_at_) >= power_loss_ms_) {
     power_lost_ = true;
     power_down_applied_ = false;     // the next gear pass runs the teardown
@@ -2551,7 +2545,8 @@ void FurrionChillCube::update_power_state_() {
   }
   if (display_off_pending_ && (now - display_off_at_) >= display_off_delay_ms_) {
     display_off_pending_ = false;
-    if (power_raw_ && !power_lost_ && display_off_sensor_ != nullptr && display_off_sensor_->state) {
+    if (power_raw_ && !power_lost_ && display_off_sensor_ != nullptr && display_off_sensor_->has_state() &&
+        display_off_sensor_->state) {
       ESP_LOGI(TAG, "Power restore: display toggle (unit powers up with the display lit)");
       send_display_toggle();
     } else {

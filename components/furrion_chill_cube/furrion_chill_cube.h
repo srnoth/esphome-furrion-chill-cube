@@ -489,8 +489,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Phase 2 adaptive input
   binary_sensor::BinarySensor *vent_fan_sensor_{nullptr};
 
-  // Unit power / load shed / display-off inputs + state (2026-11-09). Callback-armed timers self-clock
-  // on millis() (reference_furrion_millis_now_footgun).
+  // Unit power / load shed / display-off inputs + state (2026-11-09). Polled every loop (update_power_state_);
+  // timers self-clock on millis() (reference_furrion_millis_now_footgun).
   binary_sensor::BinarySensor *load_shed_sensor_{nullptr};
   binary_sensor::BinarySensor *unit_power_sensor_{nullptr};
   binary_sensor::BinarySensor *display_off_sensor_{nullptr};

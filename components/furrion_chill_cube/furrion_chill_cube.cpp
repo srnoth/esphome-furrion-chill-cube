@@ -3093,6 +3093,15 @@ void FurrionChillCube::apply_aux_heat_gate_(float room, uint32_t now, bool &do_c
     clear_mode_latch_();
     ESP_LOGI(TAG, "Aux heat running — HEAT_COOL cool latch dropped");
   }
+  // This unit has its own heat side (HEAT_COOL, not outdoor-locked, heat target set): the native changeover
+  // supervisor owns heat↔cool. The aux latch only stands in for a missing heat side (COOL-only), so drop it
+  // here — otherwise a recent aux run could hold cool after the supervisor already latched cool (unit OFF,
+  // neither mode running). A running aux heater still blocks cool below.
+  if (aux_latched_ && this->mode == climate::CLIMATE_MODE_HEAT_COOL && !heater_locked_out_ &&
+      !isnan(get_heat_target_())) {
+    aux_latched_ = false;
+    ESP_LOGI(TAG, "Aux heat latch cleared — HEAT_COOL with own heat side (native changeover owns it)");
+  }
   if (!do_cool) return;
   if (aux_running_) {
     do_cool = false;

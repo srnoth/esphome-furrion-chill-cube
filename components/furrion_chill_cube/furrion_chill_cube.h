@@ -198,7 +198,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   //         target by mode_switch_temp_offset, aux off ≥ mode_switch_idle + changeover_trend_window, and a
   //         sustained rise (deep backstop: room past the cool target by the offset). Then cool runs as usual.
   // The heat side is untouched. In HEAT_COOL a cool latch is dropped while the aux runs (arbitration then
-  // picks heat by temperature). First report after boot: ON = latched; OFF = no latch, so a summer COOL
+  // picks heat by temperature), and the aux latch itself is cleared whenever this unit has its own heat side
+  // (HEAT_COOL, not outdoor-locked) — the native changeover supervisor owns heat↔cool there. First report after boot: ON = latched; OFF = no latch, so a summer COOL
   // with the aux heaters idle behaves exactly as before. Left out = feature off.
   void set_aux_heat_sensor(binary_sensor::BinarySensor *s) { aux_heat_sensor_ = s; }
 

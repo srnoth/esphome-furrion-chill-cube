@@ -410,8 +410,13 @@ void FurrionChillCube::set_active_ir_mode_(climate::ClimateMode mode) {
   climate::ClimateMode prev = active_ir_mode_;
   if (prev == mode) return;
   active_ir_mode_ = mode;
+  // FAN_ONLY reaches this setter only from a load shed (the bench harness assigns active_ir_mode_
+  // directly), so it is the shed's fan-only: persist it as 3 (resume cool) / 4 (resume heat) so a reboot
+  // mid-shed still knows the unit is running fan-only. Older firmware reads 3/4 as "nothing saved".
+  shed_fan_only_ = (mode == climate::CLIMATE_MODE_FAN_ONLY);
   uint8_t m = (mode == climate::CLIMATE_MODE_HEAT) ? 1 :
-              (mode == climate::CLIMATE_MODE_COOL) ? 2 : 0;
+              (mode == climate::CLIMATE_MODE_COOL) ? 2 :
+              (mode == climate::CLIMATE_MODE_FAN_ONLY) ? (shed_resume_heat_ ? 4 : 3) : 0;
   mode_pref_.save(&m);
 
   // Timed vane positioning hook. The ONLY known vane anchor is the unit's power-on
@@ -538,7 +543,9 @@ bool FurrionChillCube::transmit_mode_command_() {
   // always allowed. A transient gap is harmless (the unit coasts); a gap longer
   // than the unit's ~7-min CS-mode timeout hands control back to its internal
   // controller. See project_failover_invariant.
-  if (!test_mode_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF && isnan(get_active_ir_target_())) {
+  // FAN_ONLY (load shed) carries no setpoint either (0x0E) — exempt like OFF.
+  if (!test_mode_ && active_ir_mode_ != climate::CLIMATE_MODE_OFF &&
+      active_ir_mode_ != climate::CLIMATE_MODE_FAN_ONLY && isnan(get_active_ir_target_())) {
     return false;
   }
 
@@ -577,8 +584,8 @@ bool FurrionChillCube::transmit_mode_command_() {
   }
   // Record the °C anchor actually put on the wire (both protocols ride furrion_setpoint_c_ as
   // the anchor). This is the baseline update_furrion_setpoint_() diffs against for sp_changed.
-  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) {
-    last_tx_setpoint_c_ = furrion_setpoint_c_;
+  if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && active_ir_mode_ != climate::CLIMATE_MODE_FAN_ONLY) {
+    last_tx_setpoint_c_ = furrion_setpoint_c_;   // (a fan-only frame carries no setpoint)
   }
 
   // Fan speed — Midea board percent (captured byte-exact from a Midea U-shape remote 2026-09-02;
@@ -678,6 +685,8 @@ bool FurrionChillCube::transmit_mode_command_() {
   // transmit_mode_with_cs_), so this is the single point that keeps last_tx_fan_ current — which
   // maybe_apply_gear_fan_() diffs against to decide whether a per-gear fan change needs a new frame.
   last_tx_fan_ = (active_ir_mode_ == climate::CLIMATE_MODE_OFF) ? -1 : fan;
+  // A main frame puts the unit back under the controller's model (failsafe hand-off over).
+  if (!failsafe_fan_release_tx_) self_run_side_ = MODE_NONE;
 
   // Arm the one-shot reinforcement (fired in loop() step 3d): re-send this frame once,
   // mode_resend_delay_ms_ later (0 = disabled). Any newer mode frame re-arms, so the
@@ -847,6 +856,10 @@ void FurrionChillCube::send_probe_6byte(uint8_t code) {
 }
 
 void FurrionChillCube::resync_ir_state() {
+  if (power_lost_) {
+    ESP_LOGI(TAG, "Resync: skipped (unit has no power)");
+    return;
+  }
   if (failsafe_active_) {
     ESP_LOGI(TAG, "Resync: skipped (failsafe active — unit runs on its own sensor)");
     return;
@@ -905,7 +918,25 @@ void FurrionChillCube::setup() {
   // Gear + adaptive bias, saved by save_gear_pref_() at the end of every gear pass.
   gear_pref_ = global_preferences->make_preference<GearPrefData>(this->get_object_id_hash() ^ 0x47454152);
   uint8_t saved_mode = 0;
-  if (mode_pref_.load(&saved_mode) && (saved_mode == 1 || saved_mode == 2)) {
+  bool have_mode = mode_pref_.load(&saved_mode);
+  if (have_mode && (saved_mode == 3 || saved_mode == 4)) {
+    // Rebooted during a load shed: the unit is running fan-only (compressor off) — model exactly that,
+    // so the shed carries on without a frame (a reboot must not touch the unit) and a shed that ended
+    // during the reboot resumes through the normal FAN_ONLY → mode start. Gears −1: no compressor.
+    active_ir_mode_ = climate::CLIMATE_MODE_FAN_ONLY;
+    shed_fan_only_ = true;
+    shed_resume_heat_ = (saved_mode == 4);
+    heat_gear_ = -1;
+    cool_gear_ = -1;
+    last_active_mode_ = shed_resume_heat_ ? MODE_HEAT : MODE_COOL;
+    furrion_setpoint_c_ = compute_setpoint_c_(shed_resume_heat_);
+    last_tx_setpoint_c_ = furrion_setpoint_c_;
+    current_cs_ = furrion_setpoint_c_;
+    last_tx_fan_ = shed_fan_;
+    boot_ready_ = true;
+    ESP_LOGI(TAG, "Restored prior mode: FAN_ONLY (load shed, resumes %s) — no frame",
+             shed_resume_heat_ ? "HEAT" : "COOL");
+  } else if (have_mode && (saved_mode == 1 || saved_mode == 2)) {
     bool is_heat = (saved_mode == 1);
     // The saved gear is the unit's true state only on a WARM reset (ESP-only reboot:
     // the Furrion kept power and is still at the last commanded gear CS) — resume
@@ -1032,6 +1063,61 @@ void FurrionChillCube::setup() {
       if (this->adaptive_enable_) this->temp_dirty_ = true;
     });
   }
+  // Load shed input. Every change prompts a gear pass. Unknown until the first HA report (see the
+  // bounded boot wait in run_power_and_shed_).
+  if (load_shed_sensor_) {
+    load_shed_sensor_->add_on_state_callback([this](bool on) {
+      bool first = !this->shed_known_;
+      this->shed_known_ = true;
+      if (!first && on == this->shed_req_) return;
+      this->shed_req_ = on;
+      ESP_LOGI(TAG, "Load shed input %s%s", on ? "ON" : "OFF", first ? " (first report)" : "");
+      this->temp_dirty_ = true;
+    });
+  }
+  // Unit power input. The first report after boot only initialises: a reboot is never an outage (an OFF
+  // first report starts the loss timer — the unit really is unpowered now). Later edges: OFF arms the
+  // power_loss_ms_ confirmation (update_power_state_); ON after a CONFIRMED loss = restore → immediate
+  // gear pass + the display timer; ON before confirmation = a short dip, ignored. HA's
+  // unavailable/unknown never reaches here (the homeassistant platform drops them).
+  if (unit_power_sensor_) {
+    unit_power_sensor_->add_on_state_callback([this](bool on) {
+      uint32_t t = millis();
+      if (!this->power_known_) {
+        this->power_known_ = true;
+        this->power_raw_ = on;
+        if (!on) {
+          this->power_false_at_ = t;
+          this->power_loss_at_boot_ = true;
+          ESP_LOGW(TAG, "Unit power: first report OFF — confirming outage");
+        } else {
+          ESP_LOGI(TAG, "Unit power: first report ON (initial state, not an edge)");
+        }
+        return;
+      }
+      if (on == this->power_raw_) return;
+      this->power_raw_ = on;
+      if (!on) {
+        this->power_false_at_ = t;
+        ESP_LOGW(TAG, "Unit power: OFF — confirming (%lums)", (unsigned long) this->power_loss_ms_);
+        return;
+      }
+      uint32_t off_ms = t - this->power_false_at_;
+      if (!this->power_lost_) {
+        ESP_LOGI(TAG, "Unit power: back after %lums (< threshold) — ignored", (unsigned long) off_ms);
+        return;
+      }
+      this->power_lost_ = false;
+      this->power_restore_pending_ = true;
+      this->temp_dirty_ = true;
+      ESP_LOGW(TAG, "Unit power: RESTORED after %lus — re-commanding from OFF", (unsigned long) (off_ms / 1000));
+      if (this->display_off_sensor_ != nullptr) {
+        this->display_off_pending_ = true;
+        this->display_off_at_ = t;
+      }
+    });
+  }
+
   if (outside_temp_sensor_) {
     outside_temp_sensor_->add_on_state_callback([this](float value) {
       if (isnan(value)) {
@@ -1058,6 +1144,10 @@ void FurrionChillCube::setup() {
 
 void FurrionChillCube::loop() {
   uint32_t now = millis();
+
+  // 0. Unit power: confirm an outage after power_loss_ms_ and fire the post-outage display toggle.
+  // Runs in every regime (test mode included) — the teardown/re-command itself happens in the gear pass.
+  update_power_state_();
 
   // Bench test harness: while test_mode_ is set the production controller is fully inert —
   // no gear pass, kickstart, maneuver, vane, or heartbeat. The unit is driven ONLY by the
@@ -1878,6 +1968,8 @@ int FurrionChillCube::get_effective_fan_mode_() {
   if (failsafe_fan_release_tx_) return FAN_AUTO;
   // 1. Bench-test operator override.
   if (test_mode_ && test_fan_ >= 0) return test_fan_;
+  // 1b. Load shed: the fan-only hold runs at load_shed_fan.
+  if (!test_mode_ && active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY && shed_fan_only_) return shed_fan_;
   // 2. An active maneuver's via_fan (e.g. the heat OFF→gear clamp) overrides all. end_maneuver_
   //    clears maneuver_phase_ BEFORE calling apply_gear_frames_, so the release frames pick up the
   //    settled gear's fan below rather than the maneuver's via_fan.
@@ -2009,6 +2101,10 @@ void FurrionChillCube::update_action_() {
   climate::ClimateAction action;
   if (this->mode == climate::CLIMATE_MODE_OFF) {
     action = climate::CLIMATE_ACTION_OFF;
+  } else if (power_lost_) {
+    action = climate::CLIMATE_ACTION_OFF;       // no power: not heating/cooling, whatever the mode says
+  } else if (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY && shed_fan_only_) {
+    action = climate::CLIMATE_ACTION_FAN;       // load shed: fan-only hold
   } else if (heat_gear_ >= 1) {
     action = climate::CLIMATE_ACTION_HEATING;
   } else if (cool_gear_ >= 1) {
@@ -2436,6 +2532,177 @@ void FurrionChillCube::force_off_for_mode_switch_(uint32_t now) {
 }
 
 // ============================================================
+// Unit power / load shed (2026-11-09) — see set_load_shed_sensor in the header
+// ============================================================
+
+// Every loop, every regime. Self-clocked on millis(): power_false_at_ / display_off_at_ are stamped in
+// the sensor callback (reference_furrion_millis_now_footgun).
+void FurrionChillCube::update_power_state_() {
+  if (unit_power_sensor_ == nullptr) return;
+  uint32_t now = millis();
+  if (power_known_ && !power_raw_ && !power_lost_ && (now - power_false_at_) >= power_loss_ms_) {
+    power_lost_ = true;
+    power_down_applied_ = false;     // the next gear pass runs the teardown
+    power_restore_pending_ = false;  // a new outage supersedes an unfinished restore
+    display_off_pending_ = false;
+    temp_dirty_ = true;
+    ESP_LOGW(TAG, "Unit power: OUTAGE confirmed (off >= %lums) — controller stands down",
+             (unsigned long) power_loss_ms_);
+  }
+  if (display_off_pending_ && (now - display_off_at_) >= display_off_delay_ms_) {
+    display_off_pending_ = false;
+    if (power_raw_ && !power_lost_ && display_off_sensor_ != nullptr && display_off_sensor_->state) {
+      ESP_LOGI(TAG, "Power restore: display toggle (unit powers up with the display lit)");
+      send_display_toggle();
+    } else {
+      ESP_LOGI(TAG, "Power restore: display toggle skipped (%s)",
+               (!power_raw_ || power_lost_) ? "power dropped again" : "display-off option is off");
+    }
+  }
+}
+
+// Side (ActiveMode) the unit is physically running, best knowledge: the wire mode; a shed fan-only unit
+// = its resume side; a unit failsafe handed to its own thermostat; or, on the first pass after an
+// outage, the side it ran before the loss (it restarts in that EEPROM mode; 3 = unknown).
+uint8_t FurrionChillCube::unit_on_side_() {
+  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) return MODE_HEAT;
+  if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) return MODE_COOL;
+  if (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY) return shed_resume_heat_ ? MODE_HEAT : MODE_COOL;
+  if (self_run_side_ != MODE_NONE) return self_run_side_;
+  if (power_restore_pending_) return power_loss_side_;
+  return MODE_NONE;
+}
+
+// Shared outage / shed teardown — the episode is SUSPENDED, exactly like a user OFF: positive biases
+// parked (the first pass back applies the elapsed τ decay), negative / near-zero ones zeroed, SP
+// baselines + raise freezes + stall dwells + approach holds dropped, any maneuver and pending
+// reinforcement dropped, gears −1. Wire mode and off_since_ are the callers' business.
+void FurrionChillCube::suspend_teardown_(uint32_t now) {
+  if (bias_c_ <= NATURAL_OFF_BIAS_EPS_C) bias_c_ = 0.0f;
+  if (bias_h_ <= NATURAL_OFF_BIAS_EPS_C) bias_h_ = 0.0f;
+  if (bias_parked_at_ == 0 && (bias_c_ > 0.0f || bias_h_ > 0.0f)) {
+    bias_parked_at_ = (now != 0) ? now : 1;
+    ESP_LOGI(TAG, "Suspend: bias parked (cool %.2f / heat %.2f)", bias_c_, bias_h_);
+  }
+  last_committed_cool_target_c_ = NAN;
+  last_committed_heat_target_c_ = NAN;
+  raise_freeze_c_at_ = 0;
+  raise_freeze_h_at_ = 0;
+  stall_above_since_c_ = 0; stall_logged_c_ = false;
+  stall_below_since_h_ = 0; stall_logged_h_ = false;
+  approach_hold_cool_ = false;
+  approach_hold_heat_ = false;
+  approach_hold_from_off_ = false;
+  approach_entry_drift_cpm_ = NAN;
+  approach_entry_drift_at_ = 0;
+  maneuver_phase_ = ManeuverPhase::IDLE;
+  maneuver_start_ = 0;
+  mode_resend_pending_ = false;
+  if (heat_gear_ != -1 || cool_gear_ != -1) last_gear_change_ = now;
+  heat_gear_ = -1;
+  cool_gear_ = -1;
+  idle_since_ = 0;
+  if (heat_gear_sensor_) heat_gear_sensor_->publish_state(-1);
+  if (cool_gear_sensor_) cool_gear_sensor_->publish_state(-1);
+  if (compressor_output_sensor_) compressor_output_sensor_->publish_state(0.0f);
+}
+
+// Outage teardown (once per outage). No frame: the unit can't hear one. active_ir_mode_ → OFF (pref
+// saved, so a reboot mid-outage also starts from OFF) — the unit restarts with its compressor stopped,
+// so the restore pass is an honest start from OFF.
+void FurrionChillCube::enter_power_down_(uint32_t now) {
+  power_down_applied_ = true;
+  uint8_t side = unit_on_side_();
+  power_loss_side_ = (side != MODE_NONE) ? side : (power_loss_at_boot_ ? 3 : MODE_NONE);
+  ESP_LOGW(TAG, "Unit power lost — no IR until it returns (unit was %s)",
+           power_loss_side_ == MODE_HEAT ? "heating side" : power_loss_side_ == MODE_COOL ? "cooling side" :
+           power_loss_side_ == 3 ? "unknown (outage seen at boot)" : "off");
+  suspend_teardown_(now);
+  shed_active_ = false;        // a shed hold is gone with the power — re-applied fresh on restore
+  self_run_side_ = MODE_NONE;
+  set_active_ir_mode_(climate::CLIMATE_MODE_OFF);   // state + pref only
+  off_since_ = 0;              // the restore bypasses the off-dwell (unit's own power-on delay)
+  update_action_();
+  publish_debug_state_(NAN);
+}
+
+// Gear-pass gate, right after check_failsafe_. true = suspended this pass.
+bool FurrionChillCube::run_power_and_shed_(uint32_t now) {
+  // Boot: hold (bounded) until every configured input has reported once, so the first pass can't act on
+  // a default (e.g. resume from a shed that is still on). After INPUT_WAIT_MS: shed off / powered.
+  if (((unit_power_sensor_ != nullptr && !power_known_) || (load_shed_sensor_ != nullptr && !shed_known_)) &&
+      (now - boot_time_) < INPUT_WAIT_MS) {
+    publish_debug_state_(NAN);
+    return true;
+  }
+  if (power_lost_) {
+    if (!power_down_applied_) enter_power_down_(now);
+    // Events are consumed, not queued: the restore pass re-picks from OFF with the live mode/targets.
+    user_changed_ = false;
+    resume_from_test_ = false;
+    resync_on_resume_ = false;
+    return true;
+  }
+  if (power_restore_pending_) {
+    // Power came back before any pass ran the outage teardown (e.g. inside a NaN-room hold): the unit
+    // still rebooted — tear down now so this pass is a real start from OFF.
+    if (!power_down_applied_) enter_power_down_(now);
+    off_since_ = 0;   // immediate re-command (see enter_power_down_)
+  }
+  if (load_shed_sensor_ != nullptr && shed_req_) {
+    run_shed_(now);
+    return true;
+  }
+  if (shed_active_) {
+    shed_active_ = false;
+    ESP_LOGI(TAG, "Load shed ended — resuming as a start from OFF");
+  }
+  return false;
+}
+
+// Shed pass. Applied once on entry (and again when power returns mid-shed); afterwards only a user
+// mode-OFF changes anything. The logic ladder stays suspended for the whole shed.
+void FurrionChillCube::run_shed_(uint32_t now) {
+  user_changed_ = false;      // consumed — the resume pass re-picks from OFF
+  resume_from_test_ = false;
+  resync_on_resume_ = false;
+  bool ha_off = (this->mode == climate::CLIMATE_MODE_OFF) && !(is_script_mode() && script_mode_ != 0);
+  bool restore = power_restore_pending_;
+  if (!shed_active_ || restore) {
+    uint8_t side = unit_on_side_();
+    power_restore_pending_ = false;
+    if (side == 3) {   // outage seen at boot: side unknown — take the side the mode would run
+      side = (this->mode == climate::CLIMATE_MODE_HEAT ||
+              (this->mode == climate::CLIMATE_MODE_HEAT_COOL && last_active_mode_ == MODE_HEAT)) ? MODE_HEAT
+                                                                                                  : MODE_COOL;
+    }
+    shed_active_ = true;
+    suspend_teardown_(now);
+    self_run_side_ = MODE_NONE;
+    if (side != MODE_NONE) off_since_ = now;   // compressor stops now: a short shed still gets the dwell
+    if (side != MODE_NONE && !ha_off) {
+      shed_resume_heat_ = (side == MODE_HEAT);
+      if (active_ir_mode_ != climate::CLIMATE_MODE_FAN_ONLY || restore) {   // reboot mid-shed: already there
+        set_active_ir_mode_(climate::CLIMATE_MODE_FAN_ONLY);
+        transmit_mode_command_();   // fan-only at load_shed_fan (+ the 5 s reinforcement)
+      }
+      ESP_LOGW(TAG, "Load shed: unit -> fan-only %d%% (resumes %s)", shed_fan_, shed_resume_heat_ ? "HEAT" : "COOL");
+    } else {
+      if (active_ir_mode_ != climate::CLIMATE_MODE_OFF) set_active_ir_mode_(climate::CLIMATE_MODE_OFF);
+      if (side != MODE_NONE) transmit_mode_command_();   // running (self-run / restarted) but HA says OFF
+      ESP_LOGW(TAG, "Load shed: unit stays OFF");
+    }
+  } else if (ha_off && active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY) {
+    set_active_ir_mode_(climate::CLIMATE_MODE_OFF);   // user switched off mid-shed: fan off too
+    transmit_mode_command_();
+    off_since_ = now;
+    ESP_LOGI(TAG, "Load shed: mode OFF — unit OFF");
+  }
+  update_action_();
+  publish_debug_state_(NAN);
+}
+
+// ============================================================
 // Gear Controller
 // ============================================================
 
@@ -2453,6 +2720,11 @@ void FurrionChillCube::run_gear_controller_() {
   // Failsafe scenarios + NaN-room grace (also clears a stale failsafe). Returns
   // true if a failsafe/grace path was taken — stop this pass.
   if (check_failsafe_(now, room)) return;
+
+  // Unit power / load shed: an outage or a shed suspends the pass (also the bounded boot wait for the
+  // first input reports). Returns false when the pass should run normally — including the first pass
+  // after an outage or shed, which is an ordinary start from OFF.
+  if (run_power_and_shed_(now)) return;
 
   // Fix: seed idle_since_ if gear is 0 but timer was never set (post-boot recovery)
   if ((heat_gear_ == 0 || cool_gear_ == 0) && idle_since_ == 0) {
@@ -2493,6 +2765,18 @@ void FurrionChillCube::run_gear_controller_() {
     if (run_cool_mode_(room, now, user_input, from_test, gear_diff)) return;
   } else {
     run_idle_mode_(now);
+  }
+
+  // First full pass after an outage: the unit restarted in its pre-outage mode (EEPROM). A pass that
+  // turned it on has already said so; one that leaves it OFF must say OFF explicitly, or the unit runs
+  // on in its old mode (skipped when it was known to be OFF at the loss). A pending OFF→gear start
+  // (PRE_CS) turns it on 500 ms from now — nothing to add.
+  if (power_restore_pending_) {
+    power_restore_pending_ = false;
+    if (active_ir_mode_ == climate::CLIMATE_MODE_OFF && !kickstart_active_() && power_loss_side_ != MODE_NONE) {
+      ESP_LOGI(TAG, "Power restore: unit stays OFF — explicit OFF frame (it restarted in its old mode)");
+      transmit_mode_command_();
+    }
   }
 
   // Phase 2: each mode's adaptive bias only exists while that mode is active. Clear the inactive
@@ -2651,6 +2935,17 @@ bool FurrionChillCube::check_failsafe_(uint32_t now, float room) {
     // Only when the wire fan is fixed and the unit is on; the mode-frame gate (valid target) still
     // applies — a NaN target simply skips it (nothing sensible to say). No CS frames are sent, so
     // the unit's ~7-min CS timeout still returns it to its internal sensor exactly as before.
+    // Load shed fan-only: hand the unit back in its REAL mode, or its own thermostat would sit in
+    // fan-only (no heat/cool) for the whole HA outage — the failover invariant beats the shed. Direct
+    // assign (no vane hook / pref save); the OFF sync below saves the pref.
+    if (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY && shed_fan_only_) {
+      active_ir_mode_ = shed_resume_heat_ ? climate::CLIMATE_MODE_HEAT : climate::CLIMATE_MODE_COOL;
+      ESP_LOGW(TAG, "FAILSAFE during load shed — unit handed back in %s (shed can't be honoured without HA)",
+               shed_resume_heat_ ? "HEAT" : "COOL");
+    }
+    shed_active_ = false;   // re-applied fresh (via self_run_side_) if HA comes back with the shed still on
+    if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) self_run_side_ = MODE_HEAT;
+    else if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) self_run_side_ = MODE_COOL;
     if (active_ir_mode_ != climate::CLIMATE_MODE_OFF && last_tx_fan_ > 0) {
       failsafe_fan_release_tx_ = true;
       bool sent = transmit_mode_command_();
@@ -3008,7 +3303,9 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
   // Cool→Heat MUST route through a real OFF held for the off-dwell — same rationale as
   // run_cool_mode_ (compressor safety + vane OFF→ON anchor). Catches a DIRECT switch while
   // the unit is still actively COOLing; the natural HEAT_COOL handoff already turned it OFF.
-  if (active_ir_mode_ == climate::CLIMATE_MODE_COOL) {
+  // Also a shed that held a COOL unit in fan-only and now resumes into heat (mirror of the cool pass).
+  if (active_ir_mode_ == climate::CLIMATE_MODE_COOL ||
+      (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY && shed_fan_only_ && !shed_resume_heat_)) {
     ESP_LOGI(TAG, "Cool→Heat: force OFF + %lus dwell before heating",
              (unsigned long)(mode_switch_off_ms_ / 1000));
     force_off_for_mode_switch_(now);
@@ -3440,7 +3737,10 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
   // still actively HEATing when COOL is selected (user flip, or sync_mode handoff). The
   // natural HEAT_COOL drift already turns the unit OFF via the heat 0→-1 path, so by the
   // time it reaches here active_ir_mode_ is already OFF and this is skipped.
-  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) {
+  // Also a shed that held a HEAT unit in fan-only and now resumes into cool: the vane needs the OFF→ON
+  // re-home for the cool position (fan-only is not known to re-home it).
+  if (active_ir_mode_ == climate::CLIMATE_MODE_HEAT ||
+      (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY && shed_fan_only_ && shed_resume_heat_)) {
     ESP_LOGI(TAG, "Heat→Cool: force OFF + %lus dwell before cooling",
              (unsigned long)(mode_switch_off_ms_ / 1000));
     force_off_for_mode_switch_(now);
@@ -4071,7 +4371,8 @@ void FurrionChillCube::publish_debug_state_(float diff) {
 
   // Active IR mode: 0=OFF, 1=HEAT, 2=COOL
   float ir_mode = (active_ir_mode_ == climate::CLIMATE_MODE_HEAT) ? 1.0f :
-                  (active_ir_mode_ == climate::CLIMATE_MODE_COOL) ? 2.0f : 0.0f;
+                  (active_ir_mode_ == climate::CLIMATE_MODE_COOL) ? 2.0f :
+                  (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY) ? 3.0f : 0.0f;   // 3 = fan-only (shed / bench)
   pub(debug_active_ir_mode_sensor_, ir_mode);
   pub(debug_last_active_mode_sensor_, (float)last_active_mode_);
 
@@ -4146,6 +4447,8 @@ void FurrionChillCube::publish_debug_state_(float diff) {
     bool script = is_script_mode() && !test_mode_ && !failsafe_active_;
     if (test_mode_)                                          sub = "test";
     else if (failsafe_active_)                               sub = "failsafe";
+    else if (power_lost_)                                    sub = "no_power";
+    else if (shed_active_)                                   sub = "shed";
     else if (!script && this->mode == climate::CLIMATE_MODE_OFF) sub = "off";
     else if (approach_hold_cool_ || approach_hold_heat_)     sub = "approach";
     else if (maneuver_phase_ != ManeuverPhase::IDLE)         sub = "maneuver";
@@ -4236,6 +4539,7 @@ void FurrionChillCube::test_frame(int mode, int setpoint_c, int cs, int fan) {
   failsafe_active_ = false;
   publish_debug_state_(NAN);  // bypasses set_test_mode() — publish the cleared state here too
   boot_ready_ = true;
+  shed_fan_only_ = false;   // the harness owns FAN_ONLY now — not a shed hold
   test_fan_ = fan_valid_(fan) ? fan : FAN_AUTO;   // board percent (0 auto, 20..100); anything else → auto
   if (mode == 0) {
     active_ir_mode_ = climate::CLIMATE_MODE_OFF;
@@ -4275,6 +4579,7 @@ void FurrionChillCube::test_off() {
   maneuver_start_ = 0;
   mode_resend_pending_ = false;  // bypasses set_test_mode() — drop a pending production reinforcement here too
   active_ir_mode_ = climate::CLIMATE_MODE_OFF;
+  shed_fan_only_ = false;
   transmit_mode_command_();
   ESP_LOGI(TAG, "TEST: unit OFF");
 }
@@ -4408,6 +4713,11 @@ void FurrionChillCube::dump_config() {
                   (unsigned long)(cool_vent_move_delay_ms_ / 1000),
                   (unsigned long)(cool_vent_interval_ms_ / 1000));
   }
+  ESP_LOGCONFIG(TAG, "  Load shed input: %s (fan-only %d%%)", load_shed_sensor_ ? "yes" : "no (off)", shed_fan_);
+  ESP_LOGCONFIG(TAG, "  Unit power input: %s (outage after %lums)", unit_power_sensor_ ? "yes" : "no (always powered)",
+                (unsigned long) power_loss_ms_);
+  ESP_LOGCONFIG(TAG, "  Display off on power restore: %s (after %lus)", display_off_sensor_ ? "yes" : "no",
+                (unsigned long) (display_off_delay_ms_ / 1000));
 }
 
 }  // namespace furrion_chill_cube

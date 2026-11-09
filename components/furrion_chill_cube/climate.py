@@ -109,6 +109,13 @@ CONF_TEST_MODE = "test_mode"
 # Phase 2 adaptive equilibrium-gear controller (cool mode)
 CONF_ADAPTIVE_ENABLE = "adaptive_enable"
 CONF_VENT_FAN = "vent_fan"
+# Unit power / load shed / display (2026-11-09). All optional; each input left out = feature off.
+CONF_LOAD_SHED = "load_shed"                        # ON = shed: running unit → fan-only, compressor off
+CONF_LOAD_SHED_FAN = "load_shed_fan"                # fan held while shed (board percent)
+CONF_UNIT_POWER = "unit_power"                      # ON = the unit has 120 V; left out = always powered
+CONF_POWER_LOSS_TIME = "power_loss_time"            # OFF this long = a real outage (shorter = ignored)
+CONF_DISPLAY_OFF_ON_RESTORE = "display_off_on_power_restore"   # ON = toggle the display after an outage
+CONF_DISPLAY_OFF_DELAY = "display_off_delay"        # restore → display toggle
 CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
 # Setpoint-transition preload (fix-setpoint-transition-integral, 2026-08-02)
 CONF_SP_PRELOAD_FACTOR = "sp_preload_factor"
@@ -286,6 +293,13 @@ def _validate_vane_memory(config):
         for key in (CONF_HEAT_VANE_AUTO, CONF_COOL_VANE_AUTO):
             if key in config:
                 raise cv.Invalid(f"'{key}' needs '{CONF_VANE_MEMORY}: true'.")
+    return config
+
+
+def _validate_display_off(config):
+    """The display toggle fires on the end of a detected outage, so it needs unit_power."""
+    if CONF_DISPLAY_OFF_ON_RESTORE in config and CONF_UNIT_POWER not in config:
+        raise cv.Invalid(f"'{CONF_DISPLAY_OFF_ON_RESTORE}' needs '{CONF_UNIT_POWER}'.")
     return config
 
 
@@ -507,6 +521,20 @@ CONFIG_SCHEMA = cv.All(
             # Optional observed-disturbance input: the CO2/fresh-air vent fan. While ON, a
             # fixed feedforward biases cooling up and the integral is frozen across the edge.
             cv.Optional(CONF_VENT_FAN): cv.use_id(binary_sensor.BinarySensor),
+            # Unit power / load shed / display (2026-11-09). Binary inputs, normally imported from HA.
+            # load_shed ON: a running unit goes fan-only at load_shed_fan (vent open, compressor off); a unit
+            # the controller has OFF stays OFF. OFF again: normal control resumes as a start from OFF.
+            cv.Optional(CONF_LOAD_SHED): cv.use_id(binary_sensor.BinarySensor),
+            cv.Optional(CONF_LOAD_SHED_FAN, default=20): cv.All(_FAN_NAMES, cv.int_range(min=20, max=100)),
+            # unit_power OFF for power_loss_time: the controller stands down (no IR, action off); when it
+            # comes back ON it re-commands the unit from OFF at whatever the room needs now. The first
+            # report after a reboot only initialises (a reboot is never an outage).
+            cv.Optional(CONF_UNIT_POWER): cv.use_id(binary_sensor.BinarySensor),
+            cv.Optional(CONF_POWER_LOSS_TIME, default="1s"): cv.positive_time_period_milliseconds,
+            # display_off_on_power_restore ON: one display toggle display_off_delay after a real outage
+            # ends (the unit powers up with its display lit). Needs unit_power.
+            cv.Optional(CONF_DISPLAY_OFF_ON_RESTORE): cv.use_id(binary_sensor.BinarySensor),
+            cv.Optional(CONF_DISPLAY_OFF_DELAY, default="10s"): cv.positive_time_period_milliseconds,
             # Gear-equivalents of feedforward applied while the vent fan runs (field-tuned).
             cv.Optional(CONF_FAN_FEEDFORWARD_GEARS, default=1): cv.int_range(min=0, max=3),
             # Setpoint-transition preload (default 0 = OFF = bit-identical; needs
@@ -616,6 +644,7 @@ CONFIG_SCHEMA = cv.All(
     _auto_debug_sensors,
     _validate_vent_pairs,
     _validate_vane_memory,
+    _validate_display_off,
 )
 
 
@@ -744,6 +773,19 @@ async def to_code(config):
     if CONF_VENT_FAN in config:
         fan = await cg.get_variable(config[CONF_VENT_FAN])
         cg.add(var.set_vent_fan_sensor(fan))
+
+    # Unit power / load shed / display (2026-11-09)
+    cg.add(var.set_load_shed_fan(config[CONF_LOAD_SHED_FAN]))
+    cg.add(var.set_power_loss_time_ms(config[CONF_POWER_LOSS_TIME].total_milliseconds))
+    cg.add(var.set_display_off_delay_ms(config[CONF_DISPLAY_OFF_DELAY].total_milliseconds))
+    for key, setter in [
+        (CONF_LOAD_SHED, "set_load_shed_sensor"),
+        (CONF_UNIT_POWER, "set_unit_power_sensor"),
+        (CONF_DISPLAY_OFF_ON_RESTORE, "set_display_off_on_restore_sensor"),
+    ]:
+        if key in config:
+            bs = await cg.get_variable(config[key])
+            cg.add(getattr(var, setter)(bs))
 
     # Diagnostic sensors
     for key, setter in [

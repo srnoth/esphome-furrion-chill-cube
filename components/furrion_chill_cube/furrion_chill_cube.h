@@ -167,6 +167,28 @@ class FurrionChillCube : public climate::Climate, public Component {
   // bit-identical).
   void set_crossing_preload_kd(float kd) { crossing_preload_kd_ = kd; }
 
+  // ── Unit power / load shed / display-off (2026-11-09) ─────────────────────────
+  // Three optional binary inputs (normally imported from HA). Each one left out = that feature off.
+  //   load_shed ON  → a running unit (any gear incl. idle) goes FAN_ONLY at load_shed_fan: compressor
+  //                   off, vent open, air moving. A unit the controller has OFF stays OFF. The logic
+  //                   ladder is SUSPENDED for the shed (bias parked like a user OFF, no gear moves);
+  //                   shed OFF → the next pass is an ordinary start from OFF (pick, OFF-entry clamp).
+  //                   Resuming into the OTHER mode (cool↔heat) goes through the forced OFF + dwell.
+  //   unit_power OFF for ≥ power_loss_time → outage: no IR (the unit is deaf), gears −1, action OFF,
+  //                   bias parked. Power back → immediate re-command from OFF at whatever the room
+  //                   needs now (heat↔cool flip allowed, off-dwell bypassed — the unit's own power-on
+  //                   delay protects the compressor; the vane re-homes on power-up, so the OFF→ON
+  //                   positioning runs as usual). A shorter dip is ignored. The FIRST report after a
+  //                   reboot only initialises — a reboot is never an outage.
+  //   display_off_on_power_restore ON → one display toggle display_off_delay after an outage ends.
+  // Failsafe still wins: a shed fan-only unit is handed back in its real mode (failover invariant).
+  void set_load_shed_sensor(binary_sensor::BinarySensor *s) { load_shed_sensor_ = s; }
+  void set_load_shed_fan(int f) { shed_fan_ = f; }
+  void set_unit_power_sensor(binary_sensor::BinarySensor *s) { unit_power_sensor_ = s; }
+  void set_power_loss_time_ms(uint32_t ms) { power_loss_ms_ = ms; }
+  void set_display_off_on_restore_sensor(binary_sensor::BinarySensor *s) { display_off_sensor_ = s; }
+  void set_display_off_delay_ms(uint32_t ms) { display_off_delay_ms_ = ms; }
+
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
   void set_cool_gear_sensor(sensor::Sensor *s) { cool_gear_sensor_ = s; }
@@ -274,6 +296,16 @@ class FurrionChillCube : public climate::Climate, public Component {
   static bool fan_valid_(int f);         // 0 (auto) or one of the five board percents
   static constexpr int FAN_AUTO = 0;
   uint32_t tx_seq_{0};  // wire-log frame counter (wraps; only used to make lines distinct)
+
+  // Unit power / load shed (see set_load_shed_sensor). update_power_state_ runs every loop (also in
+  // test mode): confirms an outage after power_loss_ms_ and fires the display toggle. run_power_and_shed_
+  // runs in the gear pass right after the failsafe check; true = this pass is suspended.
+  void update_power_state_();
+  bool run_power_and_shed_(uint32_t now);
+  void enter_power_down_(uint32_t now);
+  void run_shed_(uint32_t now);
+  void suspend_teardown_(uint32_t now);   // shared by outage + shed: park bias, drop holds/maneuvers, gears −1
+  uint8_t unit_on_side_();                // MODE_NONE / MODE_HEAT / MODE_COOL the unit is physically running
 
   // Gear controller
   void run_gear_controller_();
@@ -456,6 +488,34 @@ class FurrionChillCube : public climate::Climate, public Component {
 
   // Phase 2 adaptive input
   binary_sensor::BinarySensor *vent_fan_sensor_{nullptr};
+
+  // Unit power / load shed / display-off inputs + state (2026-11-09). Callback-armed timers self-clock
+  // on millis() (reference_furrion_millis_now_footgun).
+  binary_sensor::BinarySensor *load_shed_sensor_{nullptr};
+  binary_sensor::BinarySensor *unit_power_sensor_{nullptr};
+  binary_sensor::BinarySensor *display_off_sensor_{nullptr};
+  int shed_fan_{20};
+  uint32_t power_loss_ms_{1000};
+  uint32_t display_off_delay_ms_{10000};
+  bool shed_known_{false};          // first load_shed report since boot received
+  bool shed_req_{false};            // input: shed requested
+  bool shed_active_{false};         // the controller is in its shed suspension (state applied)
+  bool shed_fan_only_{false};       // active_ir_mode_ == FAN_ONLY because of a shed (not the bench harness)
+  bool shed_resume_heat_{false};    // side the unit ran before the shed (persisted with FAN_ONLY: pref 3/4)
+  bool power_known_{false};         // first unit_power report since boot received (init only, never an edge)
+  bool power_raw_{true};            // last unit_power value
+  uint32_t power_false_at_{0};      // millis() of the last ON→OFF (or first-report OFF)
+  bool power_lost_{false};          // outage confirmed (OFF ≥ power_loss_ms_)
+  bool power_down_applied_{false};  // the outage teardown has run
+  bool power_restore_pending_{false};   // power back: the first full pass owes the unit an explicit command
+  uint8_t power_loss_side_{0};      // unit_on_side_() at the loss; 3 = unknown (loss seen at boot)
+  bool power_loss_at_boot_{false};  // the first report after boot was OFF (pre-outage side unknown)
+  bool display_off_pending_{false};
+  uint32_t display_off_at_{0};
+  // Failsafe handed control to the unit while it was running (mode side, ActiveMode). Our model says
+  // OFF but the unit runs its own thermostat — a shed must still reach it. Cleared by any main frame.
+  uint8_t self_run_side_{0};
+  static constexpr uint32_t INPUT_WAIT_MS = 30000;   // boot: wait this long at most for the first input reports
 
   // Configuration
   float outside_lockout_temp_c_{1.67f};   // 35°F default

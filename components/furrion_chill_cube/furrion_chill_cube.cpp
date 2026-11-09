@@ -2649,6 +2649,16 @@ bool FurrionChillCube::run_power_and_shed_(uint32_t now) {
     return true;
   }
   if (shed_active_) {
+    // A shed shorter than the compressor-restart dwell: keep the fan-only hold until the dwell is over —
+    // resuming now would only read "gear −1 (dwell)" and switch the fan fully OFF for the rest of it.
+    if (active_ir_mode_ == climate::CLIMATE_MODE_FAN_ONLY && shed_fan_only_ && off_since_ != 0 &&
+        (now - off_since_) < mode_switch_off_ms_) {
+      user_changed_ = false;
+      resume_from_test_ = false;
+      resync_on_resume_ = false;
+      publish_debug_state_(NAN);
+      return true;
+    }
     shed_active_ = false;
     ESP_LOGI(TAG, "Load shed ended — resuming as a start from OFF");
   }

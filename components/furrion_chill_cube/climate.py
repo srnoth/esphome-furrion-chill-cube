@@ -116,6 +116,7 @@ CONF_UNIT_POWER = "unit_power"                      # ON = the unit has 120 V; l
 CONF_POWER_LOSS_TIME = "power_loss_time"            # OFF this long = a real outage (shorter = ignored)
 CONF_DISPLAY_OFF_ON_RESTORE = "display_off_on_power_restore"   # ON = toggle the display after an outage
 CONF_DISPLAY_OFF_DELAY = "display_off_delay"        # restore → display toggle
+CONF_EXTERNAL_AUX_HEAT_RUNNING = "external_aux_heat_running"   # ON = another heater is heating now (2026-11-09)
 CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
 # Setpoint-transition preload (fix-setpoint-transition-integral, 2026-08-02)
 CONF_SP_PRELOAD_FACTOR = "sp_preload_factor"
@@ -535,6 +536,10 @@ CONFIG_SCHEMA = cv.All(
             # ends (the unit powers up with its display lit). Needs unit_power.
             cv.Optional(CONF_DISPLAY_OFF_ON_RESTORE): cv.use_id(binary_sensor.BinarySensor),
             cv.Optional(CONF_DISPLAY_OFF_DELAY, default="10s"): cv.positive_time_period_milliseconds,
+            # external_aux_heat_running ON: another heater (not this unit) is heating the room. Cooling is held
+            # off (a unit in cool goes OFF); after it stops, cool returns only through the HEAT_COOL changeover
+            # rule (room past the heat target + offset, idle + trend window, sustained rise). Heat untouched.
+            cv.Optional(CONF_EXTERNAL_AUX_HEAT_RUNNING): cv.use_id(binary_sensor.BinarySensor),
             # Gear-equivalents of feedforward applied while the vent fan runs (field-tuned).
             cv.Optional(CONF_FAN_FEEDFORWARD_GEARS, default=1): cv.int_range(min=0, max=3),
             # Setpoint-transition preload (default 0 = OFF = bit-identical; needs
@@ -782,6 +787,7 @@ async def to_code(config):
         (CONF_LOAD_SHED, "set_load_shed_sensor"),
         (CONF_UNIT_POWER, "set_unit_power_sensor"),
         (CONF_DISPLAY_OFF_ON_RESTORE, "set_display_off_on_restore_sensor"),
+        (CONF_EXTERNAL_AUX_HEAT_RUNNING, "set_aux_heat_sensor"),
     ]:
         if key in config:
             bs = await cg.get_variable(config[key])

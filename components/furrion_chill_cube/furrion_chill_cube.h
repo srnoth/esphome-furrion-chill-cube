@@ -189,6 +189,19 @@ class FurrionChillCube : public climate::Climate, public Component {
   void set_display_off_on_restore_sensor(binary_sensor::BinarySensor *s) { display_off_sensor_ = s; }
   void set_display_off_delay_ms(uint32_t ms) { display_off_delay_ms_ = ms; }
 
+  // ── External aux heat (2026-11-09) ────────────────────────────────────────────
+  // Optional binary input: ON = another heater (not this unit) is heating the room right now. Without it,
+  // COOL with no heat side of its own cools against that heater (its approach fires early on the heat-driven
+  // rise). With it, the auxiliary heater plays the heat side of HEAT_COOL:
+  //   ON  → cooling is blocked (incl. approach); a unit in cool goes OFF at once. Latches.
+  //   OFF → the latch holds until the HEAT_COOL changeover rule says the day has turned: room past the heat
+  //         target by mode_switch_temp_offset, aux off ≥ mode_switch_idle + changeover_trend_window, and a
+  //         sustained rise (deep backstop: room past the cool target by the offset). Then cool runs as usual.
+  // The heat side is untouched. In HEAT_COOL a cool latch is dropped while the aux runs (arbitration then
+  // picks heat by temperature). First report after boot: ON = latched; OFF = no latch, so a summer COOL
+  // with the aux heaters idle behaves exactly as before. Left out = feature off.
+  void set_aux_heat_sensor(binary_sensor::BinarySensor *s) { aux_heat_sensor_ = s; }
+
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
   void set_cool_gear_sensor(sensor::Sensor *s) { cool_gear_sensor_ = s; }
@@ -312,6 +325,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool check_failsafe_(uint32_t now, float room);
   void update_outside_lockout_();
   void arbitrate_mode_(float room, bool &do_heat, bool &do_cool);
+  void apply_aux_heat_gate_(float room, uint32_t now, bool &do_cool);
   bool run_heat_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
   bool run_cool_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
   void run_idle_mode_(uint32_t now);
@@ -510,6 +524,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool power_restore_pending_{false};   // power back: the first full pass owes the unit an explicit command
   uint8_t power_loss_side_{0};      // unit_on_side_() at the loss; 3 = unknown (loss seen at boot)
   bool power_loss_at_boot_{false};  // the first report after boot was OFF (pre-outage side unknown)
+  // External aux heat (see set_aux_heat_sensor). Polled in update_power_state_; gate applied in the gear pass.
+  binary_sensor::BinarySensor *aux_heat_sensor_{nullptr};
+  bool aux_known_{false};           // first report since boot received
+  bool aux_running_{false};         // last input value
+  bool aux_latched_{false};         // cooling held off until the changeover rule releases it
+  uint32_t aux_off_since_{0};       // millis() of the last aux ON→OFF (0 = none since the latch)
+  bool aux_blocking_{false};        // this pass: cooling blocked by the aux heat (regime label)
   bool display_off_pending_{false};
   uint32_t display_off_at_{0};
   // Failsafe handed control to the unit while it was running (mode side, ActiveMode). Our model says

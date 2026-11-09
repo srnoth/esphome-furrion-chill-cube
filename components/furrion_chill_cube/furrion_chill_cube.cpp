@@ -2498,6 +2498,23 @@ void FurrionChillCube::update_power_state_() {
       temp_dirty_ = true;
     }
   }
+  if (aux_heat_sensor_ != nullptr && aux_heat_sensor_->has_state()) {
+    bool on = aux_heat_sensor_->state;
+    if (!aux_known_ || on != aux_running_) {
+      bool first = !aux_known_;
+      aux_known_ = true;
+      aux_running_ = on;
+      if (on) {
+        aux_latched_ = true;
+        aux_off_since_ = 0;
+      } else if (!first) {
+        aux_off_since_ = (now != 0) ? now : 1;
+      }
+      ESP_LOGI(TAG, "Aux heat input %s%s%s", on ? "ON" : "OFF", first ? " (first report)" : "",
+               on ? " — cooling held off (latched)" : (aux_latched_ ? " — latch holds until the changeover rule" : ""));
+      temp_dirty_ = true;
+    }
+  }
   if (unit_power_sensor_ == nullptr) return;
   if (unit_power_sensor_->has_state()) {
     bool on = unit_power_sensor_->state;
@@ -2753,6 +2770,7 @@ void FurrionChillCube::run_gear_controller_() {
 
   bool do_heat = false, do_cool = false;
   arbitrate_mode_(room, do_heat, do_cool);
+  apply_aux_heat_gate_(room, now, do_cool);
   // Gear-script with a BOUND mode owns the mode for the run (Stephen 2026-09-05): HA's mode is ignored
   // until exit; the passes' own cool↔heat handling (forced OFF + dwell) still applies; the outdoor heat
   // lockout still wins (→ idle pass, one-shot LOGW there).
@@ -3062,6 +3080,44 @@ void FurrionChillCube::arbitrate_mode_(float room, bool &do_heat, bool &do_cool)
       }
     }
   }
+}
+
+// External aux heat gate (see set_aux_heat_sensor). Runs right after arbitrate_mode_, before a bound gear
+// script (a script still owns the mode for its run). Only ever clears do_cool.
+void FurrionChillCube::apply_aux_heat_gate_(float room, uint32_t now, bool &do_cool) {
+  aux_blocking_ = false;
+  if (aux_heat_sensor_ == nullptr) return;
+  if (aux_running_ && this->mode == climate::CLIMATE_MODE_HEAT_COOL && latched_mode_ == MODE_COOL) {
+    // The aux heater decided the room needs heat: a cool latch must not keep this unit's own heat side
+    // from engaging (the cool pass that would hand it back doesn't run while cooling is blocked).
+    clear_mode_latch_();
+    ESP_LOGI(TAG, "Aux heat running — HEAT_COOL cool latch dropped");
+  }
+  if (!do_cool) return;
+  if (aux_running_) {
+    do_cool = false;
+    aux_blocking_ = true;
+    return;
+  }
+  if (!aux_latched_) return;
+  float c = get_cool_target_();
+  float h = get_heat_target_();
+  if (isnan(c) || isnan(room)) {   // nothing to release against — keep holding
+    do_cool = false;
+    aux_blocking_ = true;
+    return;
+  }
+  float h_ref = (!isnan(h) && h < c) ? h : c;
+  uint32_t since = aux_off_since_;
+  if (since != 0 && (now - since) > 0x80000000u) since = now;   // stamped after this pass's cached now
+  if (room > h_ref + mode_switch_temp_offset_c_ && changeover_ready_(true, room, c, since, now)) {
+    aux_latched_ = false;
+    ESP_LOGI(TAG, "Aux heat latch released: room %.2f, aux off %lus, sustained rise — cooling allowed", room,
+             (unsigned long) ((now - since) / 1000));
+    return;
+  }
+  do_cool = false;
+  aux_blocking_ = true;
 }
 
 // ── Displacement arming ring (see APPROACH_ARM_RISE_C) ──────────────────────────────────────
@@ -4455,6 +4511,7 @@ void FurrionChillCube::publish_debug_state_(float diff) {
     else if (power_lost_)                                    sub = "no_power";
     else if (shed_active_)                                   sub = "shed";
     else if (!script && this->mode == climate::CLIMATE_MODE_OFF) sub = "off";
+    else if (aux_blocking_)                                  sub = "aux_heat";
     else if (approach_hold_cool_ || approach_hold_heat_)     sub = "approach";
     else if (maneuver_phase_ != ManeuverPhase::IDLE)         sub = "maneuver";
     else if (active_ir_mode_ == climate::CLIMATE_MODE_OFF)   sub = "unit_off";

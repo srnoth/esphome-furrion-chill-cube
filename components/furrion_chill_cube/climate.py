@@ -120,6 +120,8 @@ CONF_EXTERNAL_AUX_HEAT_RUNNING = "external_aux_heat_running"   # ON = another he
 CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
 # Setpoint-transition preload (fix-setpoint-transition-integral, 2026-08-02)
 CONF_SP_PRELOAD_FACTOR = "sp_preload_factor"
+# Heat-side override (2026-11-17): unset = same as sp_preload_factor (bit-identical)
+CONF_HEAT_SP_PRELOAD_FACTOR = "heat_sp_preload_factor"
 CONF_APPROACH_LEAD = "approach_lead"
 # OFF-entry lead override (2026-08-06): an OFF-fired approach rides the 305s clamped start, so its
 # lead should match machine readiness (clamp + latency), not the idle-side comfort lead. Unset =
@@ -549,6 +551,11 @@ CONFIG_SCHEMA = cv.All(
             # data 2026-07-30..08-02 showed ~0.3 °C bias needed per °C of drop; run below that
             # so the integral tops up the remainder (under-prediction is the safe side).
             cv.Optional(CONF_SP_PRELOAD_FACTOR, default=0.0): cv.float_range(min=0.0, max=1.0),
+            # Heat SP-raise preload, separate from the cool one (2026-11-17). The cool factor was
+            # tuned on cool trip data; on heat (oversized unit, no low gears below heat g1) a
+            # 60->70 raise preloaded +1.39 C and every downshift ran ~2.5 F late (11-07 +3.0 F,
+            # 11-17 +1.8 F overshoot). Unset = sp_preload_factor (bit-identical); 0 = off.
+            cv.Optional(CONF_HEAT_SP_PRELOAD_FACTOR): cv.float_range(min=0.0, max=1.0),
             # Approach-side predictive re-engagement (default 0s = OFF = bit-identical). When the
             # room drifts toward the setpoint (sun warming toward a cool SP / envelope loss sinking
             # toward a heat SP) and the predicted crossing is within this lead time, engage gear 1
@@ -771,6 +778,11 @@ async def to_code(config):
     cg.add(var.set_adaptive_enable(config[CONF_ADAPTIVE_ENABLE]))
     cg.add(var.set_fan_feedforward_gears(config[CONF_FAN_FEEDFORWARD_GEARS]))
     cg.add(var.set_sp_preload_factor(config[CONF_SP_PRELOAD_FACTOR]))
+    cg.add(
+        var.set_heat_sp_preload_factor(
+            config.get(CONF_HEAT_SP_PRELOAD_FACTOR, config[CONF_SP_PRELOAD_FACTOR])
+        )
+    )
     cg.add(var.set_approach_lead_ms(config[CONF_APPROACH_LEAD].total_milliseconds))
     if CONF_APPROACH_LEAD_OFF in config:
         cg.add(var.set_approach_lead_off_ms(config[CONF_APPROACH_LEAD_OFF].total_milliseconds))

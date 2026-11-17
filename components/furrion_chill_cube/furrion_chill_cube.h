@@ -132,6 +132,9 @@ class FurrionChillCube : public climate::Climate, public Component {
   // the active mode's integral bias, gated on real demand at the new target. (A companion
   // "pulldown windup" option was cut in bug-check — see the note in adaptive_cool_eff_diff_.)
   void set_sp_preload_factor(float f) { sp_preload_factor_ = f; }
+  // Heat SP-raise preload factor (2026-11-17), separate from the cool one above. The YAML default
+  // (unset) passes sp_preload_factor through, so existing configs are bit-identical.
+  void set_heat_sp_preload_factor(float f) { heat_sp_preload_factor_ = f; }
   // Approach-side predictive re-engagement (fix-setpoint-transition-integral §Deferred design,
   // implemented 2026-08-03). 0 (default) = OFF (bit-identical). When the room is below the cool
   // setpoint (above the heat setpoint) and a sustained fresh drift predicts an SP crossing within
@@ -744,7 +747,8 @@ class FurrionChillCube : public climate::Climate, public Component {
   // last COMMITTED (post-debounce) target seen by the active mode's pass; NAN = no baseline (boot,
   // mode re-entry, failsafe, test session) → next pass records only, never preloads. Not persisted
   // to NVS (a reboot just re-records; the preloaded bias itself rides the existing bias save).
-  float sp_preload_factor_{0.0f};        // 0 = preload disabled (default; bit-identical)
+  float sp_preload_factor_{0.0f};        // 0 = preload disabled (default; bit-identical) — cool SP drop
+  float heat_sp_preload_factor_{0.0f};   // heat SP raise (0 = off); codegen defaults it to sp_preload_factor_
   float last_committed_cool_target_c_{NAN};
   float last_committed_heat_target_c_{NAN};
   // Raise-side bias freeze (Stephen 2026-08-14): a committed demand-REMOVING setpoint change

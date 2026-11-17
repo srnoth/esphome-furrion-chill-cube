@@ -3416,7 +3416,7 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
 
   // Setpoint-transition detector — SIGN-MIRROR of the cool one (see run_cool_mode_ for the full
   // rationale + accepted edges). Heat demand rises on a setpoint RAISE: preload bias_h_ with a
-  // fraction of the raise, gated on real heating demand (room below the NEW target by more than
+  // fraction (heat_sp_preload_factor_, own knob since 2026-11-17) of the raise, gated on real heating demand (room below the NEW target by more than
   // the deadband). A demand-removing DROP freezes the bias until the crossing (see below).
   // ⚠️ WINTER-UNVALIDATED like the rest of the heat adaptive path — structurally symmetric only.
   if (!setpoint_pending_ && !is_script_mode()) {   // script: bias frozen → no preload / raise freeze
@@ -3425,9 +3425,9 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
     } else if (target != last_committed_heat_target_c_) {
       float delta_c = target - last_committed_heat_target_c_;
       last_committed_heat_target_c_ = target;
-      if (delta_c > 0.0f && adaptive_enable_ && sp_preload_factor_ > 0.0f &&
+      if (delta_c > 0.0f && adaptive_enable_ && heat_sp_preload_factor_ > 0.0f &&
           diff < -ADAPT_DEADBAND_C) {
-        float preload = sp_preload_factor_ * delta_c;
+        float preload = heat_sp_preload_factor_ * delta_c;
         bias_h_ += preload;
         if (bias_h_ > ADAPT_BIAS_C_MAX) bias_h_ = ADAPT_BIAS_C_MAX;
         if (bias_h_ < -ADAPT_BIAS_C_MAX) bias_h_ = -ADAPT_BIAS_C_MAX;
@@ -4764,8 +4764,10 @@ void FurrionChillCube::dump_config() {
                 (unsigned long)(quirk_transmit_interval_ms_ / 1000));
   ESP_LOGCONFIG(TAG, "  Mode resend delay: %.1fs%s", mode_resend_delay_ms_ / 1000.0f,
                 mode_resend_delay_ms_ == 0 ? " (disabled)" : "");
-  ESP_LOGCONFIG(TAG, "  SP preload factor: %.2f%s", sp_preload_factor_,
+  ESP_LOGCONFIG(TAG, "  SP preload factor (cool): %.2f%s", sp_preload_factor_,
                 sp_preload_factor_ == 0.0f ? " (off)" : "");
+  ESP_LOGCONFIG(TAG, "  SP preload factor (heat): %.2f%s", heat_sp_preload_factor_,
+                heat_sp_preload_factor_ == 0.0f ? " (off)" : "");
   ESP_LOGCONFIG(TAG, "  Approach lead: %lus%s", (unsigned long)(approach_lead_ms_ / 1000),
                 approach_lead_ms_ == 0 ? " (off)" : "");
   ESP_LOGCONFIG(TAG, "  Quirks: %d (default hold %lus)", quirk_count_,

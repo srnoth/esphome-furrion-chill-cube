@@ -183,13 +183,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   //                   delay protects the compressor; the vane re-homes on power-up, so the OFF→ON
   //                   positioning runs as usual). A shorter dip is ignored. The FIRST report after a
   //                   reboot only initialises — a reboot is never an outage.
-  //   display_off_on_power_restore ON → one display toggle display_off_delay after an outage ends.
+  //   display_off_on_power_restore true → one display toggle display_off_delay after an outage ends.
   // Failsafe still wins: a shed fan-only unit is handed back in its real mode (failover invariant).
   void set_load_shed_sensor(binary_sensor::BinarySensor *s) { load_shed_sensor_ = s; }
   void set_load_shed_fan(int f) { shed_fan_ = f; }
   void set_unit_power_sensor(binary_sensor::BinarySensor *s) { unit_power_sensor_ = s; }
   void set_power_loss_time_ms(uint32_t ms) { power_loss_ms_ = ms; }
-  void set_display_off_on_restore_sensor(binary_sensor::BinarySensor *s) { display_off_sensor_ = s; }
+  void set_display_off_on_restore(bool b) { display_off_on_restore_ = b; }
   void set_display_off_delay_ms(uint32_t ms) { display_off_delay_ms_ = ms; }
 
   // ── External aux heat (2026-11-09) ────────────────────────────────────────────
@@ -507,13 +507,13 @@ class FurrionChillCube : public climate::Climate, public Component {
   // Phase 2 adaptive input
   binary_sensor::BinarySensor *vent_fan_sensor_{nullptr};
 
-  // Unit power / load shed / display-off inputs + state (2026-11-09). Polled every loop (update_power_state_);
+  // Unit power / load shed inputs, display-off option + state (2026-11-09). Polled every loop (update_power_state_);
   // timers self-clock on millis() (reference_furrion_millis_now_footgun).
   binary_sensor::BinarySensor *load_shed_sensor_{nullptr};
   binary_sensor::BinarySensor *unit_power_sensor_{nullptr};
-  binary_sensor::BinarySensor *display_off_sensor_{nullptr};
   int shed_fan_{20};
   uint32_t power_loss_ms_{1000};
+  bool display_off_on_restore_{false};
   uint32_t display_off_delay_ms_{10000};
   bool shed_known_{false};          // first load_shed report since boot received
   bool shed_req_{false};            // input: shed requested

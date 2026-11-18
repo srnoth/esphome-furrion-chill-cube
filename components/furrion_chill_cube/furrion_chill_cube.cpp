@@ -2544,7 +2544,7 @@ void FurrionChillCube::update_power_state_() {
         temp_dirty_ = true;
         ESP_LOGW(TAG, "Unit power: RESTORED after %lus — re-commanding from OFF",
                  (unsigned long) ((now - power_false_at_) / 1000));
-        if (display_off_sensor_ != nullptr) {
+        if (display_off_on_restore_) {
           display_off_pending_ = true;
           display_off_at_ = now;
         }
@@ -2562,13 +2562,11 @@ void FurrionChillCube::update_power_state_() {
   }
   if (display_off_pending_ && (now - display_off_at_) >= display_off_delay_ms_) {
     display_off_pending_ = false;
-    if (power_raw_ && !power_lost_ && display_off_sensor_ != nullptr && display_off_sensor_->has_state() &&
-        display_off_sensor_->state) {
+    if (power_raw_ && !power_lost_) {
       ESP_LOGI(TAG, "Power restore: display toggle (unit powers up with the display lit)");
       send_display_toggle();
     } else {
-      ESP_LOGI(TAG, "Power restore: display toggle skipped (%s)",
-               (!power_raw_ || power_lost_) ? "power dropped again" : "display-off option is off");
+      ESP_LOGI(TAG, "Power restore: display toggle skipped (power dropped again)");
     }
   }
 }
@@ -4789,7 +4787,7 @@ void FurrionChillCube::dump_config() {
   ESP_LOGCONFIG(TAG, "  Load shed input: %s (fan-only %d%%)", load_shed_sensor_ ? "yes" : "no (off)", shed_fan_);
   ESP_LOGCONFIG(TAG, "  Unit power input: %s (outage after %lums)", unit_power_sensor_ ? "yes" : "no (always powered)",
                 (unsigned long) power_loss_ms_);
-  ESP_LOGCONFIG(TAG, "  Display off on power restore: %s (after %lus)", display_off_sensor_ ? "yes" : "no",
+  ESP_LOGCONFIG(TAG, "  Display off on power restore: %s (after %lus)", display_off_on_restore_ ? "yes" : "no",
                 (unsigned long) (display_off_delay_ms_ / 1000));
 }
 

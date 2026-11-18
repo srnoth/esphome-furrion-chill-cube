@@ -114,7 +114,7 @@ CONF_LOAD_SHED = "load_shed"                        # ON = shed: running unit â†
 CONF_LOAD_SHED_FAN = "load_shed_fan"                # fan held while shed (board percent)
 CONF_UNIT_POWER = "unit_power"                      # ON = the unit has 120 V; left out = always powered
 CONF_POWER_LOSS_TIME = "power_loss_time"            # OFF this long = a real outage (shorter = ignored)
-CONF_DISPLAY_OFF_ON_RESTORE = "display_off_on_power_restore"   # ON = toggle the display after an outage
+CONF_DISPLAY_OFF_ON_RESTORE = "display_off_on_power_restore"   # true = toggle the display after an outage
 CONF_DISPLAY_OFF_DELAY = "display_off_delay"        # restore â†’ display toggle
 CONF_EXTERNAL_AUX_HEAT_RUNNING = "external_aux_heat_running"   # ON = another heater is heating now (2026-11-09)
 CONF_FAN_FEEDFORWARD_GEARS = "fan_feedforward_gears"
@@ -301,7 +301,7 @@ def _validate_vane_memory(config):
 
 def _validate_display_off(config):
     """The display toggle fires on the end of a detected outage, so it needs unit_power."""
-    if CONF_DISPLAY_OFF_ON_RESTORE in config and CONF_UNIT_POWER not in config:
+    if config[CONF_DISPLAY_OFF_ON_RESTORE] and CONF_UNIT_POWER not in config:
         raise cv.Invalid(f"'{CONF_DISPLAY_OFF_ON_RESTORE}' needs '{CONF_UNIT_POWER}'.")
     return config
 
@@ -534,9 +534,10 @@ CONFIG_SCHEMA = cv.All(
             # report after a reboot only initialises (a reboot is never an outage).
             cv.Optional(CONF_UNIT_POWER): cv.use_id(binary_sensor.BinarySensor),
             cv.Optional(CONF_POWER_LOSS_TIME, default="1s"): cv.positive_time_period_milliseconds,
-            # display_off_on_power_restore ON: one display toggle display_off_delay after a real outage
-            # ends (the unit powers up with its display lit). Needs unit_power.
-            cv.Optional(CONF_DISPLAY_OFF_ON_RESTORE): cv.use_id(binary_sensor.BinarySensor),
+            # display_off_on_power_restore true: one display toggle display_off_delay after a real outage
+            # ends (the unit powers up with its display lit). false/unset: leave the display alone. Needs
+            # unit_power when true.
+            cv.Optional(CONF_DISPLAY_OFF_ON_RESTORE, default=False): cv.boolean,
             cv.Optional(CONF_DISPLAY_OFF_DELAY, default="10s"): cv.positive_time_period_milliseconds,
             # external_aux_heat_running ON: another heater (not this unit) is heating the room. Cooling is held
             # off (a unit in cool goes OFF); after it stops, cool returns only through the HEAT_COOL changeover
@@ -794,11 +795,11 @@ async def to_code(config):
     # Unit power / load shed / display (2026-11-09)
     cg.add(var.set_load_shed_fan(config[CONF_LOAD_SHED_FAN]))
     cg.add(var.set_power_loss_time_ms(config[CONF_POWER_LOSS_TIME].total_milliseconds))
+    cg.add(var.set_display_off_on_restore(config[CONF_DISPLAY_OFF_ON_RESTORE]))
     cg.add(var.set_display_off_delay_ms(config[CONF_DISPLAY_OFF_DELAY].total_milliseconds))
     for key, setter in [
         (CONF_LOAD_SHED, "set_load_shed_sensor"),
         (CONF_UNIT_POWER, "set_unit_power_sensor"),
-        (CONF_DISPLAY_OFF_ON_RESTORE, "set_display_off_on_restore_sensor"),
         (CONF_EXTERNAL_AUX_HEAT_RUNNING, "set_aux_heat_sensor"),
     ]:
         if key in config:

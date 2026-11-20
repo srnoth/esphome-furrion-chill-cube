@@ -1133,6 +1133,11 @@ void FurrionChillCube::loop() {
       ESP_LOGI(TAG, "Setpoint commit: running side's target unchanged — no gear re-pick");
     }
   }
+  // Same debounce for the user re-evaluation (see reeval_pending_), armed for a change on either side.
+  if (reeval_pending_ && (millis() - reeval_pending_since_) >= SETPOINT_SETTLE_MS) {
+    reeval_pending_ = false;
+    reeval_due_ = true;
+  }
 
   // 2. Run gear controller if triggered. Not blocked by an active override (clamped kickstart or
   // transition maneuver) — those suppress the gear pass's CS writes but the pass still runs so the
@@ -1141,6 +1146,7 @@ void FurrionChillCube::loop() {
   if (temp_dirty_) should_run = true;
   if (last_gear_run_ == 0 || (now - last_gear_run_) >= GEAR_INTERVAL_MS) should_run = true;
   if (user_changed_) should_run = true;
+  if (reeval_due_) should_run = true;
 
   if (should_run) {
     temp_dirty_ = false;  // only consume when gear controller actually runs
@@ -1384,6 +1390,21 @@ void FurrionChillCube::control(const climate::ClimateCall &call) {
   // change is DEBOUNCED instead: arm setpoint_pending_ and let loop() commit it after the
   // user stops stepping (SETPOINT_SETTLE_MS). target_temperature is already updated above,
   // so HA's card shows the new value instantly — only the IR transmit is deferred.
+  // User re-evaluation (see reeval_pending_): ANY real target change counts here — the idle side too
+  // (unlike temp_changed, which feeds the running side's gear re-pick). NaN→value (first sync after
+  // boot) is not a user instruction.
+  auto target_moved = [](float now_v, float pre_v) { return !isnan(pre_v) && now_v != pre_v; };
+  bool any_target_moved = target_moved(this->target_temperature, pre_target) ||
+                          target_moved(this->target_temperature_low, pre_low) ||
+                          target_moved(this->target_temperature_high, pre_high);
+  if (mode_changed) {
+    this->reeval_due_ = true;           // mode change: re-evaluate on the immediate pass
+    this->reeval_pending_ = false;
+  } else if (any_target_moved) {
+    this->reeval_pending_ = true;       // target change: after the setpoint debounce (one decision per sweep)
+    this->reeval_pending_since_ = millis();
+  }
+
   if (mode_changed) {
     this->user_changed_ = true;
     this->setpoint_pending_ = false;  // flush: the immediate run handles the current target
@@ -2766,6 +2787,14 @@ void FurrionChillCube::run_gear_controller_() {
 
   update_outside_lockout_();
 
+  // User re-evaluation (see reeval_pending_): drop the decision holds BEFORE arbitration so this very
+  // pass picks from the room against the new setpoints. reeval_handover_ lives for this pass only.
+  reeval_handover_ = MODE_NONE;
+  if (reeval_due_) {
+    reeval_due_ = false;
+    apply_user_reeval_(room);
+  }
+
   bool do_heat = false, do_cool = false;
   arbitrate_mode_(room, do_heat, do_cool);
   apply_aux_heat_gate_(room, now, do_cool);
@@ -3125,6 +3154,38 @@ void FurrionChillCube::apply_aux_heat_gate_(float room, uint32_t now, bool &do_c
   }
   do_cool = false;
   aux_blocking_ = true;
+}
+
+// User re-evaluation (Stephen 2026-11-19, after the 11-19 night: Auto with the Furrion's heat side handed
+// to the resistive heater, sleep SP drop 73→63 at 22:31, room 71 — cooling waited until 23:10 on the
+// aux latch's "sustained rise" rule while the room fell naturally). "No latch survives a SP change; SP and
+// mode changes = immediately re-evaluate what state we should be in." Runs once per mode change / settled
+// target change, before arbitration. Drops the DECISION holds only; the protections stay (a running aux
+// heater still blocks cool in apply_aux_heat_gate_, the off lockout still paces the restart, outdoor
+// lockout and load shed still apply).
+void FurrionChillCube::apply_user_reeval_(float room) {
+  if (aux_latched_) {
+    aux_latched_ = false;
+    aux_off_since_ = 0;
+    ESP_LOGI(TAG, "User change: aux heat latch cleared%s", aux_running_ ? " (aux still running — blocks until it stops)" : "");
+  }
+  if (latched_mode_ != MODE_NONE) {
+    ESP_LOGI(TAG, "User change: changeover latch (%s) cleared", latched_mode_ == MODE_HEAT ? "heat" : "cool");
+    clear_mode_latch_();
+  }
+  // HEAT_COOL with a side engaged (running or idling at gear 0): arbitration would keep that side until the
+  // changeover supervisor's idle + trend + event gates allow a handover. Hand over now if the room is at
+  // least the offset past the OTHER side's new setpoint (the same margin the supervisor uses).
+  if (this->mode != climate::CLIMATE_MODE_HEAT_COOL || isnan(room) || is_script_mode()) return;
+  float h = get_heat_target_();
+  float c = get_cool_target_();
+  if (heat_gear_ >= 0 && !isnan(c) && room >= c + mode_switch_temp_offset_c_) {
+    reeval_handover_ = MODE_COOL;
+    ESP_LOGI(TAG, "User change: room %.2f ≥ cool target %.2f + offset with heat engaged — handing over to cool", room, c);
+  } else if (cool_gear_ >= 0 && !heater_locked_out_ && !isnan(h) && room <= h - mode_switch_temp_offset_c_) {
+    reeval_handover_ = MODE_HEAT;
+    ESP_LOGI(TAG, "User change: room %.2f ≤ heat target %.2f − offset with cool engaged — handing over to heat", room, h);
+  }
 }
 
 // ── Displacement arming ring (see APPROACH_ARM_RISE_C) ──────────────────────────────────────
@@ -3693,6 +3754,18 @@ bool FurrionChillCube::run_heat_mode_(float room, uint32_t now, bool user_input,
 
   }  // end production logic ladder (heat)
 
+  // User re-evaluation handover (see apply_user_reeval_): overrides this pass's ladder pick. Same shape as
+  // the supervisor's changeover — heat OFF, cool latched (arbitration routes the next pass to cool, which
+  // starts once the off lockout has run) — minus its idle / trend / event gates.
+  if (reeval_handover_ == MODE_COOL && !is_script_mode() && auto_co && gear >= 0) {
+    new_gear = -1;
+    changeover_this_pass = true;
+    latched_mode_ = MODE_COOL;
+    latched_at_ = (now != 0) ? now : 1;
+    approach_engaged_this_pass = false;   // an approach fired this pass is void — the cleanup below releases it
+    ESP_LOGI(TAG, "Changeover HEAT→COOL (user change): room %.2f — heat OFF, cool latched", room);
+  }
+
   // Track idle_since
   if (new_gear == 0 && gear != 0) {
     idle_since_ = now;
@@ -4259,6 +4332,16 @@ bool FurrionChillCube::run_cool_mode_(float room, uint32_t now, bool user_input,
     }
 
   }  // end production logic ladder (cool)
+
+  // User re-evaluation handover — mirror of the heat pass (auto_co already requires heat not locked out).
+  if (reeval_handover_ == MODE_HEAT && !is_script_mode() && auto_co && gear >= 0) {
+    new_gear = -1;
+    changeover_this_pass = true;
+    latched_mode_ = MODE_HEAT;
+    latched_at_ = (now != 0) ? now : 1;
+    approach_engaged_this_pass = false;   // mirror: void a same-pass approach so the cleanup releases it
+    ESP_LOGI(TAG, "Changeover COOL→HEAT (user change): room %.2f — cool OFF, heat latched", room);
+  }
 
   // Track idle_since
   if (new_gear == 0 && gear != 0) {

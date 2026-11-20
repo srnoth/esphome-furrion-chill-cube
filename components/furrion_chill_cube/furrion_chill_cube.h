@@ -330,6 +330,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void update_outside_lockout_();
   void arbitrate_mode_(float room, bool &do_heat, bool &do_cool);
   void apply_aux_heat_gate_(float room, uint32_t now, bool &do_cool);
+  void apply_user_reeval_(float room);
   bool run_heat_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
   bool run_cool_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
   void run_idle_mode_(uint32_t now);
@@ -722,6 +723,18 @@ class FurrionChillCube : public climate::Climate, public Component {
   // (sets user_changed_) once SETPOINT_SETTLE_MS of steady state has elapsed.
   bool setpoint_pending_{false};
   uint32_t setpoint_pending_since_{0};
+  // User re-evaluation (Stephen 2026-11-19): a mode change, or a settled change to ANY target (either
+  // side — the idle side included), drops every decision hold so the next pass picks heat / cool /
+  // idle from the room against the new setpoints: the aux-heat cool latch, the HEAT_COOL changeover
+  // latch, and the heat↔cool handover gates (idle dwell + trend, 20-min event gate, "stay in the
+  // engaged mode"). Protections stay: a RUNNING aux heater, the off lockout, outdoor lockout, shed.
+  // Mode change → due at once; target change → due after the same SETPOINT_SETTLE_MS debounce.
+  bool reeval_pending_{false};
+  uint32_t reeval_pending_since_{0};
+  bool reeval_due_{false};
+  // Set by apply_user_reeval_ for THIS pass only: the engaged side must hand over now (room at least
+  // mode_switch_temp_offset past the other side's setpoint). Consumed by run_heat/cool_mode_.
+  uint8_t reeval_handover_{0};   // MODE_NONE / MODE_HEAT / MODE_COOL (target side)
   // Targets as they stood when the current debounce episode armed. The commit re-picks the gear only
   // if the RUNNING side's target differs from these (setpoint_commit_moves_running_side_()).
   float sp_base_target_{NAN};

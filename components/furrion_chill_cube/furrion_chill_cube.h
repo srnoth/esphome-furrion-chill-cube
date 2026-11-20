@@ -205,6 +205,10 @@ class FurrionChillCube : public climate::Climate, public Component {
   // (HEAT_COOL, not outdoor-locked) — the native changeover supervisor owns heat↔cool there. First report after boot: ON = latched; OFF = no latch, so a summer COOL
   // with the aux heaters idle behaves exactly as before. Left out = feature off.
   void set_aux_heat_sensor(binary_sensor::BinarySensor *s) { aux_heat_sensor_ = s; }
+  // Optional companion (2026-11-20): ON = at least one aux heater is switched on in HA (running or idle).
+  // OFF (all switched off) → no aux latch at all. Left out, or no report yet = treated as ON (the 11-09
+  // behaviour). Used by apply_user_reeval_ (re-set the latch only while enabled) and apply_aux_heat_gate_.
+  void set_aux_heat_enabled_sensor(binary_sensor::BinarySensor *s) { aux_enabled_sensor_ = s; }
 
   // Diagnostic sensor setters
   void set_heat_gear_sensor(sensor::Sensor *s) { heat_gear_sensor_ = s; }
@@ -330,7 +334,7 @@ class FurrionChillCube : public climate::Climate, public Component {
   void update_outside_lockout_();
   void arbitrate_mode_(float room, bool &do_heat, bool &do_cool);
   void apply_aux_heat_gate_(float room, uint32_t now, bool &do_cool);
-  void apply_user_reeval_(float room);
+  void apply_user_reeval_(float room, uint32_t now);
   bool run_heat_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
   bool run_cool_mode_(float room, uint32_t now, bool user_input, bool from_test, float &gear_diff);
   void run_idle_mode_(uint32_t now);
@@ -536,6 +540,12 @@ class FurrionChillCube : public climate::Climate, public Component {
   bool aux_latched_{false};         // cooling held off until the changeover rule releases it
   uint32_t aux_off_since_{0};       // millis() of the last aux ON→OFF (0 = none since the latch)
   bool aux_blocking_{false};        // this pass: cooling blocked by the aux heat (regime label)
+  binary_sensor::BinarySensor *aux_enabled_sensor_{nullptr};   // see set_aux_heat_enabled_sensor
+  bool aux_enabled_known_{false};
+  bool aux_enabled_last_{true};
+  bool aux_heat_enabled_() const {
+    return aux_enabled_sensor_ == nullptr || !aux_enabled_sensor_->has_state() || aux_enabled_sensor_->state;
+  }
   bool display_off_pending_{false};
   uint32_t display_off_at_{0};
   // Failsafe handed control to the unit while it was running (mode side, ActiveMode). Our model says
@@ -723,17 +733,17 @@ class FurrionChillCube : public climate::Climate, public Component {
   // (sets user_changed_) once SETPOINT_SETTLE_MS of steady state has elapsed.
   bool setpoint_pending_{false};
   uint32_t setpoint_pending_since_{0};
-  // User re-evaluation (Stephen 2026-11-19): a mode change, or a settled change to ANY target (either
-  // side — the idle side included), drops every decision hold so the next pass picks heat / cool /
-  // idle from the room against the new setpoints: the aux-heat cool latch, the HEAT_COOL changeover
-  // latch, and the heat↔cool handover gates (idle dwell + trend, 20-min event gate, "stay in the
-  // engaged mode"). Protections stay: a RUNNING aux heater, the off lockout, outdoor lockout, shed.
+  // User re-evaluation (Stephen 2026-11-19, re-decide rule 2026-11-20): a mode change, or a settled change
+  // to ANY target (either side — the idle side included), re-decides the latches from the room against the
+  // new setpoints (see apply_user_reeval_): room > cool target → cool now (latches dropped, engaged heat
+  // hands over); aux running or room < heat target → heat latched; in between → latches kept. Protections
+  // stay: a RUNNING aux heater, the off lockout, outdoor lockout, shed.
   // Mode change → due at once; target change → due after the same SETPOINT_SETTLE_MS debounce.
   bool reeval_pending_{false};
   uint32_t reeval_pending_since_{0};
   bool reeval_due_{false};
-  // Set by apply_user_reeval_ for THIS pass only: the engaged side must hand over now (room at least
-  // mode_switch_temp_offset past the other side's setpoint). Consumed by run_heat/cool_mode_.
+  // Set by apply_user_reeval_ for THIS pass only: the engaged side must hand over now (room past the
+  // other side's new setpoint). Consumed by run_heat/cool_mode_.
   uint8_t reeval_handover_{0};   // MODE_NONE / MODE_HEAT / MODE_COOL (target side)
   // Targets as they stood when the current debounce episode armed. The commit re-picks the gear only
   // if the RUNNING side's target differs from these (setpoint_commit_moves_running_side_()).

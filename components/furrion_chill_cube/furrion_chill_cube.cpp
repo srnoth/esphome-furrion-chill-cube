@@ -2536,6 +2536,15 @@ void FurrionChillCube::update_power_state_() {
       temp_dirty_ = true;
     }
   }
+  if (aux_enabled_sensor_ != nullptr && aux_enabled_sensor_->has_state()) {
+    bool on = aux_enabled_sensor_->state;
+    if (!aux_enabled_known_ || on != aux_enabled_last_) {
+      ESP_LOGI(TAG, "Aux heat enabled input %s%s", on ? "ON" : "OFF", aux_enabled_known_ ? "" : " (first report)");
+      aux_enabled_known_ = true;
+      aux_enabled_last_ = on;
+      temp_dirty_ = true;
+    }
+  }
   if (unit_power_sensor_ == nullptr) return;
   if (unit_power_sensor_->has_state()) {
     bool on = unit_power_sensor_->state;
@@ -2792,7 +2801,7 @@ void FurrionChillCube::run_gear_controller_() {
   reeval_handover_ = MODE_NONE;
   if (reeval_due_) {
     reeval_due_ = false;
-    apply_user_reeval_(room);
+    apply_user_reeval_(room, now);
   }
 
   bool do_heat = false, do_cool = false;
@@ -3129,6 +3138,12 @@ void FurrionChillCube::apply_aux_heat_gate_(float room, uint32_t now, bool &do_c
     aux_latched_ = false;
     ESP_LOGI(TAG, "Aux heat latch cleared — HEAT_COOL with own heat side (native changeover owns it)");
   }
+  // Every aux heater switched off in HA (Stephen 2026-11-20): no aux latch — plain COOL.
+  if (aux_latched_ && !aux_running_ && !aux_heat_enabled_()) {
+    aux_latched_ = false;
+    aux_off_since_ = 0;
+    ESP_LOGI(TAG, "Aux heaters all off — aux heat latch cleared");
+  }
   if (!do_cool) return;
   if (aux_running_) {
     do_cool = false;
@@ -3158,33 +3173,81 @@ void FurrionChillCube::apply_aux_heat_gate_(float room, uint32_t now, bool &do_c
 
 // User re-evaluation (Stephen 2026-11-19, after the 11-19 night: Auto with the Furrion's heat side handed
 // to the resistive heater, sleep SP drop 73→63 at 22:31, room 71 — cooling waited until 23:10 on the
-// aux latch's "sustained rise" rule while the room fell naturally). "No latch survives a SP change; SP and
-// mode changes = immediately re-evaluate what state we should be in." Runs once per mode change / settled
-// target change, before arbitration. Drops the DECISION holds only; the protections stay (a running aux
-// heater still blocks cool in apply_aux_heat_gate_, the off lockout still paces the restart, outdoor
-// lockout and load shed still apply).
-void FurrionChillCube::apply_user_reeval_(float room) {
-  if (aux_latched_) {
-    aux_latched_ = false;
-    aux_off_since_ = 0;
-    ESP_LOGI(TAG, "User change: aux heat latch cleared%s", aux_running_ ? " (aux still running — blocks until it stops)" : "");
+// aux latch's "sustained rise" rule while the room fell naturally). Runs once per mode change / settled
+// target change, before arbitration: the latches are re-decided from the room against the NEW setpoints,
+// not dropped for good (Stephen 2026-11-20, after the 11-20 morning: a 63→69 heat raise cleared the aux
+// latch while the resistive heater ran; when it reached SP the cool approach fired at room 69.2 against
+// cool 70 on the heater-driven rise).
+//   room > cool target            → calls for cool: latches cleared, the engaged heat side hands over now
+//   aux heater running, or room < heat target → calls for heat: latched again (cool waits for the
+//                                    normal release rule, so a heater-driven overshoot stays held)
+//   in between (inclusive)        → whatever was latched stays latched
+// No margin here: the setpoint spread is already ≥ 1 °F, and natural drifts go through the release rule.
+// The aux latch is only re-set while an aux heater is switched on in HA (aux_heat_enabled_()).
+// Protections stay as they were: a running aux heater still blocks cool in apply_aux_heat_gate_, the
+// off lockout still paces the restart, outdoor lockout and load shed still apply.
+void FurrionChillCube::apply_user_reeval_(float room, uint32_t now) {
+  if (isnan(room)) return;
+  float h = get_heat_target_();
+  float c = get_cool_target_();
+  bool calls_cool = !isnan(c) && room > c;
+
+  // Aux-heat cool latch (COOL with the heat side handed to other heaters). Skipped when this unit has its own
+  // heat side (HEAT_COOL, not outdoor-locked) — apply_aux_heat_gate_ drops the aux latch there anyway.
+  bool own_heat_side = this->mode == climate::CLIMATE_MODE_HEAT_COOL && !heater_locked_out_ && !isnan(h);
+  if (aux_heat_sensor_ != nullptr && !own_heat_side) {
+    bool aux_heat_call = aux_running_ || (!isnan(h) && room < h);
+    if (aux_running_) {
+      // A running heater has the latch already (ON edge); keep it whatever the setpoints say.
+      if (!aux_latched_) {
+        aux_latched_ = true;
+        aux_off_since_ = 0;
+      }
+      ESP_LOGI(TAG, "User change: aux heater running — aux heat latch kept");
+    } else if (!aux_heat_enabled_()) {
+      if (aux_latched_) {
+        aux_latched_ = false;
+        aux_off_since_ = 0;
+        ESP_LOGI(TAG, "User change: aux heaters all off — aux heat latch cleared");
+      }
+    } else if (calls_cool) {
+      if (aux_latched_) {
+        aux_latched_ = false;
+        aux_off_since_ = 0;
+        ESP_LOGI(TAG, "User change: room %.2f > cool target %.2f — aux heat latch cleared, cooling decides now",
+                 room, c);
+      }
+    } else if (aux_heat_call) {
+      if (!aux_latched_) {
+        aux_latched_ = true;
+        // Release clock: from the heaters' last stop if there was one, else from now (0 never releases).
+        if (aux_off_since_ == 0) aux_off_since_ = (now != 0) ? now : 1;
+      }
+      ESP_LOGI(TAG, "User change: room %.2f < heat target %.2f — aux heat latch set", room, h);
+    } else if (aux_latched_) {
+      ESP_LOGI(TAG, "User change: room %.2f between the setpoints — aux heat latch kept", room);
+    }
   }
-  if (latched_mode_ != MODE_NONE) {
-    ESP_LOGI(TAG, "User change: changeover latch (%s) cleared", latched_mode_ == MODE_HEAT ? "heat" : "cool");
+
+  // HEAT_COOL changeover latch + handover. Only the side the new setpoints call against is dropped.
+  bool calls_heat = !heater_locked_out_ && !isnan(h) && room < h;
+  if (latched_mode_ == MODE_HEAT && calls_cool) {
+    ESP_LOGI(TAG, "User change: room %.2f > cool target %.2f — heat changeover latch cleared", room, c);
+    clear_mode_latch_();
+  } else if (latched_mode_ == MODE_COOL && calls_heat) {
+    ESP_LOGI(TAG, "User change: room %.2f < heat target %.2f — cool changeover latch cleared", room, h);
     clear_mode_latch_();
   }
   // HEAT_COOL with a side engaged (running or idling at gear 0): arbitration would keep that side until the
-  // changeover supervisor's idle + trend + event gates allow a handover. Hand over now if the room is at
-  // least the offset past the OTHER side's new setpoint (the same margin the supervisor uses).
-  if (this->mode != climate::CLIMATE_MODE_HEAT_COOL || isnan(room) || is_script_mode()) return;
-  float h = get_heat_target_();
-  float c = get_cool_target_();
-  if (heat_gear_ >= 0 && !isnan(c) && room >= c + mode_switch_temp_offset_c_) {
+  // changeover supervisor's idle + trend + event gates allow a handover. Hand over now if the new setpoints
+  // call for the other side.
+  if (this->mode != climate::CLIMATE_MODE_HEAT_COOL || is_script_mode()) return;
+  if (heat_gear_ >= 0 && calls_cool) {
     reeval_handover_ = MODE_COOL;
-    ESP_LOGI(TAG, "User change: room %.2f ≥ cool target %.2f + offset with heat engaged — handing over to cool", room, c);
-  } else if (cool_gear_ >= 0 && !heater_locked_out_ && !isnan(h) && room <= h - mode_switch_temp_offset_c_) {
+    ESP_LOGI(TAG, "User change: room %.2f > cool target %.2f with heat engaged — handing over to cool", room, c);
+  } else if (cool_gear_ >= 0 && calls_heat) {
     reeval_handover_ = MODE_HEAT;
-    ESP_LOGI(TAG, "User change: room %.2f ≤ heat target %.2f − offset with cool engaged — handing over to heat", room, h);
+    ESP_LOGI(TAG, "User change: room %.2f < heat target %.2f with cool engaged — handing over to heat", room, h);
   }
 }
 
